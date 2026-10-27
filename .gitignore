@@ -1,0 +1,47 @@
+# This repository holds the studio's code and nothing that belongs to one machine
+# or one person. Models, Python environments, settings, chats and generated media
+# all live outside it, in the per-user data folder (see "Where things live" in the
+# README); tests/repo-hygiene.test.ts fails if any of them is ever committed.
+
+# Build output and dependencies
+node_modules/
+out/
+dist/
+release/
+*.tsbuildinfo
+
+# Model weights, whatever their format, and model folders. Each user downloads
+# their own from the studio (or with image-engine/scripts/fetch_model.py).
+models/
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+*.pkl
+*.pickle
+
+# Python environments and downloaded packages
+.venv/
+venv/
+image-python/
+wheelhouse/
+*.whl
+__pycache__/
+*.pyc
+
+# Per-user state: settings, chats, approvals, galleries, logs
+userData/
+outputs/
+*.db
+*.db-journal
+*.log
+.env
+.env.*
+
+# Local scratch
+.gstack/
+.DS_Store
+Thumbs.db

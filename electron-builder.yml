@@ -1,0 +1,58 @@
+appId: com.justsimpleideas.localaistudio
+productName: Local AI Studio
+directories:
+  output: release
+  buildResources: resources
+
+files:
+  - out/**
+  - package.json
+  # llama.cpp's full source, kept by node-llama-cpp for building from source. The app
+  # only runs the prebuilt binaries and never builds at run time, so it is left out.
+  - "!**/node_modules/node-llama-cpp/llama/gitRelease.bundle"
+  - "!**/node_modules/node-llama-cpp/llama/localBuilds/**"
+
+# The Python image engine ships as plain source next to the app. It runs in the
+# user's own Python environment (PyTorch is far too large to bundle), and its
+# tests and caches stay out of the installer.
+extraResources:
+  - from: LICENSE
+    to: LICENSE.txt
+  - from: THIRD_PARTY_NOTICES.md
+    to: THIRD_PARTY_NOTICES.md
+  - from: image-engine
+    to: image-engine
+    filter:
+      - image_engine/**
+      - scripts/fetch_model.py
+      - requirements.txt
+      - constraints.txt
+      - "!**/__pycache__/**"
+
+# The llama.cpp binaries are native and must stay real files on disk; loading a
+# .dll or .dylib out of an asar archive does not work.
+asarUnpack:
+  - node_modules/node-llama-cpp/**
+  - node_modules/@node-llama-cpp/**
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  # The x64 build carries the x64 llama.cpp binaries (CPU, Vulkan, CUDA) only.
+  files:
+    - "!**/node_modules/@node-llama-cpp/win-arm64/**"
+  artifactName: "Local-AI-Studio-Setup-${version}.${ext}"
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+
+mac:
+  target: dmg
+  category: public.app-category.developer-tools
+
+linux:
+  target: AppImage
+  category: Development

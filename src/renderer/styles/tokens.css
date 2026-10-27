@@ -1,0 +1,52 @@
+/*
+ * Design tokens shared by the chat side and the image side. Both stylesheets
+ * read from here; neither defines its own colours, radii or fonts.
+ *
+ * The look is retro-futurist: a seventies instrument panel rebuilt with modern
+ * materials. Graphite surfaces, neon light used only where something is live or
+ * actionable, bevelled corners instead of rounded ones, square "pixel" status
+ * lights and segmented LED-style meters.
+ *
+ * Surfaces are neutral grey on purpose. A tinted background shifts how the
+ * colours of a generated image are perceived; photo tools use grey for the same
+ * reason. The neon stays on controls and never sits behind an image.
+ */
+:root {
+  color-scheme: dark;
+
+  /* surfaces */
+  --bg: #0b0b0c;
+  --panel: #131314;
+  --panel-2: #1a1a1c;
+  --line: #29292c;
+  --line-strong: #3a3a3f;
+  --text: #ececef;
+  --muted: #8f8f97;
+
+  /* light */
+  --accent: #2de2ff;
+  --accent-strong: #8af1ff;
+  --accent-ink: #00191e;
+  --signal: #ff2f6e;
+  --ok: #3cf5a0;
+  --warn: #ffc53d;
+  --danger: #ff5274;
+
+  --glow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent),
+    0 0 16px color-mix(in srgb, var(--accent) 30%, transparent);
+  --glow-soft: 0 0 10px color-mix(in srgb, var(--accent) 35%, transparent);
+
+  /* shape */
+  --radius: 9px;
+  --radius-sm: 5px;
+  --shadow: 0 12px 40px rgb(0 0 0 / 0.55);
+
+  /* type: Bahnschrift is Windows' built-in DIN, the typeface of seventies
+     signage and dashboards. No font is bundled or downloaded. */
+  --font-ui: Bahnschrift, 'DIN Alternate', 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  --mono: 'Cascadia Mono', ui-monospace, 'SF Mono', Consolas, monospace;
+  --label-spacing: 0.12em;
+
+  /* motion */
+  --fast: 0.12s;
+}

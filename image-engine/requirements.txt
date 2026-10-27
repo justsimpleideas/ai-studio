@@ -1,0 +1,15 @@
+# Install PyTorch first, from the official PyTorch index (see README).
+# Everything here comes from PyPI, as binary wheels only.
+# Versions are the ones audited in docs/package-security-audit.md.
+diffusers==0.42.0
+transformers==5.20.2
+accelerate==1.15.0
+safetensors==0.8.0
+huggingface-hub==2.3.0
+Pillow==13.0.0
+# Held back from 2.16.0 (four days old when audited, no publish provenance): decision P1.
+httpx2==2.13.1
+httpcore2==2.13.1
+# Held back from 10.1.0 and 4.1.2 (days old, and these projects publish no provenance): decision P2.
+importlib-metadata==9.0.1
+zipp==4.1.1

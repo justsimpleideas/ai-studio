@@ -1,0 +1,62 @@
+# Tests every push and pull request. On a version tag (v0.1.0, ...) it also builds the
+# Windows installer and attaches it to a draft release, to be checked and published
+# by hand. The installer holds the app and the image engine's source only: no Python,
+# no PyTorch and no model weights, which each user installs from inside the studio.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      # The engine's own tests need Pillow only (the GPU tests skip without PyTorch).
+      - run: python -m pip install --only-binary=:all: -c image-engine/constraints.txt Pillow
+      - run: npm run test:engine
+
+  installer:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run package
+        env:
+          # Unsigned: there is no code-signing certificate.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - name: Draft release with the installer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release
+          sha256sum Local-AI-Studio-Setup-*.exe > SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" Local-AI-Studio-Setup-*.exe SHA256SUMS.txt \
+            --draft --title "Local AI Studio $GITHUB_REF_NAME" --generate-notes
