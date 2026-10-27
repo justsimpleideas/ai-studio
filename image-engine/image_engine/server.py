@@ -623,6 +623,9 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
 class StudioServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False  # a second instance on the same port must fail, not share it
+    # The gallery asks for every thumbnail at once. With the default backlog of 5,
+    # Windows refuses the connections beyond it, and those pictures show as broken.
+    request_queue_size = 128
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         # A client hanging up on an idle keep-alive connection is normal; on Windows it

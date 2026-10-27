@@ -46,6 +46,27 @@ class ServerTests(unittest.TestCase):
         cls.gallery.close()
         cls.tmp.cleanup()
 
+    def test_a_burst_of_connections_is_served_not_refused(self):
+        # Opening the gallery asks for every thumbnail at once. With the default listen
+        # backlog of 5, Windows refuses the connections beyond it outright.
+        count = 60
+        barrier = threading.Barrier(count)
+        results = []
+
+        def one():
+            barrier.wait()
+            try:
+                results.append(self.request("GET", "/api/status")[0])
+            except OSError as exc:
+                results.append(type(exc).__name__)
+
+        threads = [threading.Thread(target=one) for _ in range(count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        self.assertEqual(results.count(200), count, sorted({str(r) for r in results}))
+
     # ------------------------------------------------------------ helpers
 
     def request(self, method, path, body=None, headers=None, raw=None):

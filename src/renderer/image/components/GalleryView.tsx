@@ -115,12 +115,13 @@ export function GalleryView({ version, folders, onOpen, registerUpdater, onError
                   : "Nothing here yet. Generated images and videos are saved automatically."}
           </div>
         )}
-        <div className="grid">
+        <div className="gallery-grid">
           {items.map((img) => (
             <button
               key={img.id}
               className="tile"
               data-id={img.id}
+              style={{ "--ar": img.width > 0 && img.height > 0 ? img.width / img.height : 1.6 } as React.CSSProperties}
               draggable
               onDragStart={(e) => {
                 e.dataTransfer.setData(ITEM_DRAG_TYPE, img.id);

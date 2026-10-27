@@ -230,8 +230,12 @@ img { -webkit-user-drag: none; }
 .detail-folder { display: flex; flex-direction: column; gap: 6px; }
 .detail-folder select { width: 100%; }
 .gallery-toolbar .search { max-width: 360px; }
-.grid { columns: 230px; column-gap: 10px; }
-.tile { position: relative; width: 100%; padding: 0; margin: 0 0 10px; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; break-inside: avoid; background: var(--panel-2); display: block; }
+/* Justified rows: newest first, left to right. Each tile grows in proportion to its
+   aspect ratio (--ar), so every row fills the width at one height and nothing is
+   cropped; the spacer after the last tile keeps the final row from stretching. */
+.gallery-grid { display: flex; flex-wrap: wrap; gap: 10px; }
+.gallery-grid::after { content: ""; flex-grow: 1000000; }
+.tile { position: relative; flex: var(--ar, 1.6) 1 calc(var(--ar, 1.6) * 140px); min-width: 0; padding: 0; margin: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--panel-2); display: block; }
 .tile:hover:not(:disabled) { border-color: var(--accent); box-shadow: var(--glow-soft); }
 .tile img { width: 100%; height: auto; transition: transform 0.2s; }
 .tile:hover img { transform: scale(1.02); }
