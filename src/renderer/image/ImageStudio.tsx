@@ -22,6 +22,9 @@ import {
   type FormState,
   type SeenModel
 } from './form.js'
+import { matchesShortcut } from '@shared/shortcuts.js'
+import { useShortcutsRef } from '../useShortcuts.js'
+import { loadDisplay, saveDisplay } from './display.js'
 import { MAX_PNG_BYTES, settingsFromPng } from './png-settings.js'
 import type { ImageRecord, StartImage } from './types.js'
 import { activeJob, jobKind, queuedCount, useEngine } from './useEngine.js'
@@ -53,6 +56,29 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
   const [submitError, setSubmitError] = useState<string | null>(null)
   const [videoError, setVideoError] = useState<string | null>(null)
   const [detail, setDetail] = useState<{ image: ImageRecord; list: ImageRecord[] } | null>(null)
+
+  // A shortcut (Ctrl+Shift+L by default), anywhere in the studio: lock every open PIN folder at
+  // once. A gallery view of one goes to Favorites, and an item from a PIN folder open in detail closes.
+  const shortcuts = useShortcutsRef()
+  const [lockedAll, setLockedAll] = useState(0)
+  const lockFolders = useRef<() => void>(() => undefined)
+  lockFolders.current = () => {
+    if (!engine.connected) return
+    const pinned = new Set(folders.list.filter((f) => f.locked).map((f) => f.id))
+    setLockedAll((n) => n + 1)
+    setDetail((d) => (d && d.image.folder_id && pinned.has(d.image.folder_id) ? null : d))
+    folders.lockAll().catch((e: Error) => setNote({ ok: false, text: e.message }))
+  }
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (matchesShortcut(e, shortcuts.current.lockFolders)) {
+        e.preventDefault()
+        lockFolders.current()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
   const [note, setNote] = useState<Note>(null)
   const [dragging, setDragging] = useState(false)
   const galleryUpdater = useRef<((u: GalleryUpdate) => void) | null>(null)
@@ -75,6 +101,8 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
     saveSeenModel(seenModel.current)
   }, [imageProfile])
   useEffect(() => saveVideoForm(videoForm), [videoForm])
+  const [display, setDisplay] = useState(loadDisplay)
+  useEffect(() => saveDisplay(display), [display])
   // The video model decides the sizes, lengths, frame rate, steps and start a clip takes.
   const videoProfile = engine.status?.video?.profile ?? null
   const videoGeometry = geometryFor(videoProfile)
@@ -349,6 +377,7 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
               modelMessage={engine.status?.model.message ?? ''}
               onOpen={(image, list) => setDetail({ image, list })}
               onCancel={(j) => void api.cancel(j.id).catch(() => undefined)}
+              display={display.image}
             />
           </>
         )}
@@ -371,6 +400,7 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
               modelMessage={engine.status?.models?.video?.message ?? ''}
               onOpen={(video, list) => setDetail({ image: video, list })}
               onCancel={(j) => void api.cancel(j.id).catch(() => undefined)}
+              display={display.video}
             />
           </>
         )}
@@ -381,6 +411,8 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
             <GalleryView
               version={`${engine.galleryVersion}:${folders.version}`}
               folders={folders}
+              lockedAll={lockedAll}
+              start={display.galleryStart}
               onOpen={(image, list) => setDetail({ image, list })}
               registerUpdater={registerUpdater}
               onError={(text) => setNote({ ok: false, text })}
@@ -392,7 +424,15 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
           <TrainView jobs={engine.jobs} connected={engine.connected} captioning={engine.status?.captioning === true} library={loras.list} onLibraryChanged={() => void loras.refresh()} />
         )}
         {tab === 'settings' && (
-          <SettingsView status={engine.status} engine={engine.engine} privacyVersion={engine.privacyVersion} />
+          <SettingsView
+            status={engine.status}
+            engine={engine.engine}
+            privacyVersion={engine.privacyVersion}
+            display={display}
+            onDisplayChange={setDisplay}
+            folders={folders.list}
+            merge={engine.merge}
+          />
         )}
       </main>
 

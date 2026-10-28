@@ -15,7 +15,7 @@ import { spawn, spawnSync, execSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { delimiter, dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const ROOT = resolve(import.meta.dirname, '..')
@@ -77,6 +77,9 @@ const modelsDir = join(dirname(workspaceDir), 'models')
 const trainingPhotos = join(dirname(workspaceDir), 'photos')
 const PYTHON = process.env.STUDIO_PYTHON ?? 'python'
 execSync(`"${PYTHON}" "${join(ROOT, 'scripts', 'e2e-training-photos.py')}" "${trainingPhotos}"`, { stdio: 'inherit' })
+// Two other galleries to merge in, standing in for the folder picker of the merge (one per pick).
+const mergeGalleries = join(dirname(workspaceDir), 'other-galleries')
+execSync(`"${PYTHON}" "${join(ROOT, 'scripts', 'e2e-merge-galleries.py')}" "${mergeGalleries}"`, { stdio: 'inherit' })
 const TRAINS_FOR_REAL = spawnSync(PYTHON, ['-c', 'import torch, diffusers, safetensors'], { stdio: 'ignore' }).status === 0
 // A local stand-in for Wikimedia Commons and Openverse, so collecting photos is tested without the internet.
 const FAKE_SOURCES_PORT = 9362
@@ -95,6 +98,7 @@ Object.assign(env, {
   STUDIO_PICK_MODELS_FOLDER: modelsDir,
   STUDIO_PICK_TRAINING_FOLDER: trainingPhotos,
   STUDIO_PICK_COLLECT_FOLDER: collectedPhotos,
+  STUDIO_PICK_MERGE_SOURCES: [join(mergeGalleries, 'pc1', 'outputs'), join(mergeGalleries, 'pc2')].join(delimiter),
   STUDIO_COLLECT_COMMONS_API: `http://127.0.0.1:${FAKE_SOURCES_PORT}/commons/api.php`,
   STUDIO_COLLECT_OPENVERSE_API: `http://127.0.0.1:${FAKE_SOURCES_PORT}/openverse/v1/images/`,
   HARNESS_STEP_DELAY: '0.15',
@@ -154,6 +158,26 @@ function closeLikeTheCloseButton() {
     Add-Type -Name Win -Namespace E2E -MemberDefinition '[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);'
     if ($h -eq 0) { exit 3 }
     [E2E.Win]::PostMessage($h, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null`
+  return spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { stdio: 'ignore' }).status === 0
+}
+
+/** Tell the window it lost focus, as choosing another program does: WM_ACTIVATE with WA_INACTIVE. */
+function deactivateLikeAnotherWindow() {
+  const script = `
+    $h = (Get-Process -Id ${app.pid}).MainWindowHandle
+    Add-Type -Name Win -Namespace E2E -MemberDefinition '[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);'
+    if ($h -eq 0) { exit 3 }
+    [E2E.Win]::PostMessage($h, 0x0006, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null`
+  return spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { stdio: 'ignore' }).status === 0
+}
+
+/** Minimize the window the way its title bar button does: WM_SYSCOMMAND with SC_MINIMIZE. */
+function minimizeLikeTheButton() {
+  const script = `
+    $h = (Get-Process -Id ${app.pid}).MainWindowHandle
+    Add-Type -Name Win -Namespace E2E -MemberDefinition '[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);'
+    if ($h -eq 0) { exit 3 }
+    [E2E.Win]::PostMessage($h, 0x0112, [IntPtr]0xF020, [IntPtr]::Zero) | Out-Null`
   return spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { stdio: 'ignore' }).status === 0
 }
 
@@ -617,7 +641,55 @@ try {
   )
   check('"All" still shows everything', (await js(`window.api.image.gallery({})`)).total === everything.length)
 
-  await js(`${folderRow('Trips')}.querySelector('[aria-label="Rename Trips"]').click()`)
+  // The folder list can be put away, by its button or Ctrl+B, and the choice is kept.
+  const folderListShown = `!!document.querySelector(${q(inImage('.folder-list'))})`
+  await click(inImage('.folders-toggle'))
+  check('the folder list can be hidden', await waitFor(`!${folderListShown}`))
+  check('and the choice is kept', await js(`localStorage.getItem("lis.gallery.folders.v1") === "hidden"`))
+  await js(`window.dispatchEvent(new KeyboardEvent("keydown", { key: "b", ctrlKey: true, bubbles: true }))`)
+  check('Ctrl+B brings it back', await waitFor(folderListShown))
+
+  // Where the gallery opens: All by default, or where it was left.
+  await clickText(inImage('.folder-item'), 'Trips')
+  await waitFor(`document.querySelector(${q(inImage('.gallery-heading'))})?.textContent === "Trips"`)
+  await clickText(inImage('.tabs button'), 'Image')
+  await clickText(inImage('.tabs button'), 'Gallery')
+  check('the gallery opens on All by default', await waitFor(`document.querySelector(${q(inImage('.gallery-heading'))})?.textContent === "All"`))
+  await clickText(inImage('.folder-item'), 'Trips')
+  await clickText(inImage('.tabs button'), 'Settings')
+  await clickText(inImage('[aria-label="The gallery opens on"] button'), 'Where it was left')
+  await clickText(inImage('.tabs button'), 'Gallery')
+  check('or where it was left, when chosen', await waitFor(`document.querySelector(${q(inImage('.gallery-heading'))})?.textContent === "Trips"`))
+  await clickText(inImage('.folder-item'), 'All')
+  await clickText(inImage('.tabs button'), 'Settings')
+  await clickText(inImage('[aria-label="The gallery opens on"] button'), 'Favorites')
+  await clickText(inImage('.tabs button'), 'Gallery')
+  check('or on Favorites', await waitFor(`document.querySelector(${q(inImage('.gallery-heading'))})?.textContent === "Favorites"`))
+  await clickText(inImage('.tabs button'), 'Settings')
+  await clickText(inImage('[aria-label="The gallery opens on"] button'), 'A folder')
+  check('or on a chosen folder, picked from a list', await waitFor(`[...document.querySelectorAll(${q(inImage('[aria-label="The folder the gallery opens on"] option'))})].some((o) => o.textContent === "Trips")`))
+  await js(`(() => { const s = document.querySelector(${q(inImage('[aria-label="The folder the gallery opens on"]'))}); const id = [...s.options].find((o) => o.textContent === "Trips").value; const set = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set; set.call(s, id); s.dispatchEvent(new Event("change", { bubbles: true })) })()`)
+  await clickText(inImage('.tabs button'), 'Gallery')
+  check('which it then opens on', await waitFor(`document.querySelector(${q(inImage('.gallery-heading'))})?.textContent === "Trips"`))
+  await clickText(inImage('.tabs button'), 'Settings')
+  await clickText(inImage('[aria-label="The gallery opens on"] button'), 'All')
+  await clickText(inImage('.tabs button'), 'Gallery')
+  await waitFor(`document.querySelector(${q(inImage('.gallery-heading'))})?.textContent === "All"`)
+
+  // A folder's own actions: only ⋯ (and a lock for an open PIN folder) on the row; rename and delete in its menu.
+  const openMenu = (name) => js(`${folderRow(name)}.querySelector('[aria-label="Options for ${name}"]').click()`)
+  const folderMenuOpen = `!!document.querySelector(${q(inImage('.folder-menu'))})`
+  check('a folder row offers only its menu', await js(`[...(${folderRow('Trips')}).querySelectorAll(".folder-actions button")].map((b) => b.textContent.trim()).join() === "⋯"`))
+  await openMenu('Trips')
+  check('its menu opens', await waitFor(folderMenuOpen))
+  await js(`document.querySelector(${q(inImage('.gallery-heading'))}).dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }))`)
+  check('and closes on a click anywhere else', await waitFor(`!${folderMenuOpen}`))
+  await openMenu('Trips')
+  await waitFor(folderMenuOpen)
+  await js(`document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`)
+  check('or on Escape', await waitFor(`!${folderMenuOpen}`))
+  await openMenu('Trips')
+  await clickText(inImage('.folder-menu button'), 'Rename')
   await nameFolder('Holidays')
   check('a folder can be renamed', await waitFor(`!!(${folderRow('Holidays')}) && !(${folderRow('Trips')})`))
   await click(inImage('.folder-head button'))
@@ -650,7 +722,8 @@ try {
   await js(`document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`)
   check('and Escape closes it, leaving the item', (await waitFor(`!${menuOpen}`)) && (await js(`window.api.image.gallery({})`)).total === everything.length)
 
-  await js(`${folderRow('Holidays')}.querySelector('[aria-label="Delete Holidays"]').click()`)
+  await openMenu('Holidays')
+  await clickText(inImage('.folder-menu button'), 'Delete folder')
   check('deleting asks first, and says the items stay', await waitFor(`document.querySelector(${q(inImage('.folder-confirm'))})?.textContent.includes("stay in All")`))
   await clickText(inImage('.folder-confirm button'), 'Delete folder')
   check('the folder goes', await waitFor(`!(${folderRow('Holidays')})`))
@@ -660,7 +733,6 @@ try {
   console.log('hidden and locked folders')
   const pinField = (label) => inImage(`.folder-pin input[aria-label="${label}"]`)
   const submitPin = () => js(`document.querySelector(${q(inImage('.folder-pin'))}).requestSubmit()`)
-  const openMenu = (name) => js(`${folderRow(name)}.querySelector('[aria-label="Options for ${name}"]').click()`)
   const tileShown = (id) => `!!document.querySelector(${q(inImage(`.tile[data-id="${id}"]`))})`
   await click(inImage('.folder-head button'))
   await nameFolder('Vault')
@@ -678,8 +750,8 @@ try {
   await setValue(pinField('PIN again'), '246810')
   await submitPin()
   check('a folder can be locked with a PIN, and stays open for now', await waitFor(`window.api.image.folders().then((f) => f.some((x) => x.name === "Vault" && x.locked && x.unlocked))`))
-  await openMenu('Vault')
-  await clickText(inImage('.folder-menu button'), 'Lock now')
+  check('an open PIN folder shows a lock button beside its menu', await js(`[...(${folderRow('Vault')}).querySelectorAll(".folder-actions button")].map((b) => b.textContent.trim()).join() === "🔒,⋯"`))
+  await js(`${folderRow('Vault')}.querySelector('[aria-label="Lock Vault now"]').click()`)
   check('locking it shows a lock instead of a count', await waitFor(`!!(${folderRow('Vault')})?.querySelector(".folder-lock")`))
   check('and takes what it holds out of All', await waitFor(`!(${tileShown(favorite.id)}) && document.querySelectorAll(${q(inImage('.tile'))}).length === ${everything.length - 1}`))
   check('and out of Favorites and search', (await js(`window.api.image.gallery({ favorites: true })`)).total === 0)
@@ -691,6 +763,15 @@ try {
   await submitPin()
   check('the right one opens it', await waitFor(`document.querySelector(${q(inImage('.gallery-heading'))})?.textContent === "Vault" && ${tileShown(favorite.id)}`))
   await shot('12-gallery-locked-folder')
+  // Ctrl+Shift+L locks every open folder; a view of one goes to Favorites.
+  await js(`window.dispatchEvent(new KeyboardEvent("keydown", { key: "L", ctrlKey: true, shiftKey: true, bubbles: true }))`)
+  check('Ctrl+Shift+L locks every open folder', await waitFor(`window.api.image.folders().then((f) => f.every((x) => !x.unlocked))`))
+  check('and leaves the locked folder for Favorites', await waitFor(`document.querySelector(${q(inImage('.gallery-heading'))})?.textContent === "Favorites" && !!(${folderRow('Vault')})?.querySelector(".folder-lock")`))
+  check('without showing what it holds', !(await js(tileShown(favorite.id))))
+  await js(`${folderRow('Vault')}.querySelector(".folder-item").click()`)
+  await setValue(pinField('PIN'), '246810')
+  await submitPin()
+  await waitFor(`document.querySelector(${q(inImage('.gallery-heading'))})?.textContent === "Vault"`)
   await openMenu('Vault')
   await clickText(inImage('.folder-menu button'), 'Hide')
   check('a hidden folder leaves the folder list', await waitFor(`!(${folderRow('Vault')})`))
@@ -711,6 +792,34 @@ try {
   check('a video still comes out', await waitFor(`document.querySelectorAll(${q(inImage('.film'))}).length === 3`, 30000))
   check('as an animated WebP that plays as a picture', await waitFor(`(() => { const i = document.querySelector(${q(inImage('.stage-video img.video-frame'))}); return !!i && i.src.startsWith("studio-image://video/") && i.complete && i.naturalWidth > 0 })()`))
   await js(`window.api.image.saveSettings({ ffmpeg_path: "" })`)
+
+  console.log('what shows once something is made')
+  const toggle = (label) => clickText(inImage('.settings label.toggle'), label)
+  const stageText = () => text(inImage('.stage'))
+  await clickText(inImage('.tabs button'), 'Settings')
+  await toggle('Show a finished video on screen')
+  await clickText(inImage('.tabs button'), 'Video')
+  check('with results off, the finished video leaves the stage', await waitFor(`!document.querySelector(${q(inImage('.stage-video'))})`))
+  check('and the stage says it is done', (await stageText()).includes('Done. It is in the gallery.'))
+  check('while the strip stays', (await count(inImage('.film'))) === 3)
+  await click(inImage('.film'))
+  check('a thumbnail picked from the strip still shows', await waitFor(`!!document.querySelector(${q(inImage('.stage-video'))})`))
+  await clickText(inImage('.tabs button'), 'Settings')
+  await toggle('Show this session’s videos as thumbnails under it')
+  check('the choices are kept', await js(`(() => { const d = JSON.parse(localStorage.getItem("lis.display.v1")); return d.video.showResult === false && d.video.showStrip === false && d.image.showResult && d.image.showStrip })()`))
+  await clickText(inImage('.tabs button'), 'Video')
+  check('with the strip off, no thumbnails show', await waitFor(`document.querySelectorAll(${q(inImage('.film'))}).length === 0`))
+  await clickText(inImage('.tabs button'), 'Image')
+  check('and images keep their own choices', await waitFor(`document.querySelectorAll(${q(inImage('.film'))}).length > 0 && !!document.querySelector(${q(inImage('.stage-image'))})`))
+  await clickText(inImage('.tabs button'), 'Settings')
+  await toggle('Show this session’s images as thumbnails under it')
+  await clickText(inImage('.tabs button'), 'Image')
+  check('the image strip turns off on its own', await waitFor(`document.querySelectorAll(${q(inImage('.film'))}).length === 0 && !!document.querySelector(${q(inImage('.stage-image'))})`))
+  await clickText(inImage('.tabs button'), 'Settings')
+  await toggle('Show this session’s images as thumbnails under it')
+  await toggle('Show this session’s videos as thumbnails under it')
+  await toggle('Show a finished video on screen')
+  check('and all of it turns back on', await js(`(() => { const d = JSON.parse(localStorage.getItem("lis.display.v1")); return d.video.showResult && d.video.showStrip && d.image.showResult && d.image.showStrip })()`))
 
   console.log('training')
   const train = (sel) => inImage(`.train-view ${sel}`)
@@ -812,6 +921,41 @@ try {
   await clickText(train('.collect-progress button'), 'Open the project')
   check('the collected project opens with its subject and captions', await waitFor(`document.querySelectorAll(${q(train('.caption-card'))}).length === 3 && ${cardsText}.every((t) => t === "Example Motors Coupe GT Mk2, coupe")`, 20000))
 
+  console.log('merging galleries')
+  const merge = (sel) => inImage(`.merge ${sel}`)
+  const mergeText = () => text(inImage('.merge'))
+  // Hidden folders hidden, as they are when the studio starts (the steps above showed them).
+  await js(`window.api.image.setShowHiddenFolders(false)`)
+  const totalBefore = (await js(`window.api.image.gallery({})`)).total
+  await clickText(inImage('.tabs button'), 'Image')
+  await clickText(inImage('.tabs button'), 'Settings')
+  await clickText(merge('button'), 'Add a gallery')
+  check('a gallery to merge can be chosen', await waitFor(`document.querySelectorAll(${q(merge('.merge-source'))}).length === 1`))
+  // The second pick is the folder holding an outputs folder: its outputs folder is taken.
+  await clickText(merge('button'), 'Add a gallery')
+  check('and another, by the folder that holds it', await waitFor(`document.querySelectorAll(${q(merge('.merge-source'))}).length === 2`))
+  check('each says what it holds', await waitFor(`document.querySelector(${q(merge('.merge-source'))})?.textContent.includes("3 images")`))
+  check('names that differ only in case are a clash, shown before anything is copied', await waitFor(`!!document.querySelector(${q(merge('.merge-conflicts'))})?.textContent.includes("“Beach”")`))
+  check('and the merge waits until it is resolved', await js(`[...document.querySelectorAll(${q(merge('button.primary'))})].every((b) => b.disabled)`))
+  check('a copy of an item already coming is skipped, and said so', (await mergeText()).includes('1 item is already here'))
+  check('a hidden folder of another gallery is not named', !(await mergeText()).includes('Private'))
+  await clickText(merge('button'), 'Rename them for me')
+  check('names can be suggested for every clash', await waitFor(`!document.querySelector(${q(merge('.merge-conflicts'))})`))
+  check('so it can merge', await waitFor(`[...document.querySelectorAll(${q(merge('button.primary'))})].some((b) => !b.disabled && b.textContent === "Merge 4 items")`))
+  check('a merge can be stopped, which adds nothing', (await js(`window.api.image.cancelMerge().then(() => true)`)) && (await js(`window.api.image.gallery({})`)).total === totalBefore)
+  await clickText(merge('button.primary'), 'Merge')
+  check('merging copies them in', await waitFor(`document.querySelector(${q(merge('.merge-result'))})?.textContent.includes("Merged 4 items")`, 20000))
+  check('every item comes, but the one already there', await waitFor(`window.api.image.gallery({}).then((p) => p.total === ${totalBefore + 3})`))
+  const merged = await js(`window.api.image.folders()`)
+  check('folders come with their names, the clash renamed', merged.some((f) => f.name === 'Beach') && merged.some((f) => f.name === 'beach (pc2)'))
+  check('favourites come as favourites', (await js(`window.api.image.gallery({ favorites: true })`)).items.some((i) => i.prompt === 'a merged sandcastle'))
+  check('with their prompts and settings', (await js(`window.api.image.gallery({ q: "merged wave" })`)).items[0]?.seed === 201)
+  check('a hidden folder stays hidden', !merged.some((f) => f.name === 'Private'))
+  await js(`window.api.image.setShowHiddenFolders(true)`)
+  const privateFolder = (await js(`window.api.image.folders()`)).find((f) => f.name === 'Private')
+  check('and locked, with the PIN it had', !!privateFolder?.locked && !!(await js(`window.api.image.unlockFolder(${q(privateFolder?.id ?? '')}, "135790").then((f) => f.unlocked)`)))
+  await js(`window.api.image.lockFolder(${q(privateFolder?.id ?? '')}).then(() => window.api.image.setShowHiddenFolders(false))`)
+
   console.log('switching sides keeps state')
   await clickText('.rail-button', 'Chat')
   check('chat side back', await waitFor(`!document.querySelector(".studio-pane:not([hidden]) .image-studio")`))
@@ -835,11 +979,67 @@ try {
   await clickText('.rail-button', 'Settings')
   check('studio settings open', await waitFor(`!!document.querySelector(".app-settings")`))
   check('closing the window quits by default', await js(`document.querySelector('.app-settings input[value=quit]').checked`))
-  check('the per-model choices wait until background is chosen', await js(`[...document.querySelectorAll(".keep-row button")].every((b) => b.disabled)`))
+  check('the per-model choices wait until background is chosen', await js(`[...document.querySelectorAll(".keep-models .keep-row button")].every((b) => b.disabled)`))
+  const privacyRow = (label) => `[...document.querySelectorAll(".app-settings .keep-row")].find((r) => r.textContent.startsWith(${q(label)}))`
+  check('open folders stay open on minimizing, by default', await js(`(${privacyRow('When the window is minimized')}).querySelector("button.active").textContent === "Leave them open"`))
+  check('and lock again on closing to the background, a choice that waits until background is chosen', await js(`(() => { const r = ${privacyRow('When the window closes to the background')}; return r.querySelector("button.active").textContent === "Lock them again" && [...r.querySelectorAll("button")].every((b) => b.disabled) })()`))
   await click('.app-settings input[value=background]')
   check('background can be chosen', await waitFor(`window.api.getConfig().then((c) => c.background.closeBehavior === "background")`))
   check('every model stays on the GPU by default', await js(`window.api.getConfig().then((c) => Object.values(c.background.keepLoaded).every(Boolean))`))
   await shot('10-app-settings')
+
+  // Keyboard shortcuts: every one listed; a changeable one takes the next keys pressed.
+  const kbdOf = (label) => js(`[...document.querySelectorAll(".shortcut-row")].find((r) => r.textContent.startsWith(${q(label)}))?.querySelector("kbd")?.textContent`)
+  // By row, not by an aria-label selector: click() puts its selector in a string unescaped.
+  const changeKeys = (label) => js(`[...document.querySelectorAll(".shortcut-row")].find((r) => r.textContent.startsWith(${q(label)})).querySelector("button").click()`)
+  const pressKeys = (key, code, mods) => js(`window.dispatchEvent(new KeyboardEvent("keydown", { key: ${q(key)}, code: ${q(code)}, ${mods}, bubbles: true }))`)
+  check('settings list every shortcut, the fixed ones too', (await kbdOf('Lock every open folder')) === 'Ctrl+Shift+L' && (await kbdOf('Generate')) === 'Ctrl+Enter' && (await count('.shortcut-row.fixed')) >= 4)
+  await changeKeys('Show or hide the sidebar')
+  check('changing one waits for the keys', await waitFor(`!!document.querySelector(".shortcut-row kbd.recording")`))
+  await pressKeys('s', 'KeyS', 'ctrlKey: true, altKey: true')
+  check('and takes them', await waitFor(`window.api.getConfig().then((c) => c.shortcuts.toggleSidebar === "Ctrl+Alt+S")`))
+  check('showing the new keys', await waitFor(`[...document.querySelectorAll(".shortcut-row")].find((r) => r.textContent.startsWith("Show or hide the sidebar"))?.querySelector("kbd")?.textContent === "Ctrl+Alt+S"`))
+  await changeKeys('Lock every open folder')
+  await pressKeys('s', 'KeyS', 'ctrlKey: true, altKey: true')
+  check('keys another shortcut has are refused, saying which', await waitFor(`document.querySelector(".shortcut-problem")?.textContent.includes("Show or hide the sidebar")`))
+  await pressKeys('c', 'KeyC', 'ctrlKey: true')
+  check('so are editing keys', await waitFor(`document.querySelector(".shortcut-problem")?.textContent.includes("editing text")`))
+  await pressKeys('h', 'KeyH', 'shiftKey: true')
+  check('and keys that would get in the way of typing', await waitFor(`document.querySelector(".shortcut-problem")?.textContent.includes("Ctrl or Alt")`))
+  await pressKeys('Escape', 'Escape', 'ctrlKey: false')
+  check('Esc stops changing it, keeping the old keys', (await waitFor(`!document.querySelector(".shortcut-row kbd.recording")`)) && (await js(`window.api.getConfig().then((c) => c.shortcuts.lockFolders === "Ctrl+Shift+L")`)))
+  await clickText('.rail-button', 'Chat')
+  const sidebarState = () => js(`localStorage.getItem("studio.chatSidebar")`)
+  const before = await sidebarState()
+  await pressKeys('s', 'KeyS', 'ctrlKey: true, altKey: true')
+  check('the new keys work at once', await waitFor(`localStorage.getItem("studio.chatSidebar") !== ${q(before)}`))
+  await ctrlB()
+  check('and the old ones no longer do', (await sleep(300), (await sidebarState()) !== before))
+  await pressKeys('s', 'KeyS', 'ctrlKey: true, altKey: true')
+  await clickText('.rail-button', 'Settings')
+  await clickText('.shortcuts button', 'Put every shortcut back')
+  check('every shortcut can go back to its default', await waitFor(`window.api.getConfig().then((c) => c.shortcuts.toggleSidebar === "Ctrl+B")`))
+
+  // Dark by default; light at the click of a button, everywhere at once.
+  const bgColour = () => js(`getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()`)
+  check('the studio is dark by default', (await js(`window.api.getConfig().then((c) => c.theme)`)) === 'dark' && (await bgColour()) === '#0b0b0c')
+  await clickText('.app-settings [aria-label="Theme"] button', 'Light')
+  check('it can be made light', await waitFor(`getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() === "#f3f3f5"`))
+  check('and the choice is kept', await js(`window.api.getConfig().then((c) => c.theme === "light")`))
+  await shot('20-light-settings')
+  await clickText('.rail-button', 'Chat')
+  await shot('21-light-chat')
+  await clickText('.rail-button', 'Image')
+  await clickText(inImage('.tabs button'), 'Image')
+  await shot('22-light-image')
+  await clickText(inImage('.tabs button'), 'Gallery')
+  await sleep(600)
+  await shot('23-light-gallery')
+  await clickText(inImage('.tabs button'), 'Settings')
+  await shot('24-light-image-settings')
+  await clickText('.rail-button', 'Settings')
+  await clickText('.app-settings [aria-label="Theme"] button', 'Dark')
+  check('and dark again', await waitFor(`getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() === "#0b0b0c"`))
   await js(`window.api.image.loadModel()`)
   check('the image model is loaded', await waitFor(`window.api.image.status().then((s) => s.model.state === "ready")`))
 
@@ -861,6 +1061,36 @@ try {
   check('while the engine stays up', await portInUse(ENGINE_PORT))
   await launchSecond()
   check('and the window comes back again', await waitFor(`document.visibilityState === "visible"`))
+
+  // Folder locking without quitting: kept open on closing to the background, or locked on minimizing.
+  const vaultId = (await js(`window.api.image.setShowHiddenFolders(true).then(() => window.api.image.folders())`)).find((f) => f.name === 'Vault').id
+  const vaultOpen = `window.api.image.folders().then((f) => f.some((x) => x.name === "Vault" && x.unlocked))`
+  await js(`window.api.image.unlockFolder(${q(vaultId)}, "246810")`)
+  await js(`(${privacyRow('When the window closes to the background')}).querySelectorAll("button")[1].click()`)
+  check('open folders can be left open in the background', await waitFor(`window.api.getConfig().then((c) => c.folderPrivacy.lockOnBackground === false)`))
+  closeLikeTheCloseButton()
+  await waitFor(`document.visibilityState === "hidden"`)
+  await sleep(1000)
+  check('and then stay open after the window closed', await js(vaultOpen))
+  await launchSecond()
+  await waitFor(`document.visibilityState === "visible"`)
+  await js(`(${privacyRow('When the window is minimized')}).querySelectorAll("button")[0].click()`)
+  check('minimizing can lock them', await waitFor(`window.api.getConfig().then((c) => c.folderPrivacy.lockOnMinimize === true)`))
+  check('the window can be minimized', minimizeLikeTheButton())
+  // The same reset as quitting: shown hidden folders are hidden again, and open ones locked.
+  check('and minimizing hides shown hidden folders again', await waitFor(`window.api.image.showHiddenFolders().then((shown) => !shown)`, 8000))
+  check('and locks open folders again', (await js(`window.api.image.setShowHiddenFolders(true).then(() => window.api.image.folders())`)).some((f) => f.name === 'Vault' && f.locked && !f.unlocked))
+  await launchSecond()
+  await waitFor(`document.visibilityState === "visible"`)
+  // Switching to another window can lock them too.
+  await js(`window.api.image.unlockFolder(${q(vaultId)}, "246810")`)
+  await js(`(${privacyRow('When another window is chosen')}).querySelectorAll("button")[0].click()`)
+  check('switching to another window can lock them', await waitFor(`window.api.getConfig().then((c) => c.folderPrivacy.lockOnBlur === true)`))
+  check('the window can lose focus', deactivateLikeAnotherWindow())
+  check('and then open folders lock again', await waitFor(`window.api.image.showHiddenFolders().then((shown) => !shown)`, 8000))
+  await launchSecond()
+  await waitFor(`document.visibilityState === "visible"`)
+  await js(`window.api.setFolderPrivacy({ lockOnBlur: false, lockOnMinimize: false, lockOnBackground: true }).then(() => window.api.image.setShowHiddenFolders(false))`)
 
   await click('.app-settings input[value=quit]')
   check('quit can be chosen again', await waitFor(`window.api.getConfig().then((c) => c.background.closeBehavior === "quit")`))

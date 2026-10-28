@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FOLDER_NAME_MAX, FOLDER_PIN } from "@shared/image.js";
+import { matchesShortcut } from "@shared/shortcuts.js";
+import { useShortcuts, useShortcutsRef } from "../../useShortcuts";
+import { saveGalleryView, startView, type GalleryStart, type GalleryViewKind } from "../display";
 import { api } from "../api";
 import { formatSeconds } from "../format";
 import type { GalleryFolder, ImageRecord, MediaKind } from "../types";
 import type { Folders } from "../useFolders";
 
 const PAGE = 60;
+const FOLDERS_KEY = "lis.gallery.folders.v1";
 /** What a tile carries while it is dragged onto a folder. Not a file, so the file drop zones ignore it. */
 export const ITEM_DRAG_TYPE = "application/x-studio-item";
 
-export type GalleryViewKind = { kind: "all" } | { kind: "favorites" } | { kind: "folder"; id: string };
+export type { GalleryViewKind } from "../display";
 
 interface Props {
   version: number | string;
@@ -22,27 +26,75 @@ interface Props {
   onMove: (image: ImageRecord, folderId: string | null) => Promise<void>;
   /** Delete an item for good (already confirmed). */
   onDelete: (image: ImageRecord) => Promise<void>;
+  /** Changes when every open PIN folder was just locked at once (a shortcut, Ctrl+Shift+L by default). */
+  lockedAll?: number;
+  /** Open on All, Favorites or a chosen folder each time, or on the view last open (Settings). */
+  start?: GalleryStart;
 }
 
-export function GalleryView({ version, folders, onOpen, registerUpdater, onError, onMove, onDelete }: Props) {
+export function GalleryView({ version, folders, onOpen, registerUpdater, onError, onMove, onDelete, lockedAll = 0, start = "all" }: Props) {
   const [items, setItems] = useState<ImageRecord[]>([]);
   const [total, setTotal] = useState(0);
   const [query, setQuery] = useState("");
-  const [view, setView] = useState<GalleryViewKind>({ kind: "all" });
+  const [view, setView] = useState<GalleryViewKind>(() => startView(start));
+  // Kept either way, so switching to "where it was left" picks up from now.
+  useEffect(() => saveGalleryView(view), [view]);
   const [media, setMedia] = useState<MediaKind | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [menu, setMenu] = useState<TileMenuAt | null>(null);
   const closeMenu = useCallback(() => setMenu(null), []);
   const request = useRef(0);
+  const sectionRef = useRef<HTMLElement>(null);
+
+  // The folder list (All, Favorites, folders) can be put away; the choice is remembered.
+  const [showFolders, setShowFolders] = useState(() => {
+    try {
+      return localStorage.getItem(FOLDERS_KEY) !== "hidden";
+    } catch {
+      return true;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(FOLDERS_KEY, showFolders ? "shown" : "hidden");
+    } catch {
+      // storage full or disabled: the choice lasts until the window closes
+    }
+  }, [showFolders]);
+  // The sidebar shortcut (Ctrl+B by default), as on the chat side, while the gallery is in front
+  // (the image side stays mounted behind the chat).
+  const shortcuts = useShortcutsRef();
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!matchesShortcut(e, shortcuts.current.toggleSidebar)) return;
+      if (!sectionRef.current || sectionRef.current.offsetParent === null) return;
+      e.preventDefault();
+      setShowFolders((shown) => !shown);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   const folder = view.kind === "folder" ? folders.list.find((f) => f.id === view.id) : undefined;
 
-  // A folder that was just hidden or locked (or deleted) is no longer a view to stay in.
-  const viewGone = view.kind === "folder" && (!folder || (folder.locked && !folder.unlocked));
+  // A folder that was just hidden or locked (or deleted) is no longer a view to stay in. Not
+  // decided before the folder list first arrives, so a remembered folder is not dropped.
+  const viewGone = view.kind === "folder" && folders.loaded && (!folder || (folder.locked && !folder.unlocked));
   useEffect(() => {
     if (viewGone) setView({ kind: "all" });
   }, [viewGone]);
+
+  // Locking everything at once while in a PIN folder goes to Favorites (on the same render,
+  // before the locked list arrives, so the step back to All above does not apply).
+  const folderRef = useRef(folder);
+  folderRef.current = folder;
+  useEffect(() => {
+    if (lockedAll && folderRef.current?.locked) {
+      setView({ kind: "favorites" });
+      setMenu(null);
+    }
+  }, [lockedAll]);
 
   const load = useCallback(async (offset: number) => {
     if (viewGone) return;
@@ -88,10 +140,23 @@ export function GalleryView({ version, folders, onOpen, registerUpdater, onError
   const noun = media ?? "item";
 
   return (
-    <section className="gallery-view">
-      <FolderList view={view} onView={setView} folders={folders} onError={onError} />
+    <section className={`gallery-view ${showFolders ? "" : "folders-hidden"}`} ref={sectionRef}>
+      {showFolders && <FolderList view={view} onView={setView} folders={folders} onError={onError} />}
       <div className="gallery-main">
         <div className="gallery-toolbar">
+          <button
+            className="icon-button folders-toggle"
+            aria-label="Folders"
+            aria-pressed={showFolders}
+            title={`${showFolders ? "Hide" : "Show"} folders (${shortcuts.current.toggleSidebar})`}
+            onClick={() => setShowFolders((shown) => !shown)}
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden>
+              <rect x="3" y="4.5" width="18" height="15" />
+              <path d="M9 4.5v15" />
+              {showFolders ? <rect x="3" y="4.5" width="6" height="15" fill="currentColor" opacity="0.45" stroke="none" /> : null}
+            </svg>
+          </button>
           <h2 className="gallery-heading" title={heading}>{heading}</h2>
           <input
             className="input search"
@@ -406,8 +471,27 @@ function FolderRow({ folder, folders, active, onSelect, onDropItem, onRename, on
   onError: (message: string) => void;
 }) {
   const [mode, setMode] = useState<RowMode>("idle");
+  const lockAllKeys = useShortcuts().lockFolders;
   const drop = useDropTarget(onDropItem);
   const closed = folder.locked && !folder.unlocked;
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // The options menu closes on a click anywhere else, or Escape.
+  useEffect(() => {
+    if (mode !== "menu") return;
+    const away = (e: PointerEvent) => {
+      if (!menuRef.current?.contains(e.target as Node)) setMode("idle");
+    };
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMode("idle");
+    };
+    document.addEventListener("pointerdown", away);
+    document.addEventListener("keydown", key);
+    return () => {
+      document.removeEventListener("pointerdown", away);
+      document.removeEventListener("keydown", key);
+    };
+  }, [mode]);
   const run = (action: () => Promise<unknown>) => () =>
     void action().then(() => setMode("idle"), (e: Error) => onError(e.message));
 
@@ -460,8 +544,11 @@ function FolderRow({ folder, folders, active, onSelect, onDropItem, onRename, on
   }
   if (mode === "menu") {
     return (
-      <div className="folder-menu" role="menu" aria-label={`Options for ${folder.name}`}>
+      <div className="folder-menu" role="menu" aria-label={`Options for ${folder.name}`} ref={menuRef}>
         <p className="folder-menu-title" title={folder.name}>{folder.name}</p>
+        {!closed && (
+          <button role="menuitem" className="ghost small" onClick={() => setMode("rename")}>Rename…</button>
+        )}
         <button role="menuitem" className="ghost small" onClick={run(() => folders.setHidden(folder.id, !folder.hidden))}>
           {folder.hidden ? "Show in the folder list" : "Hide"}
         </button>
@@ -474,6 +561,9 @@ function FolderRow({ folder, folders, active, onSelect, onDropItem, onRename, on
             <button role="menuitem" className="ghost small" onClick={() => setMode("change-pin")}>Change PIN…</button>
             <button role="menuitem" className="ghost small" onClick={() => setMode("remove-pin")}>Remove PIN…</button>
           </>
+        )}
+        {!closed && (
+          <button role="menuitem" className="ghost small danger-text" onClick={() => setMode("confirm")}>Delete folder…</button>
         )}
         {closed && <p className="folder-menu-note">Unlock it to rename, delete or change its PIN.</p>}
         <button className="ghost small" onClick={() => setMode("idle")}>Close</button>
@@ -523,13 +613,13 @@ function FolderRow({ folder, folders, active, onSelect, onDropItem, onRename, on
         )}
       </button>
       <span className="folder-actions">
-        {!closed && (
-          <>
-            <button className="icon-button small" title="Rename" aria-label={`Rename ${folder.name}`} onClick={() => setMode("rename")}>✎</button>
-            <button className="icon-button small" title="Delete folder" aria-label={`Delete ${folder.name}`} onClick={() => setMode("confirm")}>✕</button>
-          </>
+        {/* A folder with a PIN that is open for now locks again in one click. */}
+        {folder.unlocked && (
+          <button className="icon-button small" title={`Lock now (${lockAllKeys} locks every open folder)`} aria-label={`Lock ${folder.name} now`} onClick={run(() => folders.lock(folder.id))}>
+            🔒
+          </button>
         )}
-        <button className="icon-button small" title="Hide or lock" aria-label={`Options for ${folder.name}`} onClick={() => setMode("menu")}>⋯</button>
+        <button className="icon-button small" title="More" aria-label={`Options for ${folder.name}`} onClick={() => setMode("menu")}>⋯</button>
       </span>
     </div>
   );

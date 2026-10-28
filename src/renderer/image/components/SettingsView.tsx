@@ -1,12 +1,15 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import type { ImageEngineState } from '@shared/image.js'
+import type { ImageEngineState, MergeState } from '@shared/image.js'
 import { api } from '../api.js'
+import type { DisplaySettings, ResultDisplay } from '../display.js'
 import { formatBytes } from '../format.js'
-import type { MemoryMode, Settings, Status } from '../types.js'
+import { useShortcuts } from '../../useShortcuts.js'
+import type { GalleryFolder, MemoryMode, Settings, Status } from '../types.js'
 import { EngineSetupPanel } from './EngineSetupPanel.js'
 import { ModelDownloadPanel } from './ModelDownloadPanel.js'
 import { ImportModelPanel } from './ImportModelPanel.js'
 import { ModelInspectPanel } from './ModelInspectPanel.js'
+import { MergePanel } from './MergePanel.js'
 
 const MODES: { value: MemoryMode; label: string; detail: string }[] = [
   { value: 'auto', label: 'Automatic', detail: 'Picks the fastest plan that fits this GPU.' },
@@ -96,16 +99,25 @@ interface Props {
   engine: ImageEngineState
   /** Changes when folders were hidden, shown, locked or unlocked (an engine event). */
   privacyVersion?: number
+  /** What the Create and Video tabs show once something is made. */
+  display: DisplaySettings
+  onDisplayChange: (display: DisplaySettings) => void
+  /** The gallery's folders this session sees, to choose one to open on. */
+  folders?: GalleryFolder[]
+  /** How the last gallery merge went, or is going. */
+  merge?: MergeState
 }
 
 type Message = { kind: 'ok' | 'error'; text: string } | null
 
-export function SettingsView({ status, engine, privacyVersion = 0 }: Props): React.JSX.Element {
+export function SettingsView({ status, engine, privacyVersion = 0, display, onDisplayChange, folders = [], merge = { state: 'idle' } }: Props): React.JSX.Element {
   const [settings, setSettings] = useState<Settings | null>(null)
   const [python, setPython] = useState<string | null>(null)
   const [message, setMessage] = useState<Message>(null)
   const [includeSettings, setIncludeSettings] = useState(false)
   const [showHidden, setShowHidden] = useState(false)
+  const lockAllKeys = useShortcuts().lockFolders
+  const startFolder = display.galleryStart.startsWith('folder:') ? display.galleryStart.slice('folder:'.length) : null
   const running = engine.state === 'running'
 
   useEffect(() => {
@@ -138,6 +150,16 @@ export function SettingsView({ status, engine, privacyVersion = 0 }: Props): Rea
 
   const save = (changes: Partial<Settings>): Promise<void> =>
     act(async () => setSettings(await api.saveSettings(changes)), 'Saved. Changes apply the next time the model loads.')
+
+  type Media = 'image' | 'video'
+  const setDisplay = (media: Media, key: keyof ResultDisplay, value: boolean): void =>
+    onDisplayChange({ ...display, [media]: { ...display[media], [key]: value } })
+  const displayToggle = (media: Media, key: keyof ResultDisplay, label: string): React.JSX.Element => (
+    <label className="toggle wrap">
+      <input type="checkbox" checked={display[media][key]} onChange={(e) => setDisplay(media, key, e.target.checked)} />
+      <span>{label}</span>
+    </label>
+  )
 
   const model = status?.model
   const imageProfile = status?.image?.profile ?? null
@@ -470,6 +492,80 @@ export function SettingsView({ status, engine, privacyVersion = 0 }: Props): Rea
       <ModelInspectPanel enabled={running} />
 
       <div className="card">
+        <h2>After making something</h2>
+        {displayToggle('image', 'showResult', 'Show a finished image on screen')}
+        {displayToggle('image', 'showStrip', 'Show this session’s images as thumbnails under it')}
+        {displayToggle('video', 'showResult', 'Show a finished video on screen')}
+        {displayToggle('video', 'showStrip', 'Show this session’s videos as thumbnails under it')}
+        <span className="hint">
+          Each one on its own. Whatever is made goes to the gallery either way. With the result off, the screen says
+          it is done, and a thumbnail picked from the strip still shows there.
+        </span>
+      </div>
+
+      <div className="card">
+        <h2>Gallery</h2>
+        <div className="field">
+          <span className="field-label">Opens on</span>
+          <div className="chips" role="radiogroup" aria-label="The gallery opens on">
+            {(
+              [
+                ['all', 'All'],
+                ['favorites', 'Favorites'],
+                ['folder', 'A folder'],
+                ['last', 'Where it was left']
+              ] as const
+            ).map(([value, label]) => {
+              const active = value === 'folder' ? startFolder !== null : display.galleryStart === value
+              return (
+                <button
+                  key={value}
+                  role="radio"
+                  aria-checked={active}
+                  className={`chip ${active ? 'active' : ''}`}
+                  disabled={value === 'folder' && folders.length === 0}
+                  title={value === 'folder' && folders.length === 0 ? 'Make a folder in the gallery first' : undefined}
+                  onClick={() =>
+                    onDisplayChange({
+                      ...display,
+                      galleryStart: value === 'folder' ? `folder:${startFolder ?? folders[0]!.id}` : value
+                    })
+                  }
+                >
+                  {label}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+        {startFolder !== null && (
+          <label className="field">
+            <span className="field-label">Folder</span>
+            <select
+              className="input"
+              aria-label="The folder the gallery opens on"
+              value={startFolder}
+              onChange={(e) => onDisplayChange({ ...display, galleryStart: `folder:${e.target.value}` })}
+            >
+              {!folders.some((f) => f.id === startFolder) && <option value={startFolder}>A folder no longer here</option>}
+              {folders.map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.name}
+                  {f.locked ? ' (PIN)' : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+        <span className="hint">
+          Where it was left: All, Favorites or the folder last open, kept across restarts. A chosen or last folder that
+          is locked, hidden or gone by then opens as All.
+        </span>
+      </div>
+
+      <MergePanel enabled={running} state={merge} />
+
+      <div className="card">
         <h2>Hidden folders</h2>
         <label className="toggle">
           <input
@@ -489,7 +585,9 @@ export function SettingsView({ status, engine, privacyVersion = 0 }: Props): Rea
         <span className="hint">
           Hide a folder from its menu in the gallery: it leaves the folder list, and what it holds leaves every view
           and search. This shows them again for now; closing the window hides them, and locks every unlocked folder,
-          again. Hiding and locking keep the studio&rsquo;s own views private. They do not encrypt anything: the files
+          again. {lockAllKeys} locks every open folder at once, from anywhere in the studio. The studio&rsquo;s own
+          Settings (in the bar on the left) can change that key, and lock folders on minimizing as well. Hiding and locking keep
+          the studio&rsquo;s own views private. They do not encrypt anything: the files
           stay on disk as they are.
         </span>
       </div>

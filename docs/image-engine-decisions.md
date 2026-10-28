@@ -434,3 +434,54 @@ avoids reading 28 GB per clip on machines that can afford it.
 experts kept, few-step, image to video, the older fp8 layout) and synthetic files. Real
 files, video quality, speed, and whether a given few-step file's shift suits plain Euler
 steps are the user's to check.
+
+## D19 — Merging other galleries into this one
+
+**What.** Settings → Merge galleries takes one or more other galleries (an `outputs`
+folder from a backup, an older install or another computer) and copies what they hold
+into this studio's gallery: every image and video with its file, prompt, settings,
+provenance and stats, whether it is a favourite and which folder it is in, and every
+folder with its name, hidden setting and PIN (the stored hash, so the same PIN opens it).
+Items keep their creation time. `image_engine/gallery_merge.py`.
+
+**Why into this gallery.** The studio reads one gallery, so a merge anywhere else could not
+be seen without a second feature to switch galleries. Merging in shows the result at once,
+the engine that owns the index does the writing, and the other folders are only read.
+
+**Nothing lost, nothing overwritten.**
+- Every item either comes across or is counted with its reason: already here, or
+  unreadable (a missing file or a damaged record).
+- An item is "already here" only when its id, its file byte for byte and its whole
+  generation record (prompt, settings, seed, model, provenance, when it was made) match
+  one here or one already coming: a backup, or a gallery merged before. Anything less and
+  both are kept, the newcomer with a new id. Being a favourite and the folder it is in are
+  how it is filed, not what it is: they do not count, and differences are reported.
+- A folder with the same id and exactly the same name as one here is that folder, whatever
+  each holds: its items join it, and this gallery's hidden setting and PIN stay. The same
+  name alone (in any case) is a clash to resolve.
+- Folder names stay unique regardless of case. Clashes are listed before anything is
+  copied; each side can be renamed, or names suggested ("Trips (backup1)"). This
+  gallery's folders are renamed only on purpose, and a locked one only once unlocked.
+- No file here is replaced: a path in use gets a number, and each copy is linked into
+  place, which fails rather than replace a file that appeared meanwhile.
+- Everything is copied before the index changes, in one transaction. On any failure
+  every file copied so far is removed, and the gallery is as it was.
+- There must be room for the copies on the gallery's drive before anything starts.
+- A merge can be stopped from the window; what was copied so far is removed and nothing
+  is added. A file's hash is remembered by its size and modification time, so looking
+  again after a folder is renamed does not read every file again.
+
+**Older and newer galleries.** A gallery from an older version lacks later columns; they
+take the same defaults the gallery itself gives them. Columns from a newer version are
+left out and named in the report. A PIN in a form this version cannot check is kept, so
+its folder stays locked here rather than opening.
+
+**Privacy.** As in the gallery, a hidden folder's name only counts, and is only shown,
+while hidden folders are shown. A merge never tells that a hidden folder of some name
+exists.
+
+**Verified.** Engine tests on synthetic galleries: everything comes and the sources are
+untouched byte for byte; a backup adds nothing; an id clash keeps both; no file here is
+replaced; a failure part way and a full drive leave the gallery as it was; older and
+newer schemas; unsafe paths; names differing in case. The end-to-end test merges two
+galleries (a clash, a copied item, a hidden locked folder) from the window.

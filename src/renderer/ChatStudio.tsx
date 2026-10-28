@@ -7,6 +7,8 @@ import type { RiskClass } from '@shared/tools.js'
 import type { UsageSnapshot } from '@shared/usage.js'
 import type { WorkspaceSnapshot, WorkspaceState } from '@shared/workspace.js'
 import type { ChangeGroup } from '@shared/changes.js'
+import { matchesShortcut } from '@shared/shortcuts.js'
+import { useShortcuts } from './useShortcuts.js'
 import { ActivityLog } from './components/ActivityLog.js'
 import { ApprovalDialog } from './components/ApprovalDialog.js'
 import { PermissionsPanel } from './components/PermissionsPanel.js'
@@ -68,18 +70,19 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
   useEffect(() => localStorage.setItem(SIDEBAR_KEY, showSidebar ? 'shown' : 'hidden'), [showSidebar])
   const toggleSidebar = useCallback(() => setShowSidebar((shown) => !shown), [])
 
-  // Ctrl+B, as in most editors, while the chat tab is in front.
+  // Ctrl+B by default (Settings can change it), as in most editors, while the chat tab is in front.
+  const shortcuts = useShortcuts()
   useEffect(() => {
     if (!visible || tab !== 'chat') return
     const onKey = (e: KeyboardEvent): void => {
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'b') {
+      if (matchesShortcut(e, shortcuts.toggleSidebar)) {
         e.preventDefault()
         toggleSidebar()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [visible, tab, toggleSidebar])
+  }, [visible, tab, toggleSidebar, shortcuts.toggleSidebar])
 
   const say = useCallback((text: string) => {
     setTurns((prev) => [...prev, { id: `note-${Date.now()}`, role: 'system', text, streaming: false }])
@@ -348,7 +351,7 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
           className={`icon-button sidebar-toggle ${tab === 'chat' ? '' : 'invisible'}`}
           aria-label="Folder and chats"
           aria-pressed={showSidebar}
-          title={`${showSidebar ? 'Hide' : 'Show'} folder and chats (Ctrl+B)`}
+          title={`${showSidebar ? 'Hide' : 'Show'} folder and chats (${shortcuts.toggleSidebar})`}
           tabIndex={tab === 'chat' ? undefined : -1}
           onClick={toggleSidebar}
         >

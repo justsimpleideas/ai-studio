@@ -47,6 +47,42 @@
   --mono: 'Cascadia Mono', ui-monospace, 'SF Mono', Consolas, monospace;
   --label-spacing: 0.12em;
 
+  /* the dimming behind dialogs */
+  --backdrop: rgb(4 4 5 / 0.8);
+
   /* motion */
   --fast: 0.12s;
+}
+
+/*
+ * The light theme, chosen in Settings: white panels on a pale neutral grey, with the
+ * same accents darkened until text in them reads on white (4.5:1 or more). Only the
+ * colours change; shape, type and motion stay. The window's title bar buttons follow
+ * from the main process (THEME_COLORS there mirrors --bg, --panel and --muted).
+ */
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  --bg: #f3f3f5;
+  --panel: #ffffff;
+  --panel-2: #ececef;
+  --line: #dcdce1;
+  --line-strong: #c3c3ca;
+  --text: #18181b;
+  --muted: #5d5d66;
+
+  --accent: #006f80;
+  --accent-strong: #005b69;
+  --accent-ink: #ffffff;
+  --signal: #cc1f55;
+  --ok: #0f7a52;
+  --warn: #8a5a00;
+  --danger: #c41e3d;
+
+  --glow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent),
+    0 0 10px color-mix(in srgb, var(--accent) 18%, transparent);
+  --glow-soft: 0 0 8px color-mix(in srgb, var(--accent) 20%, transparent);
+
+  --shadow: 0 12px 36px rgb(0 0 0 / 0.14);
+  --backdrop: rgb(24 24 27 / 0.42);
 }

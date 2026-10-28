@@ -1,5 +1,7 @@
+import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import type { BrowserWindow, Dialog, IpcMain, OpenDialogOptions } from 'electron'
 import {
   FOLDER_PIN,
@@ -247,6 +249,59 @@ export function registerImageHandlers({
   )
 
   ipcMain.handle('image:lockFolder', (_e, id: unknown) => api('POST', `/api/folders/${requireId(id)}/lock`, {}))
+
+  // Merging other galleries. The window holds tokens; the paths stay here, chosen in a dialog.
+  const mergeSources = new Map<string, string>()
+  let mergePicks = 0
+  ipcMain.handle('image:pickMergeSource', async () => {
+    // For the end-to-end test: folders named up front, one per pick in turn.
+    const preset = process.env['STUDIO_PICK_MERGE_SOURCES']?.split(path.delimiter).filter(Boolean)
+    const picked = preset?.length
+      ? preset[mergePicks++ % preset.length]!
+      : await pickOpenPath('STUDIO_PICK_MERGE_SOURCE', {
+          title: 'Choose a gallery to merge: an outputs folder',
+          properties: ['openDirectory'],
+          buttonLabel: 'Merge this gallery'
+        })
+    if (!picked) return null
+    // The outputs folder itself, or the folder holding it (the studio's image folder, say).
+    const folder = fs.existsSync(path.join(picked, 'gallery.db'))
+      ? picked
+      : fs.existsSync(path.join(picked, 'outputs', 'gallery.db'))
+        ? path.join(picked, 'outputs')
+        : null
+    if (!folder) throw new Error('That folder is not a studio gallery. Choose an “outputs” folder: the one that holds gallery.db.')
+    const token = randomUUID()
+    mergeSources.set(token, folder)
+    return { token, label: path.basename(folder), path: folder }
+  })
+
+  const mergeBody = (tokens: unknown, renames: unknown): { sources: string[]; renames: Record<string, string> } => {
+    if (!Array.isArray(tokens) || tokens.length === 0) throw new Error('Choose a gallery to merge first.')
+    const sources = tokens.map((t) => {
+      const folder = typeof t === 'string' ? mergeSources.get(t) : undefined
+      if (!folder) throw new Error('That gallery is no longer chosen. Add it again.')
+      return folder
+    })
+    const clean: Record<string, string> = {}
+    if (renames && typeof renames === 'object') {
+      for (const [key, name] of Object.entries(renames)) {
+        if (/^(target|\d{1,2}):[0-9a-f]{16}$/.test(key) && typeof name === 'string' && name.length <= 200) clean[key] = name
+      }
+    }
+    return { sources, renames: clean }
+  }
+
+  ipcMain.handle('image:inspectMerge', (_e, tokens: unknown, renames: unknown) =>
+    api('POST', '/api/gallery/merge/inspect', mergeBody(tokens, renames))
+  )
+  ipcMain.handle('image:startMerge', (_e, tokens: unknown, renames: unknown) =>
+    api('POST', '/api/gallery/merge', mergeBody(tokens, renames))
+  )
+  ipcMain.handle('image:mergeStatus', () => api('GET', '/api/gallery/merge'))
+  ipcMain.handle('image:cancelMerge', async () => {
+    await api('POST', '/api/gallery/merge/cancel', {})
+  })
 
   ipcMain.handle('image:showHiddenFolders', async () =>
     ((await api('GET', '/api/folders')) as { show_hidden: boolean }).show_hidden

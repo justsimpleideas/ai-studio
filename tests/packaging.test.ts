@@ -20,4 +20,14 @@ describe('what the installer ships', () => {
     for (const script of used) expect(shipped, script).toContain(script)
     for (const script of shipped) expect(fs.existsSync(path.join(root, 'image-engine', 'scripts', script)), script).toBe(true)
   })
+
+  // Without its own copy the packaged tray icon comes out blank: the app archive holds out/ only.
+  it('ships the icon files the tray reads, next to the app', () => {
+    const config = read('electron-builder.yml')
+    for (const name of ['icon.ico', 'icon.png']) {
+      expect(config, name).toMatch(new RegExp(`- from: resources/${name.replace('.', '\\.')}\\s+to: ${name.replace('.', '\\.')}`))
+      expect(fs.existsSync(path.join(root, 'resources', name)), name).toBe(true)
+    }
+    expect(read('src/main/index.ts')).toMatch(/app\.isPackaged \? path\.join\(process\.resourcesPath, name\)/)
+  })
 })

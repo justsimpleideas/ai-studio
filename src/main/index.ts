@@ -7,7 +7,10 @@ import {
   composeSystemSections,
   isCloseBehavior,
   isKvCacheType,
+  isTheme,
   parseBackground,
+  parseFolderPrivacy,
+  type Theme,
   type BackgroundPreferences,
   type GlobalRule,
   type SystemSection
@@ -21,7 +24,9 @@ import type { ApprovalRequest, ApprovalResponse, AuditEntry, ToolOutcome } from 
 import type { EngineToMain, LoadRequest } from '@shared/engine-protocol.js'
 import { validateToolCall } from '@shared/validate.js'
 import { IMAGE_ENGINE_PORT, IMAGE_SCHEME } from '@shared/image.js'
+import { SHORTCUTS, normalizeShortcut, shortcutProblem, type ShortcutMap } from '@shared/shortcuts.js'
 import { BackgroundUnloader, type UnloadTarget } from './background.js'
+import { dialogOpen, watchDialogs } from './dialog-watch.js'
 import { Broker } from './broker/index.js'
 import { canonicalize, comparablePath } from './broker/paths.js'
 import { EngineSupervisor } from './engine/supervisor.js'
@@ -72,6 +77,8 @@ protocol.registerSchemesAsPrivileged([
 
 const userDataRoot = path.join(app.getPath('userData'), 'userData')
 const store = new ConfigStore(path.join(userDataRoot, 'config.json'))
+// Before any dialog can open: the folder lock on losing focus skips the studio's own dialogs.
+watchDialogs()
 const workspaces = new WorkspaceStore(path.join(userDataRoot, 'workspaces'))
 const secrets = new SecretStore(path.join(userDataRoot, 'secrets.json'), safeStorage)
 
@@ -719,8 +726,9 @@ function ensureTray(): void {
 }
 
 /**
- * Hidden gallery folders hide again and unlocked ones lock again whenever the window
- * goes away, as they do when the studio quits and the engine with it (gallery.py).
+ * Hidden gallery folders hide again and unlocked ones lock again when the window goes
+ * away, as they do when the studio quits and the engine with it (gallery.py): always when
+ * it closes, and on going to the background or being minimized as chosen in Settings.
  */
 function resetGalleryPrivacy(): void {
   if (imageEngine.state.state !== 'running') return
@@ -730,7 +738,7 @@ function resetGalleryPrivacy(): void {
 function toBackground(): void {
   if (!window) return
   window.hide()
-  resetGalleryPrivacy()
+  if (store.get().folderPrivacy.lockOnBackground) resetGalleryPrivacy()
   ensureTray()
   backgroundUnloader.start()
   if (!toldAboutTray) {
@@ -762,21 +770,40 @@ function measureUsage(): void {
   })
 }
 
-// The icon on disk is for unpackaged runs; a packaged app carries it in the
-// executable, set by electron-builder from the same resources folder.
+// The app icon as a file, for the window and the tray. Unpackaged runs read it from the
+// resources folder; a packaged app carries a copy next to its archive (extraResources in
+// electron-builder.yml), since the tray cannot take its icon from the executable.
 function windowIcon(): { icon?: string } {
-  const file = path.join(import.meta.dirname, '../../resources', process.platform === 'win32' ? 'icon.ico' : 'icon.png')
+  const name = process.platform === 'win32' ? 'icon.ico' : 'icon.png'
+  const file = app.isPackaged ? path.join(process.resourcesPath, name) : path.join(import.meta.dirname, '../../resources', name)
   return fs.existsSync(file) ? { icon: file } : {}
 }
 
 // The top bars in the renderer double as the title bar: the system caption
 // buttons are drawn over their right end, in the same colours (--panel and
-// --muted in tokens.css). One pixel short of the bars' 54 px, so their bottom
-// border runs under the buttons too. macOS keeps its own title bar.
-const titleBar: Electron.BrowserWindowConstructorOptions =
-  process.platform === 'darwin'
-    ? {}
-    : { titleBarStyle: 'hidden', titleBarOverlay: { color: '#131314', symbolColor: '#8f8f97', height: 53 } }
+// --muted in tokens.css, for each theme). One pixel short of the bars' 54 px, so
+// their bottom border runs under the buttons too. macOS keeps its own title bar.
+const THEME_COLORS: Record<Theme, { bg: string; panel: string; muted: string }> = {
+  dark: { bg: '#0b0b0c', panel: '#131314', muted: '#8f8f97' },
+  light: { bg: '#f3f3f5', panel: '#ffffff', muted: '#5d5d66' }
+}
+const TITLE_BAR_HEIGHT = 53
+
+function titleBar(theme: Theme): Electron.BrowserWindowConstructorOptions {
+  if (process.platform === 'darwin') return {}
+  const colors = THEME_COLORS[theme]
+  return { titleBarStyle: 'hidden', titleBarOverlay: { color: colors.panel, symbolColor: colors.muted, height: TITLE_BAR_HEIGHT } }
+}
+
+/** Repaint the window's own parts (behind the page, and the caption buttons) in a theme's colours. */
+function applyTheme(theme: Theme): void {
+  if (!window) return
+  const colors = THEME_COLORS[theme]
+  window.setBackgroundColor(colors.bg)
+  if (process.platform !== 'darwin') {
+    window.setTitleBarOverlay({ color: colors.panel, symbolColor: colors.muted, height: TITLE_BAR_HEIGHT })
+  }
+}
 
 function createWindow(): void {
   window = new BrowserWindow({
@@ -785,10 +812,10 @@ function createWindow(): void {
     minWidth: 940,
     minHeight: 620,
     show: false,
-    backgroundColor: '#0b0b0c',
+    backgroundColor: THEME_COLORS[store.get().theme].bg,
     title: 'Local AI Studio',
     ...windowIcon(),
-    ...titleBar,
+    ...titleBar(store.get().theme),
     webPreferences: {
       preload: path.join(import.meta.dirname, '../preload/index.cjs'),
       contextIsolation: true,
@@ -809,6 +836,14 @@ function createWindow(): void {
     if (quitting || store.get().background.closeBehavior !== 'background') return
     event.preventDefault()
     toBackground()
+  })
+  // Minimizing, or switching to another program, can lock open folders again too, if chosen
+  // (config.folderPrivacy). The studio's own dialogs take focus as well; they do not count.
+  window.on('minimize', () => {
+    if (store.get().folderPrivacy.lockOnMinimize) resetGalleryPrivacy()
+  })
+  window.on('blur', () => {
+    if (store.get().folderPrivacy.lockOnBlur && !dialogOpen()) resetGalleryPrivacy()
   })
   window.on('closed', () => {
     window = null
@@ -835,9 +870,12 @@ function createWindow(): void {
 
   const devUrl = process.env['ELECTRON_RENDERER_URL']
   if (devUrl) {
-    void window.loadURL(devUrl)
+    // The theme rides along, so the page is in its colours before its first paint.
+    const url = new URL(devUrl)
+    url.searchParams.set('theme', store.get().theme)
+    void window.loadURL(url.toString())
   } else {
-    void window.loadFile(path.join(import.meta.dirname, '../renderer/index.html'))
+    void window.loadFile(path.join(import.meta.dirname, '../renderer/index.html'), { query: { theme: store.get().theme } })
   }
 }
 
@@ -1071,6 +1109,49 @@ function registerHandlers(): void {
     return store.update((c) => {
       c.background = parseBackground(raw)
     })
+  })
+
+  ipcMain.handle('config:setFolderPrivacy', async (_e, prefs: unknown) => {
+    const raw = prefs as Record<string, unknown> | null
+    const flags = ['lockOnBlur', 'lockOnMinimize', 'lockOnBackground']
+    if (!raw || typeof raw !== 'object' || !flags.every((flag) => typeof raw[flag] === 'boolean')) {
+      throw new Error('Invalid setting.')
+    }
+    const config = await store.update((c) => {
+      c.folderPrivacy = parseFolderPrivacy(raw)
+    })
+    toRenderer('config:changed', config)
+    return config
+  })
+
+  ipcMain.handle('config:setTheme', async (_e, theme: unknown) => {
+    if (!isTheme(theme)) throw new Error('Unknown theme.')
+    const config = await store.update((c) => {
+      c.theme = theme
+    })
+    applyTheme(theme)
+    toRenderer('config:changed', config)
+    return config
+  })
+
+  ipcMain.handle('config:setShortcuts', async (_e, shortcuts: unknown) => {
+    // Every binding checked as the window would show it; one unusable binding refuses the lot.
+    const raw = (shortcuts && typeof shortcuts === 'object' ? shortcuts : {}) as Record<string, unknown>
+    const next = {} as ShortcutMap
+    for (const { id } of SHORTCUTS) {
+      const normal = normalizeShortcut(raw[id])
+      if (!normal) throw new Error('That is not a key a shortcut can use.')
+      next[id] = normal
+    }
+    for (const { id } of SHORTCUTS) {
+      const problem = shortcutProblem(id, next[id], next)
+      if (problem) throw new Error(problem)
+    }
+    const config = await store.update((c) => {
+      c.shortcuts = next
+    })
+    toRenderer('config:changed', config)
+    return config
   })
 
   ipcMain.handle('model:unload', () => {

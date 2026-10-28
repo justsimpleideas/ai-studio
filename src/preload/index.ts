@@ -23,6 +23,9 @@ const api: RendererApi = {
   setConfirmEverything: (value) => ipcRenderer.invoke('config:setConfirmEverything', value),
   setKvCache: (kv) => ipcRenderer.invoke('config:setKvCache', kv),
   setBackground: (prefs) => ipcRenderer.invoke('config:setBackground', prefs),
+  setFolderPrivacy: (prefs) => ipcRenderer.invoke('config:setFolderPrivacy', prefs),
+  setShortcuts: (shortcuts) => ipcRenderer.invoke('config:setShortcuts', shortcuts),
+  setTheme: (theme) => ipcRenderer.invoke('config:setTheme', theme),
 
   clearSessionGrants: () => ipcRenderer.invoke('session:clearGrants'),
 
@@ -100,6 +103,11 @@ const api: RendererApi = {
     setFolderPin: (id, pin, current) => ipcRenderer.invoke('image:setFolderPin', id, pin, current),
     unlockFolder: (id, pin) => ipcRenderer.invoke('image:unlockFolder', id, pin),
     lockFolder: (id) => ipcRenderer.invoke('image:lockFolder', id),
+    pickMergeSource: () => ipcRenderer.invoke('image:pickMergeSource'),
+    inspectMerge: (tokens, renames) => ipcRenderer.invoke('image:inspectMerge', tokens, renames),
+    startMerge: (tokens, renames) => ipcRenderer.invoke('image:startMerge', tokens, renames),
+    mergeStatus: () => ipcRenderer.invoke('image:mergeStatus'),
+    cancelMerge: () => ipcRenderer.invoke('image:cancelMerge'),
     showHiddenFolders: () => ipcRenderer.invoke('image:showHiddenFolders'),
     setShowHiddenFolders: (show) => ipcRenderer.invoke('image:setShowHiddenFolders', show),
     saveImageAs: (id) => ipcRenderer.invoke('image:saveAs', id),

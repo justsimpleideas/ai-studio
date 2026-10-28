@@ -25,6 +25,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import asdict, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,6 +40,7 @@ from .backends import Backend
 from .config import SettingsStore
 from .events import EventHub
 from .gallery import MEDIA, FolderError, FolderLocked, Gallery, TooManyTries, valid_id
+from . import gallery_merge
 from .jobs import JobQueue, TaskRequest
 from .lora_library import LoraLibrary, LoraLibraryError
 from .params import (DEFAULTS, MAX_COUNT, MAX_SIDE, MAX_STEPS, MIN_SIDE, SIDE_MULTIPLE, VIDEO_FRAME_STEP,
@@ -103,6 +105,10 @@ class App:
         self.settings, self.backend, self.gallery = settings, backend, gallery
         self.events, self.jobs = events, jobs
         self.training, self.loras = training, loras
+        # One gallery merge at a time (gallery_merge.py), reported as "merge" events.
+        self.merge_lock = threading.Lock()
+        self.merge_state: dict[str, Any] = {"state": "idle"}
+        self.merge_cancel = threading.Event()
         self.token = token
         self.stopping = threading.Event()
         self.set_port(port)
@@ -489,6 +495,100 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         app.gallery.set_show_hidden(body["show_hidden"])
         privacy_changed()
         return {"show_hidden": app.gallery.show_hidden}
+
+    def merge_request(h) -> tuple[list[gallery_merge.Source], dict[str, str]]:
+        """{"sources": [folder, ...], "renames": {"<key>": "<name>"}}: the other galleries, opened read-only."""
+        body = h.json_body()
+        if not isinstance(body, dict) or set(body) - {"sources", "renames"}:
+            raise HttpError(HTTPStatus.BAD_REQUEST, "expected {\"sources\": [...], \"renames\": {...}}")
+        paths, renames = body.get("sources"), body.get("renames") or {}
+        if (not isinstance(paths, list) or not paths or len(paths) > gallery_merge.MAX_SOURCES
+                or not all(isinstance(p, str) and p for p in paths)):
+            raise HttpError(HTTPStatus.BAD_REQUEST, f"name 1 to {gallery_merge.MAX_SOURCES} gallery folders")
+        if not isinstance(renames, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in renames.items()):
+            raise HttpError(HTTPStatus.BAD_REQUEST, "renames must map keys to names")
+        here = app.gallery.root.resolve()
+        roots: list[Path] = []
+        for raw in paths:
+            root = Path(raw)
+            if not root.is_absolute():
+                raise HttpError(HTTPStatus.BAD_REQUEST, "gallery folders must be absolute paths")
+            root = root.resolve()
+            if root == here or here.is_relative_to(root) or root.is_relative_to(here):
+                raise HttpError(HTTPStatus.BAD_REQUEST, "That is this studio's own gallery, or holds it, or is inside it.")
+            if root in roots:
+                raise HttpError(HTTPStatus.BAD_REQUEST, f"“{root.name}” is in the list twice.")
+            roots.append(root)
+        try:
+            sources = [gallery_merge.open_source(root) for root in roots]
+        except gallery_merge.MergeError as exc:
+            raise HttpError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        # Two galleries with the same label are told apart by the folder above that.
+        labels = [s.label for s in sources]
+        for s in sources:
+            if labels.count(s.label) > 1:
+                s.label = f"{s.root.parent.parent.name}/{s.label}"
+        return sources, renames
+
+    def merge_plan(sources: list[gallery_merge.Source], renames: dict[str, str]) -> gallery_merge.Plan:
+        lora_ids = {item["id"] for item in app.loras.list()} if app.loras is not None else None
+        try:
+            return gallery_merge.plan_merge(app.gallery, sources, renames, lora_ids)
+        except (gallery_merge.MergeError, FolderError) as exc:
+            raise HttpError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+    @route("POST", r"/api/gallery/merge/inspect")
+    def inspect_merge(h, m):
+        sources, renames = merge_request(h)
+        return gallery_merge.describe(merge_plan(sources, renames), app.gallery.show_hidden)
+
+    @route("GET", r"/api/gallery/merge")
+    def merge_status(h, m):
+        return app.merge_state
+
+    @route("POST", r"/api/gallery/merge")
+    def start_merge(h, m):
+        """Plan again (the gallery may have changed since the window looked) and merge in the background."""
+        sources, renames = merge_request(h)
+        plan = merge_plan(sources, renames)
+        if plan.problems:
+            raise HttpError(HTTPStatus.CONFLICT, " ".join(plan.problems))
+        if not app.merge_lock.acquire(blocking=False):
+            raise HttpError(HTTPStatus.CONFLICT, "A merge is already running.")
+        app.merge_cancel.clear()
+
+        def report(state: dict[str, Any]) -> None:
+            app.merge_state = state
+            app.events.publish("merge", state)
+
+        def run() -> None:
+            last = 0.0
+            try:
+                def progress(done: int, total: int) -> None:
+                    nonlocal last
+                    now = time.monotonic()
+                    if done == total or now - last > 0.25:
+                        last = now
+                        report({"state": "copying", "done": done, "total": total})
+                report({"state": "copying", "done": 0, "total": 1})
+                result = gallery_merge.run_merge(app.gallery, plan, progress, app.merge_cancel)
+                report({"state": "done", "result": result})
+            except Exception as exc:  # reported to the window; the gallery is as it was
+                message = str(exc) if isinstance(exc, gallery_merge.MergeError) else f"The merge failed: {exc}"
+                report({"state": "failed", "message": message})
+            finally:
+                app.merge_lock.release()
+                privacy_changed()  # new folders and items: every view and folder list reloads
+
+        threading.Thread(target=run, name="gallery-merge", daemon=True).start()
+        return {"started": True, "items": len(plan.items)}
+
+    @route("POST", r"/api/gallery/merge/cancel")
+    def cancel_merge(h, m):
+        """Stop a running merge: what was copied so far is removed, and nothing is added."""
+        h.json_body()
+        app.merge_cancel.set()
+        return {"cancelling": app.merge_lock.locked()}
 
     @route("POST", r"/api/gallery/privacy/reset")
     def reset_privacy(h, m):

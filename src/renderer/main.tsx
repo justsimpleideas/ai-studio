@@ -5,6 +5,11 @@ import './styles/tokens.css'
 import './styles/app.css'
 import { App } from './App.js'
 
+// The theme the main process loaded the page with, set before the first paint; Settings
+// changes it afterwards through the config (App, useTheme).
+const theme = new URLSearchParams(location.search).get('theme')
+if (theme === 'light') document.documentElement.dataset['theme'] = 'light'
+
 const container = document.getElementById('root')
 if (!container) throw new Error('Missing #root')
 

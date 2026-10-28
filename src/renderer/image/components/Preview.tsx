@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { formatDuration, formatRemaining, stageLabel } from "../format";
+import type { ResultDisplay } from "../display";
 import type { ImageRecord, Job } from "../types";
 
 interface Props {
@@ -9,14 +10,16 @@ interface Props {
   onCancel: (job: Job) => void;
   modelMessage: string;
   starting: boolean;
+  display: ResultDisplay;
 }
 
-export function Preview({ job, images, onOpen, onCancel, modelMessage, starting }: Props) {
+export function Preview({ job, images, onOpen, onCancel, modelMessage, starting, display }: Props) {
   const latest = images[0] ?? null;
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const selected = images.find((i) => i.id === selectedId) ?? latest;
+  // With results off, the stage shows only what is picked from the strip.
+  const selected = images.find((i) => i.id === selectedId) ?? (display.showResult ? latest : null);
 
-  // A fresh result always takes over the stage.
+  // A fresh result takes over the stage, or clears it when results are off.
   useEffect(() => setSelectedId(null), [latest?.id]);
 
   return (
@@ -27,11 +30,11 @@ export function Preview({ job, images, onOpen, onCancel, modelMessage, starting 
             <img src={selected.image_url} alt={selected.prompt} width={selected.width} height={selected.height} />
           </button>
         ) : (
-          <EmptyStage busy={!!job} starting={starting} />
+          <EmptyStage busy={!!job} starting={starting} done={!!latest} />
         )}
         {job && <Progress job={job} modelMessage={modelMessage} onCancel={() => onCancel(job)} />}
       </div>
-      {images.length > 0 && (
+      {display.showStrip && images.length > 0 && (
         <div className="filmstrip" aria-label="This session">
           {images.map((img) => (
             <button
@@ -50,7 +53,7 @@ export function Preview({ job, images, onOpen, onCancel, modelMessage, starting 
   );
 }
 
-function EmptyStage({ busy, starting }: { busy: boolean; starting: boolean }) {
+function EmptyStage({ busy, starting, done }: { busy: boolean; starting: boolean; done: boolean }) {
   return (
     <div className="empty-stage">
       <svg viewBox="0 0 64 64" width="56" height="56" aria-hidden>
@@ -58,8 +61,18 @@ function EmptyStage({ busy, starting }: { busy: boolean; starting: boolean }) {
         <circle cx="24" cy="24" r="5" fill="currentColor" />
         <path d="M12 50l14-15 9 9 7-7 10 13z" fill="currentColor" />
       </svg>
-      <p>{starting ? "Starting the image engine…" : busy ? "Your image is on its way." : "Describe an image and press Generate."}</p>
-      <p className="muted small">Everything runs on this computer.</p>
+      <p>
+        {starting
+          ? "Starting the image engine…"
+          : busy
+            ? "Your image is on its way."
+            : done
+              ? "Done. It is in the gallery."
+              : "Describe an image and press Generate."}
+      </p>
+      <p className="muted small">
+        {done && !busy ? "Showing results here is off in Settings." : "Everything runs on this computer."}
+      </p>
     </div>
   );
 }

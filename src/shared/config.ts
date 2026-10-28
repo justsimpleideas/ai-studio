@@ -1,4 +1,5 @@
 import { DEFAULT_PERMISSION_SETTINGS, type PermissionSettings } from './permissions.js'
+import { DEFAULT_SHORTCUTS, type ShortcutMap } from './shortcuts.js'
 
 /**
  * A standing instruction that is prepended to every conversation.
@@ -117,6 +118,42 @@ export function parseBackground(value: unknown): BackgroundPreferences {
   }
 }
 
+/**
+ * When gallery folders opened with their PIN lock again (and hidden folders shown for now
+ * are hidden again) without the studio quitting. Quitting always does it.
+ */
+export interface FolderPrivacyPreferences {
+  /**
+   * When the window loses focus: another program or the desktop clicked, Alt+Tab. Not for
+   * the studio's own file pickers and message boxes. Off by default.
+   */
+  lockOnBlur: boolean
+  /** When the window is minimized. Off by default. */
+  lockOnMinimize: boolean
+  /** When closing the window keeps the studio running in the background. On by default. */
+  lockOnBackground: boolean
+}
+
+export const DEFAULT_FOLDER_PRIVACY: FolderPrivacyPreferences = { lockOnBlur: false, lockOnMinimize: false, lockOnBackground: true }
+
+/** Read folder privacy preferences defensively: anything but a boolean means the default. */
+export function parseFolderPrivacy(value: unknown): FolderPrivacyPreferences {
+  const raw = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>
+  return {
+    lockOnBlur: typeof raw['lockOnBlur'] === 'boolean' ? raw['lockOnBlur'] : DEFAULT_FOLDER_PRIVACY.lockOnBlur,
+    lockOnMinimize: typeof raw['lockOnMinimize'] === 'boolean' ? raw['lockOnMinimize'] : DEFAULT_FOLDER_PRIVACY.lockOnMinimize,
+    lockOnBackground:
+      typeof raw['lockOnBackground'] === 'boolean' ? raw['lockOnBackground'] : DEFAULT_FOLDER_PRIVACY.lockOnBackground
+  }
+}
+
+/** The window's colours: dark (the default) or light. */
+export type Theme = 'dark' | 'light'
+
+export function isTheme(value: unknown): value is Theme {
+  return value === 'dark' || value === 'light'
+}
+
 export interface AppConfig {
   /**
    * Modes and confirm-everything apply in every workspace. Folders and saved
@@ -130,6 +167,12 @@ export interface AppConfig {
   image: ImagePreferences
   /** What closing the window does, and which models stay loaded in the background. */
   background: BackgroundPreferences
+  /** When open gallery folders lock again without the studio quitting. */
+  folderPrivacy: FolderPrivacyPreferences
+  /** Keyboard shortcuts that can be changed (shared/shortcuts.ts). */
+  shortcuts: ShortcutMap
+  /** Dark (the default) or light. */
+  theme: Theme
   /** The workspace to reopen at startup. */
   lastWorkspaceId: string | null
 }
@@ -153,6 +196,9 @@ export const DEFAULT_CONFIG: AppConfig = {
   model: { lastModelPath: null, backend: 'auto', gpuLayers: null, contextSize: null, kvCache: 'f16' },
   image: { pythonPath: null, modelsFolder: null, partFolders: [], includeSettingsInExports: false },
   background: DEFAULT_BACKGROUND,
+  folderPrivacy: DEFAULT_FOLDER_PRIVACY,
+  shortcuts: DEFAULT_SHORTCUTS,
+  theme: 'dark',
   lastWorkspaceId: null
 }
 

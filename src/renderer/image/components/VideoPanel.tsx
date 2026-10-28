@@ -1,4 +1,6 @@
 import { useState } from "react";
+import { matchesShortcut } from "@shared/shortcuts.js";
+import { useShortcuts } from "../../useShortcuts";
 import { studioMediaUrl } from "@shared/image.js";
 import type { VideoInfo } from "../types";
 import {
@@ -29,6 +31,8 @@ const MAX_SEED = 2 ** 32 - 1;
 
 export function VideoPanel({ form, onChange, onGenerate, canGenerate, pending, error, video, onPickStart }: Props) {
   const [advanced, setAdvanced] = useState(false);
+  const generateKeys = useShortcuts().generate;
+  const keys = generateKeys.replaceAll("+", " + ");
   const set = <K extends keyof VideoFormState>(key: K, value: VideoFormState[K]) => onChange({ ...form, [key]: value });
   const profile = video?.profile ?? null;
   const geometry = geometryFor(profile);
@@ -66,7 +70,7 @@ export function VideoPanel({ form, onChange, onGenerate, canGenerate, pending, e
           rows={6}
           onChange={(e) => set("prompt", e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+            if (matchesShortcut(e, generateKeys)) {
               e.preventDefault();
               submit();
             }
@@ -297,8 +301,8 @@ export function VideoPanel({ form, onChange, onGenerate, canGenerate, pending, e
         </button>
         <span className="hint center">
           {large
-            ? `Ctrl + Enter · ${fast ? `${fast.steps} steps` : "a clip"} with a 14B model takes many minutes on a 12 GB card`
-            : fast ? `Ctrl + Enter · ${fast.steps} steps per clip with the fast model` : "Ctrl + Enter · a 720p clip takes minutes, not seconds"}
+            ? `${keys} · ${fast ? `${fast.steps} steps` : "a clip"} with a 14B model takes many minutes on a 12 GB card`
+            : fast ? `${keys} · ${fast.steps} steps per clip with the fast model` : `${keys} · a 720p clip takes minutes, not seconds`}
         </span>
       </div>
     </form>

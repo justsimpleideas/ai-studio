@@ -102,3 +102,17 @@ is no longer part of this repository.)
 - **The window** may load media only from the private `studio-image:` protocol
   (`media-src studio-image:` in its Content-Security-Policy), as it already did for
   images.
+
+## Merging galleries
+
+- **Another gallery is untrusted input.** Its `gallery.db` is opened read-only and every
+  row is checked before use: ids must be 16 hex digits, numbers and text must have
+  their types, JSON fields must be objects, and each file path must be relative, use
+  plain names under `images/`, `videos/`, `thumbs/` or `frames/` with a `.png`, `.webp`
+  or `.mp4` suffix, and resolve to a regular file inside that gallery (no `..`, no
+  absolute path, no symlink). A row that fails is left out and counted.
+- **Paths come from a dialog.** The window holds opaque tokens; the main process keeps
+  the folders the user chose in its dialog and passes those to the engine, which refuses
+  relative paths, repeats, and this studio's own gallery or a folder holding or inside it.
+- **Nothing is overwritten.** Copies go to fresh names and are linked into place, which
+  fails rather than replace an existing file.

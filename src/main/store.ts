@@ -1,7 +1,8 @@
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
-import { DEFAULT_CONFIG, isKvCacheType, parseBackground, type AppConfig } from '@shared/config.js'
+import { DEFAULT_CONFIG, isKvCacheType, isTheme, parseBackground, parseFolderPrivacy, type AppConfig } from '@shared/config.js'
+import { parseShortcuts } from '@shared/shortcuts.js'
 import { DEFAULT_PERMISSION_SETTINGS } from '@shared/permissions.js'
 
 /**
@@ -54,6 +55,9 @@ export class ConfigStore {
         },
         // Anything unrecognised means the default: closing the window quits.
         background: parseBackground(parsed.background),
+        folderPrivacy: parseFolderPrivacy(parsed.folderPrivacy),
+        shortcuts: parseShortcuts(parsed.shortcuts),
+        theme: isTheme(parsed.theme) ? parsed.theme : 'dark',
         lastWorkspaceId: typeof parsed.lastWorkspaceId === 'string' ? parsed.lastWorkspaceId : null
       }
     } catch {

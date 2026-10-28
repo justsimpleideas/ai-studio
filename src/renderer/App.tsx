@@ -24,6 +24,16 @@ export function App(): React.JSX.Element {
 
   useEffect(() => localStorage.setItem(SIDE_KEY, side), [side])
 
+  // Dark or light, from the config; changed in Settings and applied at once.
+  useEffect(() => {
+    const apply = (theme: string): void => {
+      if (theme === 'light') document.documentElement.dataset['theme'] = 'light'
+      else delete document.documentElement.dataset['theme']
+    }
+    void window.api.getConfig().then((c) => apply(c.theme))
+    return window.api.onConfigChanged((c) => apply(c.theme))
+  }, [])
+
   // A file dropped anywhere but the image side's drop zone does nothing, rather
   // than the window opening it in place of the studio. (The main process blocks
   // that navigation as well; this keeps the cursor honest.)

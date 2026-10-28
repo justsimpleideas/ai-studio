@@ -1,5 +1,5 @@
 import { useEffect, useReducer } from 'react'
-import type { ImageEngineState } from '@shared/image.js'
+import type { ImageEngineState, MergeState } from '@shared/image.js'
 import { api } from './api.js'
 import type { EngineEvent, ImageRecord, Job, MediaKind, Status } from './types.js'
 
@@ -17,6 +17,8 @@ export interface EngineState {
   blockedFolders: string[]
   /** Increments whenever folders were hidden, shown, locked or unlocked. */
   privacyVersion: number
+  /** How the last gallery merge went, or is going. */
+  merge: MergeState
 }
 
 export type EngineAction =
@@ -35,7 +37,8 @@ export const initialEngineState: EngineState = {
   session: [],
   galleryVersion: 0,
   blockedFolders: [],
-  privacyVersion: 0
+  privacyVersion: 0,
+  merge: { state: 'idle' }
 }
 
 const SESSION_LIMIT = 48
@@ -76,6 +79,10 @@ export function engineReducer(state: EngineState, action: EngineAction): EngineS
           const info = { ...before, state: e.state, message: e.message }
           const models = { ...state.status.models, [kind]: info }
           return { ...state, status: { ...state.status, models, ...(kind === 'image' ? { model: info } : {}) } }
+        }
+        case 'merge': {
+          const { type: _type, ...merge } = e
+          return { ...state, merge }
         }
         case 'privacy': {
           // Whatever this window still shows from a folder that just went out of view goes too.

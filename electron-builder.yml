@@ -18,6 +18,11 @@ files:
 extraResources:
   - from: LICENSE
     to: LICENSE.txt
+  # The tray icon, read as a file (src/main/index.ts, windowIcon).
+  - from: resources/icon.ico
+    to: icon.ico
+  - from: resources/icon.png
+    to: icon.png
   - from: THIRD_PARTY_NOTICES.md
     to: THIRD_PARTY_NOTICES.md
   - from: image-engine

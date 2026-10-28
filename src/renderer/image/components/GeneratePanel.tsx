@@ -1,4 +1,6 @@
 import { useRef, useState } from "react";
+import { matchesShortcut } from "@shared/shortcuts.js";
+import { useShortcuts } from "../../useShortcuts";
 import type { LoraItem } from "@shared/training.js";
 import type { FormState } from "../form";
 import type { ImageProfile } from "../types";
@@ -27,6 +29,7 @@ export function GeneratePanel({ form, onChange, onGenerate, canGenerate, pending
   const model = profile ?? SIX_B;
   const [advanced, setAdvanced] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const generateKeys = useShortcuts().generate;
   const [megapixels, setMegapixels] = useState(() => {
     const mp = (form.width * form.height) / 2 ** 20;
     return RESOLUTIONS.reduce((a, b) => (Math.abs(b.megapixels - mp) < Math.abs(a.megapixels - mp) ? b : a)).megapixels;
@@ -62,7 +65,7 @@ export function GeneratePanel({ form, onChange, onGenerate, canGenerate, pending
           autoFocus
           onChange={(e) => set("prompt", e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+            if (matchesShortcut(e, generateKeys)) {
               e.preventDefault();
               submit();
             }
@@ -209,7 +212,7 @@ export function GeneratePanel({ form, onChange, onGenerate, canGenerate, pending
         <button type="submit" className="primary generate-button" disabled={!canGenerate || !form.prompt.trim()}>
           {pending > 0 ? `Add to queue (${pending} waiting)` : form.count > 1 ? `Generate ${form.count} images` : "Generate"}
         </button>
-        <span className="hint center">Ctrl + Enter</span>
+        <span className="hint center">{generateKeys.replaceAll("+", " + ")}</span>
         <button
           type="button"
           className="link-button from-png"

@@ -181,6 +181,8 @@ img { -webkit-user-drag: none; }
 /* ------------------------------------------------------------ gallery */
 
 .gallery-view { display: grid; grid-template-columns: 220px minmax(0, 1fr); height: 100%; min-height: 0; }
+.gallery-view.folders-hidden { grid-template-columns: minmax(0, 1fr); }
+.folders-toggle { min-width: 0; padding: 4px 6px; display: inline-flex; flex: none; }
 .gallery-main { padding: 18px; display: flex; flex-direction: column; gap: 14px; overflow-y: auto; min-width: 0; }
 .gallery-toolbar { display: flex; align-items: center; gap: 16px; }
 .gallery-heading {
@@ -274,7 +276,7 @@ img { -webkit-user-drag: none; }
 
 /* ------------------------------------------------------------ modal */
 
-.modal-backdrop { position: fixed; inset: 0; background: rgb(4 4 5 / 0.8); backdrop-filter: blur(3px); display: flex; align-items: center; justify-content: center; padding: 24px; padding-top: max(24px, calc(env(titlebar-area-height, 0px) + 12px)); z-index: 10; }
+.modal-backdrop { position: fixed; inset: 0; background: var(--backdrop); backdrop-filter: blur(3px); display: flex; align-items: center; justify-content: center; padding: 24px; padding-top: max(24px, calc(env(titlebar-area-height, 0px) + 12px)); z-index: 10; }
 .modal { background: var(--panel); border: 1px solid var(--line-strong); border-radius: 14px; corner-shape: bevel; box-shadow: var(--shadow); overflow: hidden; }
 .detail { display: grid; grid-template-columns: 1fr 320px; width: min(1400px, 100%); height: min(900px, 100%); }
 .detail-image { position: relative; background: var(--bg); display: flex; align-items: center; justify-content: center; min-width: 0; min-height: 0; padding: 16px; }
@@ -415,6 +417,16 @@ img { -webkit-user-drag: none; }
 .train-settings .number-input { flex-direction: column; align-items: stretch; gap: 4px; }
 .train-settings .number-input span { font-size: 11px; color: var(--muted); }
 .progress-card.train-progress { position: static; transform: none; width: auto; }
+/* Merging galleries (Settings): the galleries chosen, clashing folder names, what will happen. */
+.merge .progress-card { position: static; transform: none; width: auto; }
+.merge-source { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius-sm); corner-shape: bevel; }
+.merge-source-name { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.merge-conflicts { display: flex; flex-direction: column; gap: 10px; padding: 10px; border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--line)); border-radius: var(--radius-sm); corner-shape: bevel; }
+.merge-conflicts > p, .merge-summary p { margin: 0; }
+.merge-conflict { display: flex; flex-direction: column; gap: 6px; }
+.merge-conflict-entry { display: grid; grid-template-columns: 160px minmax(0, 1fr); align-items: center; gap: 10px; }
+.merge-conflicts > .ghost { align-self: flex-start; }
+.merge-summary { display: flex; flex-direction: column; gap: 4px; }
 
 .caption-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
 .caption-card { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 10px; padding: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-sm); corner-shape: bevel; }

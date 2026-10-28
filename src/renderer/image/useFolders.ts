@@ -4,6 +4,8 @@ import type { GalleryFolder, ImageRecord } from './types.js'
 
 export interface Folders {
   list: GalleryFolder[]
+  /** The list has been read from the engine at least once. */
+  loaded: boolean
   /** Increments whenever folder membership changed, so gallery views know to reload. */
   version: number
   refresh(): Promise<void>
@@ -16,6 +18,8 @@ export interface Folders {
   setPin(id: string, pin: string | null, current: string | null): Promise<GalleryFolder>
   unlock(id: string, pin: string): Promise<GalleryFolder>
   lock(id: string): Promise<GalleryFolder>
+  /** Lock every folder with a PIN that is open this session; resolves to how many were. */
+  lockAll(): Promise<number>
 }
 
 /**
@@ -25,11 +29,13 @@ export interface Folders {
  */
 export function useFolders(enabled: boolean, privacyVersion = 0): Folders {
   const [list, setList] = useState<GalleryFolder[]>([])
+  const [loaded, setLoaded] = useState(false)
   const [version, setVersion] = useState(0)
 
   const refresh = useCallback(async () => {
     try {
       setList(await api.folders())
+      setLoaded(true)
     } catch {
       // The engine is not running yet; the list fills in once it is.
     }
@@ -50,6 +56,7 @@ export function useFolders(enabled: boolean, privacyVersion = 0): Folders {
 
   return {
     list,
+    loaded,
     version,
     refresh,
     create: (name) => after(() => api.createFolder(name))(),
@@ -61,6 +68,13 @@ export function useFolders(enabled: boolean, privacyVersion = 0): Folders {
     setHidden: (id, hidden) => after(() => api.setFolderHidden(id, hidden))(),
     setPin: (id, pin, current) => after(() => api.setFolderPin(id, pin, current))(),
     unlock: (id, pin) => after(() => api.unlockFolder(id, pin))(),
-    lock: (id) => after(() => api.lockFolder(id))()
+    lock: (id) => after(() => api.lockFolder(id))(),
+    // Asks the engine which are open rather than trusting the list, which may be behind.
+    lockAll: () =>
+      after(async () => {
+        const open = (await api.folders()).filter((f) => f.unlocked)
+        await Promise.all(open.map((f) => api.lockFolder(f.id)))
+        return open.length
+      })()
   }
 }

@@ -326,6 +326,88 @@ export type ImageEngineEvent =
   | { type: 'model'; kind?: EngineModelKind; state: ImageModelState; message: string }
   /** Folders were hidden, shown, locked or unlocked. `blocked`: the folders whose items are now out of view. */
   | { type: 'privacy'; show_hidden: boolean; blocked: string[] }
+  /** How a gallery merge is going (gallery_merge.py). */
+  | ({ type: 'merge' } & MergeState)
+
+/** Another gallery (an "outputs" folder) chosen to merge into this one. The token stands for its path in the main process. */
+export interface MergeSource {
+  token: string
+  label: string
+  path: string
+}
+
+export interface MergeSourceInfo {
+  label: string
+  items: number
+  images: number
+  videos: number
+  favorites: number
+  /** How many of its items are not here yet. */
+  new_items: number
+  /** A hidden folder's name is null unless hidden folders are shown. */
+  folders: { name: string | null; hidden: boolean; locked: boolean }[]
+  /** Rows left out: a failed check, or a missing file. */
+  unreadable: number
+  /** Items whose folder was not in its folder list: they come in no folder. */
+  no_folder: number
+  no_last_frame: number
+  /** Items whose thumbnail was missing: one is made again. */
+  new_thumbs: number
+  /** Columns from a newer version, left out. */
+  unknown_columns: string[]
+}
+
+export interface MergeConflictEntry {
+  /** "target:<id>" for this gallery's folder, "<source>:<id>" for one coming. */
+  key: string
+  where: string
+  name: string
+  suggested: string
+  /** Locked and not open: it cannot be renamed here until unlocked. */
+  locked: boolean
+  hidden: boolean
+}
+
+export interface MergePlan {
+  sources: MergeSourceInfo[]
+  new_items: number
+  new_folders: number
+  /** Items already here (the same id, file byte for byte and record), skipped. */
+  duplicates: number
+  /** Of those, how many are a favourite or in a folder only in the other gallery; this gallery's own stays. */
+  duplicates_differing: number
+  conflicts: { name: string; entries: MergeConflictEntry[] }[]
+  /** Folders that are the same as one here (same id and name): their items join it. */
+  joined: { name: string; source: string; settings_differ: boolean }[]
+  bytes: number
+  free_bytes: number
+  /** Items made with a LoRA this studio does not have. */
+  missing_loras: number
+  /** Why it cannot merge yet; empty when it can. */
+  problems: string[]
+}
+
+export interface MergeResult {
+  added: number
+  images: number
+  videos: number
+  favorites: number
+  folders: number
+  joined: number
+  duplicates: number
+  duplicates_differing: number
+  unreadable: number
+  no_folder: number
+  no_last_frame: number
+  new_thumbs: number
+  bytes: number
+}
+
+export type MergeState =
+  | { state: 'idle' }
+  | { state: 'copying'; done: number; total: number }
+  | { state: 'done'; result: MergeResult }
+  | { state: 'failed'; message: string }
 
 /** The engine process itself, as opposed to the model inside it. */
 export type ImageEngineState =
@@ -371,6 +453,15 @@ export interface ImageApi {
   setFolderPin(id: string, pin: string | null, current: string | null): Promise<GalleryFolder>
   unlockFolder(id: string, pin: string): Promise<GalleryFolder>
   lockFolder(id: string): Promise<GalleryFolder>
+  /** Choose another gallery to merge: an "outputs" folder (or the folder that holds one). */
+  pickMergeSource(): Promise<MergeSource | null>
+  /** What merging these galleries would do, with these folder names changed. Nothing is changed. */
+  inspectMerge(tokens: string[], renames: Record<string, string>): Promise<MergePlan>
+  /** Start copying them in; how it goes arrives as "merge" events. */
+  startMerge(tokens: string[], renames: Record<string, string>): Promise<{ started: boolean; items: number }>
+  mergeStatus(): Promise<MergeState>
+  /** Stop a running merge: what was copied so far is removed, and nothing is added. */
+  cancelMerge(): Promise<void>
   /** Whether hidden folders are shown. Per session: closing the window hides them again. */
   showHiddenFolders(): Promise<boolean>
   setShowHiddenFolders(show: boolean): Promise<boolean>

@@ -1074,7 +1074,7 @@ button.small {
 .scrim {
   position: fixed;
   inset: 0;
-  background: rgb(4 4 5 / 0.8);
+  background: var(--backdrop);
   backdrop-filter: blur(3px);
   display: grid;
   place-items: center;
@@ -1588,7 +1588,7 @@ button.small {
 }
 
 .usage-columns .hit:hover {
-  fill: rgba(255, 255, 255, 0.04);
+  fill: color-mix(in srgb, var(--text) 5%, transparent);
 }
 
 .usage-tableview {
@@ -1882,6 +1882,58 @@ button.small {
 
 .segmented-pair button + button {
   border-left: 1px solid var(--line-strong);
+}
+
+.settings-card + .settings-card {
+  margin-top: 16px;
+}
+
+.keep-row.off {
+  opacity: 0.45;
+}
+
+/* Keyboard shortcuts: what each does, then its keys and the buttons to change them. */
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.shortcut-row.fixed {
+  padding: 2px 0;
+}
+
+.shortcut-keys {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.shortcuts kbd {
+  padding: 3px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.shortcuts kbd.recording {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.shortcut-problem {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+.reset-shortcuts {
+  align-self: flex-start;
 }
 
 .segmented-pair button.active {

@@ -1,4 +1,5 @@
-import type { AppConfig, BackgroundPreferences, GlobalRule, KvCacheType } from './config.js'
+import type { AppConfig, BackgroundPreferences, FolderPrivacyPreferences, GlobalRule, KvCacheType, Theme } from './config.js'
+import type { ShortcutMap } from './shortcuts.js'
 import type { ClassMode, ProtectedPath } from './permissions.js'
 import type { ChangeGroup, RevertResult } from './changes.js'
 import type { RiskClass } from './tools.js'
@@ -53,6 +54,12 @@ export interface RendererApi {
   setKvCache(kv: KvCacheType): Promise<AppConfig>
   /** What closing the window does, and which models stay loaded in the background. */
   setBackground(prefs: BackgroundPreferences): Promise<AppConfig>
+  /** When open gallery folders lock again: on minimize, on closing to the background. */
+  setFolderPrivacy(prefs: FolderPrivacyPreferences): Promise<AppConfig>
+  /** Every changeable shortcut at once; refused if any binding is unusable or taken twice. */
+  setShortcuts(shortcuts: ShortcutMap): Promise<AppConfig>
+  /** Dark or light; the window and its title bar change at once. */
+  setTheme(theme: Theme): Promise<AppConfig>
 
   clearSessionGrants(): Promise<void>
 
