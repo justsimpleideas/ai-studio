@@ -144,7 +144,7 @@ export class ModelDownloads {
         throw new Error(message)
       }
       await this.options.applyFolder(model, dest)
-      this.set({ ...tracker.state, message: 'Downloaded, verified, and selected.' })
+      this.set({ ...tracker.state, message: model.part ? 'Downloaded and verified.' : 'Downloaded, verified, and selected.' })
     } catch (err) {
       if (this.current.phase !== 'failed') {
         this.set({ ...this.current, phase: 'failed', activity: null, bytesPerSecond: null, message: (err as Error).message })

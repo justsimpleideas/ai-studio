@@ -18,6 +18,11 @@ Usage:
   python scripts/fetch_model.py --model video --dest /path/to/models/video-model
   python scripts/fetch_model.py --model video-fast --dest /path/to/models/video-model-fast \
       --reuse-from /path/to/models/video-model
+  python scripts/fetch_model.py --model caption --dest /path/to/models/caption-model
+  python scripts/fetch_model.py --model large-vae --dest /path/to/models/large-vae
+  python scripts/fetch_model.py --model video-parts --dest /path/to/models/video-parts
+  python scripts/fetch_model.py --model video-14b-text-parts --dest /path/to/models/video-14b-text-parts \
+      --reuse-from /path/to/models/video-parts
 
 With --json, progress goes to stdout as one JSON object per line (the studio's
 download button reads it) and the human-readable messages go to stderr.
@@ -48,8 +53,54 @@ VIDEO_REVISION = "b8fff7315c768468a5333511427288870b2e9635"
 # (10 GB, bf16) and two small configs differ; the rest can be reused with --reuse-from.
 FAST_VIDEO_REPO = "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers"
 FAST_VIDEO_REVISION = "3e187042a324f6f5fb68fd22110a78725253de8f"
+# The captioning model for training photos (4B vision-language, Apache 2.0): 8.9 GB in bf16.
+# Not a diffusers pipeline, so its files are listed one by one.
+CAPTION_REPO = "Qwen/Qwen3-VL-4B-Instruct"
+CAPTION_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
+# The VAE the 12B image model was trained with (Apache 2.0): 254 MB, taken from the repository
+# of another image model that uses it. scripts/import_model.py puts it next to that model.
+LARGE_VAE_REPO = "Qwen/Qwen-Image"
+LARGE_VAE_REVISION = "75e0b4be04f60ec59a75f475837eced720f823b6"
+# The 14B video models (two experts each, Apache 2.0), of which only the parts around the
+# experts are downloaded (11.9 GB): the experts come as single files (scripts/import_model.py).
+# Their text encoder and tokenizer are the 5B model's, byte for byte, so --reuse-from a 5B
+# folder leaves only the 0.5 GB VAE and the configurations to download.
+VIDEO_14B_TEXT_REPO = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+VIDEO_14B_TEXT_REVISION = "5be7df9619b54f4e2667b2755bc6a756675b5cd7"
+VIDEO_14B_IMAGE_REPO = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
+VIDEO_14B_IMAGE_REVISION = "596658fd9ca6b7b71d5057529bbf319ecbc61d74"
 MODELS = {"image": (DEFAULT_REPO, DEFAULT_REVISION), "video": (VIDEO_REPO, VIDEO_REVISION),
-          "video-fast": (FAST_VIDEO_REPO, FAST_VIDEO_REVISION)}
+          "video-fast": (FAST_VIDEO_REPO, FAST_VIDEO_REVISION), "caption": (CAPTION_REPO, CAPTION_REVISION),
+          "large-vae": (LARGE_VAE_REPO, LARGE_VAE_REVISION),
+          # The 6B model without its transformer (8.2 GB): what a single transformer file of that
+          # model needs around it (scripts/import_model.py).
+          "image-parts": (DEFAULT_REPO, DEFAULT_REVISION),
+          # The video model without its transformer (14.2 GB), likewise for a single video transformer file.
+          "video-parts": (VIDEO_REPO, VIDEO_REVISION),
+          "video-14b-text-parts": (VIDEO_14B_TEXT_REPO, VIDEO_14B_TEXT_REVISION),
+          "video-14b-image-parts": (VIDEO_14B_IMAGE_REPO, VIDEO_14B_IMAGE_REVISION)}
+# Models that are not pipelines: exactly these files, nothing else from the repository.
+MODEL_FILES = {
+    "caption": ("config.json", "generation_config.json", "chat_template.json", "preprocessor_config.json",
+                "video_preprocessor_config.json", "tokenizer.json", "tokenizer_config.json", "merges.txt",
+                "vocab.json", "model.safetensors.index.json", "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors"),
+    "large-vae": ("vae/config.json", "vae/diffusion_pytorch_model.safetensors"),
+    "image-parts": ("model_index.json", "scheduler/scheduler_config.json", "text_encoder/config.json",
+                    "text_encoder/generation_config.json", "text_encoder/model-00001-of-00003.safetensors",
+                    "text_encoder/model-00002-of-00003.safetensors", "text_encoder/model-00003-of-00003.safetensors",
+                    "text_encoder/model.safetensors.index.json", "tokenizer/merges.txt", "tokenizer/tokenizer.json",
+                    "tokenizer/tokenizer_config.json", "tokenizer/vocab.json", "transformer/config.json",
+                    "vae/config.json", "vae/diffusion_pytorch_model.safetensors"),
+    "video-parts": ("model_index.json", "scheduler/scheduler_config.json", "text_encoder/config.json",
+                    "text_encoder/model-00001-of-00003.safetensors", "text_encoder/model-00002-of-00003.safetensors",
+                    "text_encoder/model-00003-of-00003.safetensors", "text_encoder/model.safetensors.index.json",
+                    "tokenizer/special_tokens_map.json", "tokenizer/spiece.model", "tokenizer/tokenizer.json",
+                    "tokenizer/tokenizer_config.json", "transformer/config.json", "vae/config.json",
+                    "vae/diffusion_pytorch_model.safetensors"),
+}
+MODEL_FILES["video-14b-text-parts"] = MODEL_FILES["video-14b-image-parts"] = (
+    *MODEL_FILES["video-parts"], "transformer_2/config.json")
 
 # Only the pipeline itself; the repos' assets/ and examples/ folders (sample images, a PDF) are not needed.
 WANTED_DIRS = ("scheduler/", "text_encoder/", "tokenizer/", "transformer/", "vae/")
@@ -132,8 +183,10 @@ def list_remote(repo: str, revision: str) -> list[RemoteFile]:
     return files
 
 
-def select_files(files: list[RemoteFile]) -> list[RemoteFile]:
-    """Pick the files the pipeline needs, refusing anything that could execute code."""
+def select_files(files: list[RemoteFile], wanted: tuple[str, ...] | None = None) -> list[RemoteFile]:
+    """Pick the files the pipeline needs (or exactly `wanted`), refusing anything that could execute code."""
+    if wanted is not None:
+        return _select_listed(files, wanted)
     chosen = []
     for f in files:
         wanted = f.path in WANTED_ROOT_FILES or f.path.startswith(WANTED_DIRS)
@@ -150,6 +203,25 @@ def select_files(files: list[RemoteFile]) -> list[RemoteFile]:
         chosen.append(f)
     if not any(f.path == "model_index.json" for f in chosen):
         raise VerificationError("model_index.json missing - not a diffusers pipeline repo")
+    return chosen
+
+
+def _select_listed(files: list[RemoteFile], wanted: tuple[str, ...]) -> list[RemoteFile]:
+    by_path = {f.path: f for f in files}
+    missing = [w for w in wanted if w not in by_path]
+    if missing:
+        raise VerificationError(f"not in the repository at this revision: {missing}")
+    for f in files:  # a repository that ships code is refused even if that file is not asked for
+        if f.path.lower().endswith(CODE_EXTENSIONS):
+            raise VerificationError(f"refusing a repository with an executable/pickle file: {f.path}")
+    chosen = [by_path[w] for w in wanted]
+    for f in chosen:
+        lower = f.path.lower()
+        tokenizer_data = f.path.startswith("tokenizer/") and lower.endswith(TOKENIZER_EXTENSIONS)
+        if not (lower.endswith(DATA_EXTENSIONS) or tokenizer_data):
+            raise VerificationError(f"unexpected file type in model folder: {f.path}")
+        if f.path.lower().endswith(".safetensors") and not f.is_lfs:
+            raise VerificationError(f"weights file is not stored in LFS, no SHA-256 published: {f.path}")
     return chosen
 
 
@@ -306,9 +378,10 @@ def reuse(source: Path, local: Path, remote: RemoteFile) -> bool:
     return True
 
 
-def run(repo: str, revision: str, dest: Path, verify_only: bool, reuse_from: Path | None = None) -> int:
+def run(repo: str, revision: str, dest: Path, verify_only: bool, reuse_from: Path | None = None,
+        wanted: tuple[str, ...] | None = None) -> int:
     say(f"Listing {repo} @ {revision}")
-    files = select_files(list_remote(repo, revision))
+    files = select_files(list_remote(repo, revision), wanted)
     total = sum(f.size for f in files)
     say(f"{len(files)} files, {total / 1e9:.2f} GB")
     emit("plan", repo=repo, revision=revision, files=len(files), bytes=total)
@@ -383,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.reuse_from is not None and args.reuse_from.resolve() == args.dest.resolve():
         ap.error("--reuse-from must be a different folder from --dest")
     try:
-        return run(repo, revision, args.dest, args.verify_only, args.reuse_from)
+        return run(repo, revision, args.dest, args.verify_only, args.reuse_from, MODEL_FILES.get(args.model))
     except VerificationError as exc:
         print(f"VERIFICATION FAILED: {exc}", file=sys.stderr)
         emit("error", message=f"Verification failed: {exc}")

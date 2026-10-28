@@ -8,6 +8,7 @@ export type {
   ImageJob as Job,
   ImageJobStatus as JobStatus,
   ImageModelState as ModelState,
+  ImageProfile,
   ImageRecord,
   ImageSettings as Settings,
   ImageStatus as Status,

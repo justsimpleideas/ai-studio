@@ -1,5 +1,8 @@
 import { useRef, useState } from "react";
+import type { LoraItem } from "@shared/training.js";
 import type { FormState } from "../form";
+import type { ImageProfile } from "../types";
+import { LoraPicker } from "./LoraPicker";
 import { ASPECT_RATIOS, RESOLUTIONS, closestRatio, isValidSide, sizeFor, snap, type AspectRatio } from "../sizes";
 
 interface Props {
@@ -11,11 +14,17 @@ interface Props {
   error: string | null;
   /** A PNG chosen to take its generation settings from. */
   onImport: (file: File) => void;
+  /** The LoRA library; the picker is hidden on an engine that cannot train, and for a model without LoRAs. */
+  library: LoraItem[] | null;
+  /** The image model's profile; null until the engine says (the 6B model's values are assumed). */
+  profile: ImageProfile | null;
 }
 
 const MAX_SEED = 2 ** 32 - 1;
+const SIX_B = { steps: 8, guidance: 0, distilled: true };
 
-export function GeneratePanel({ form, onChange, onGenerate, canGenerate, pending, error, onImport }: Props) {
+export function GeneratePanel({ form, onChange, onGenerate, canGenerate, pending, error, onImport, library, profile }: Props) {
+  const model = profile ?? SIX_B;
   const [advanced, setAdvanced] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const [megapixels, setMegapixels] = useState(() => {
@@ -142,6 +151,8 @@ export function GeneratePanel({ form, onChange, onGenerate, canGenerate, pending
         <input type="range" min={1} max={8} value={form.count} onChange={(e) => set("count", Number(e.target.value))} />
       </div>
 
+      {library && <LoraPicker library={library} value={form.loras} onChange={(loras) => set("loras", loras)} />}
+
       <button type="button" className="disclosure" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}>
         {advanced ? "▾" : "▸"} Advanced
       </button>
@@ -151,8 +162,12 @@ export function GeneratePanel({ form, onChange, onGenerate, canGenerate, pending
             <span className="field-label">
               Steps <span className="value">{form.steps}</span>
             </span>
-            <input type="range" min={1} max={30} value={form.steps} onChange={(e) => set("steps", Number(e.target.value))} />
-            <span className="hint">Turbo is distilled for 8 steps. More rarely helps.</span>
+            <input type="range" min={1} max={model.distilled ? 30 : 50} value={form.steps} onChange={(e) => set("steps", Number(e.target.value))} />
+            <span className="hint">
+              {model.distilled
+                ? `This model is distilled for ${model.steps} steps. More rarely helps.`
+                : `${model.steps} is this model's default. Fewer is faster but rougher.`}
+            </span>
           </div>
           <div className="field">
             <span className="field-label">
@@ -162,7 +177,11 @@ export function GeneratePanel({ form, onChange, onGenerate, canGenerate, pending
               type="range" min={0} max={10} step={0.5} value={form.guidance}
               onChange={(e) => set("guidance", Number(e.target.value))}
             />
-            <span className="hint">0 is right for Turbo. Any value above 0 turns on the negative prompt and doubles the work per step.</span>
+            <span className="hint">
+              {model.guidance === 0
+                ? "0 is right for this model. Any value above 0 turns on the negative prompt and doubles the work per step."
+                : `${model.guidance} is this model's default. 0 turns off guidance and the negative prompt, and halves the work per step.`}
+            </span>
           </div>
           <label className="field">
             <span className="field-label">Negative prompt</span>
@@ -175,8 +194,12 @@ export function GeneratePanel({ form, onChange, onGenerate, canGenerate, pending
               onChange={(e) => set("negative_prompt", e.target.value)}
             />
           </label>
-          <button type="button" className="link-button" onClick={() => onChange({ ...form, steps: 8, guidance: 0 })}>
-            Reset to Turbo defaults
+          <button
+            type="button"
+            className="link-button"
+            onClick={() => onChange({ ...form, steps: model.steps, guidance: model.guidance })}
+          >
+            Reset to the model's defaults
           </button>
         </div>
       )}

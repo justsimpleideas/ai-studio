@@ -11,10 +11,19 @@ export interface Folders {
   rename(id: string, name: string): Promise<GalleryFolder>
   remove(id: string): Promise<void>
   move(itemId: string, folderId: string | null): Promise<ImageRecord>
+  setHidden(id: string, hidden: boolean): Promise<GalleryFolder>
+  /** Set, change or (pin null) remove a PIN; `current` is needed once the folder has one. */
+  setPin(id: string, pin: string | null, current: string | null): Promise<GalleryFolder>
+  unlock(id: string, pin: string): Promise<GalleryFolder>
+  lock(id: string): Promise<GalleryFolder>
 }
 
-/** The gallery's folders, shared by the gallery view and the detail window. */
-export function useFolders(enabled: boolean): Folders {
+/**
+ * The gallery's folders, shared by the gallery view and the detail window. Hidden folders
+ * are in the list only while shown; the engine decides that per session (gallery.py), and
+ * `privacyVersion` (an engine event) brings the list up to date when it changes.
+ */
+export function useFolders(enabled: boolean, privacyVersion = 0): Folders {
   const [list, setList] = useState<GalleryFolder[]>([])
   const [version, setVersion] = useState(0)
 
@@ -28,35 +37,30 @@ export function useFolders(enabled: boolean): Folders {
 
   useEffect(() => {
     if (enabled) void refresh()
-  }, [enabled, refresh])
+  }, [enabled, refresh, privacyVersion])
 
-  const changed = useCallback(() => {
+  // The list is refreshed before the change resolves, so a view switched to a new or just
+  // unlocked folder finds it there.
+  const after = <T,>(run: () => Promise<T>) => async (): Promise<T> => {
+    const result = await run()
     setVersion((v) => v + 1)
-    void refresh()
-  }, [refresh])
+    await refresh()
+    return result
+  }
 
   return {
     list,
     version,
     refresh,
-    create: async (name) => {
-      const folder = await api.createFolder(name)
-      changed()
-      return folder
-    },
-    rename: async (id, name) => {
-      const folder = await api.renameFolder(id, name)
-      changed()
-      return folder
-    },
+    create: (name) => after(() => api.createFolder(name))(),
+    rename: (id, name) => after(() => api.renameFolder(id, name))(),
     remove: async (id) => {
-      await api.deleteFolder(id)
-      changed()
+      await after(() => api.deleteFolder(id))()
     },
-    move: async (itemId, folderId) => {
-      const record = await api.moveToFolder(itemId, folderId)
-      changed()
-      return record
-    }
+    move: (itemId, folderId) => after(() => api.moveToFolder(itemId, folderId))(),
+    setHidden: (id, hidden) => after(() => api.setFolderHidden(id, hidden))(),
+    setPin: (id, pin, current) => after(() => api.setFolderPin(id, pin, current))(),
+    unlock: (id, pin) => after(() => api.unlockFolder(id, pin))(),
+    lock: (id) => after(() => api.lockFolder(id))()
   }
 }

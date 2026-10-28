@@ -12,6 +12,7 @@ from pathlib import Path
 DEFAULT_PORT = 5198
 APP_DIR_NAME = "LocalAIStudio"
 MEMORY_MODES = ("auto", "full", "quality", "balanced", "low")
+PATH_KEYS = ("model_dir", "video_model_dir", "ffmpeg_path", "caption_model_dir")
 
 
 def default_data_dir() -> Path:
@@ -35,6 +36,8 @@ class Settings:
     video_memory_mode: str = "auto"
     # Empty: look for ffmpeg on PATH and where winget puts it (video_io.find_ffmpeg).
     ffmpeg_path: str = ""
+    # The vision-language model that describes training photos (backends/captioner.py).
+    caption_model_dir: str = ""
 
     def validate(self) -> None:
         for key in ("memory_mode", "video_memory_mode"):
@@ -42,7 +45,7 @@ class Settings:
                 raise ValueError(f"{key} must be one of {', '.join(MEMORY_MODES)}")
         if not isinstance(self.load_on_start, bool):
             raise ValueError("load_on_start must be true or false")
-        for key in ("model_dir", "video_model_dir", "ffmpeg_path"):
+        for key in PATH_KEYS:
             if not isinstance(getattr(self, key), str):
                 raise ValueError(f"{key} must be a string")
 
@@ -56,7 +59,8 @@ class SettingsStore:
 
     def _defaults(self) -> Settings:
         models = self.data_dir / "models"
-        return Settings(model_dir=str(models / "image-model"), video_model_dir=str(models / "video-model"))
+        return Settings(model_dir=str(models / "image-model"), video_model_dir=str(models / "video-model"),
+                        caption_model_dir=str(models / "caption-model"))
 
     def _read(self) -> Settings:
         settings = self._defaults()
@@ -74,7 +78,7 @@ class SettingsStore:
             except ValueError:
                 # Keep the folders that are still readable; everything else goes back to defaults.
                 fallback = self._defaults()
-                for key in ("model_dir", "video_model_dir", "ffmpeg_path"):
+                for key in PATH_KEYS:
                     if isinstance(getattr(settings, key), str):
                         setattr(fallback, key, getattr(settings, key))
                 settings = fallback

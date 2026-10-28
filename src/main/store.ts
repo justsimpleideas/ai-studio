@@ -46,6 +46,9 @@ export class ConfigStore {
           ...DEFAULT_CONFIG.image,
           ...(parsed.image ?? {}),
           modelsFolder: typeof parsed.image?.modelsFolder === 'string' ? parsed.image.modelsFolder : null,
+          partFolders: Array.isArray(parsed.image?.partFolders)
+            ? parsed.image.partFolders.filter((f): f is string => typeof f === 'string')
+            : [],
           // Anything but an explicit yes keeps prompts out of exported files.
           includeSettingsInExports: parsed.image?.includeSettingsInExports === true
         },

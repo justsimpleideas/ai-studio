@@ -15,11 +15,20 @@ of their content, so a request that names one stays reproducible.
 Folders are the user's own grouping: each image or video sits in at most one.
 They only organise the index; files never move on disk, deleting a folder leaves
 everything that was in it in place, and favourites are independent of folders.
+
+A folder can be hidden, locked with a six-digit PIN, or both. What a hidden folder
+holds is left out of every view until hidden folders are shown; what a locked one
+holds, until it is unlocked with its PIN. Both choices are per session: shown hidden
+folders and unlocked folders are remembered in memory only, and reset_privacy() (the
+studio calls it when its window closes) or a restart hides and locks them again. This
+keeps the studio's own views private; it does not encrypt anything, and the files
+stay readable on disk to anyone who can open the folder.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -73,10 +82,61 @@ CREATE TABLE IF NOT EXISTS folders (
 """
 
 FOLDER_NAME_MAX = 60
+PIN_PATTERN = re.compile(r"[0-9]{6}")
+# scrypt at 32 MiB and about a tenth of a second per guess. Six digits are a million
+# guesses, so this only slows down someone who has copied gallery.db; inside the studio
+# the limit on wrong attempts below is what protects a PIN.
+PIN_SCRYPT = {"n": 2**15, "r": 8, "p": 1}
+PIN_FREE_TRIES = 5
+PIN_FIRST_WAIT = 30.0
+PIN_MAX_WAIT = 15 * 60.0
+
+# Columns added to folders after the first release.
+FOLDER_ADDED_COLUMNS = {
+    "hidden": "INTEGER NOT NULL DEFAULT 0",
+    "pin": "TEXT NOT NULL DEFAULT ''",  # '' = no PIN; else scrypt$n$r$p$salt$hash
+}
 
 
 class FolderError(ValueError):
     """A folder name or id the gallery cannot accept. The message is safe to show."""
+
+
+class FolderLocked(FolderError):
+    """The folder is locked and this session has not unlocked it, or a PIN was wrong."""
+
+
+class TooManyTries(FolderError):
+    """Too many wrong PINs in a row; `wait` seconds until the next try."""
+
+    def __init__(self, wait: float) -> None:
+        self.wait = wait
+        super().__init__(f"Too many wrong PINs. Try again in {max(1, round(wait))} seconds.")
+
+
+def _hash_pin(pin: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(pin.encode(), salt=salt, maxmem=64 * 2**20, dklen=32, **PIN_SCRYPT)
+    return "$".join(["scrypt", str(PIN_SCRYPT["n"]), str(PIN_SCRYPT["r"]), str(PIN_SCRYPT["p"]),
+                     salt.hex(), digest.hex()])
+
+
+def _pin_matches(pin: str, stored: str) -> bool:
+    try:
+        scheme, n, r, p, salt, digest = stored.split("$")
+        if scheme != "scrypt":
+            return False
+        got = hashlib.scrypt(pin.encode(), salt=bytes.fromhex(salt), n=int(n), r=int(r), p=int(p),
+                             maxmem=64 * 2**20, dklen=32)
+    except ValueError:
+        return False
+    return hmac.compare_digest(got, bytes.fromhex(digest))
+
+
+def _check_pin_format(pin: object) -> str:
+    if not isinstance(pin, str) or not PIN_PATTERN.fullmatch(pin):  # fullmatch: "$" would let "123456\n" in
+        raise FolderError("A PIN is six digits.")
+    return pin
 
 # Columns added after the first release. A gallery made by an older version gains them,
 # with these defaults describing what its rows are: still images.
@@ -120,11 +180,16 @@ class Gallery:
         self._db = sqlite3.connect(root / "gallery.db", check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.executescript(SCHEMA)
-        existing = {row["name"] for row in self._db.execute("PRAGMA table_info(images)")}
-        for name, definition in ADDED_COLUMNS.items():
-            if name not in existing:
-                self._db.execute(f"ALTER TABLE images ADD COLUMN {name} {definition}")
+        for table, added in (("images", ADDED_COLUMNS), ("folders", FOLDER_ADDED_COLUMNS)):
+            existing = {row["name"] for row in self._db.execute(f"PRAGMA table_info({table})")}
+            for name, definition in added.items():
+                if name not in existing:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
         self._db.commit()
+        # This session's privacy choices; never written anywhere (module docstring).
+        self._show_hidden = False
+        self._unlocked: set[str] = set()
+        self._wrong_pins: dict[str, tuple[int, float]] = {}  # folder id -> (wrong in a row, no tries before)
 
     def close(self) -> None:
         with self._lock:
@@ -219,10 +284,13 @@ class Gallery:
             self._db.commit()
         return self.get(image_id)
 
-    def set_folder(self, image_id: str, folder_id: str | None) -> dict[str, Any] | None:
-        """Put an item in a folder, or (None) in none. Raises FolderError for a folder that does not exist."""
+    def set_folder(self, image_id: str, folder_id: str | None, *, everything: bool = False) -> dict[str, Any] | None:
+        """Put an item in a folder, or (None) in none. Raises FolderError for a folder that does not
+        exist or (unless `everything`, the engine's own use) is hidden from this session. A locked
+        folder takes items without its PIN; they are then out of view until it is unlocked."""
         with self._lock:
-            if folder_id is not None and not self._folder_exists(folder_id):
+            if folder_id is not None and not (self._folder_exists(folder_id) if everything
+                                              else self._folder_row(folder_id) is not None):
                 raise FolderError("No such folder.")
             self._db.execute("UPDATE images SET folder_id = ? WHERE id = ?", (folder_id or "", image_id))
             self._db.commit()
@@ -247,17 +315,146 @@ class Gallery:
         return self._db.execute("SELECT 1 FROM folders WHERE id = ?", (folder_id,)).fetchone() is not None
 
     def _name_taken(self, name: str, except_id: str = "") -> bool:
-        row = self._db.execute("SELECT 1 FROM folders WHERE lower(name) = lower(?) AND id != ?",
+        """Among the folders this session sees: refusing a name because a hidden folder has it
+        would tell that the hidden folder exists."""
+        hidden = "" if self._show_hidden else " AND hidden = 0"
+        row = self._db.execute(f"SELECT 1 FROM folders WHERE lower(name) = lower(?) AND id != ?{hidden}",
                                (name, except_id)).fetchone()
         return row is not None
 
-    def list_folders(self) -> list[dict[str, Any]]:
-        """Every folder, by name, with how many items it holds."""
+    def list_folders(self, *, everything: bool = False) -> list[dict[str, Any]]:
+        """The folders this session may see, by name, with how many items each holds (None for
+        one still locked) and whether it is hidden, has a PIN, and is unlocked. `everything`
+        includes hidden ones regardless, for the engine's own use (never shown as is)."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT f.id, f.name, f.created, COUNT(i.id) AS count FROM folders f "
+                "SELECT f.id, f.name, f.created, f.hidden, f.pin, COUNT(i.id) AS count FROM folders f "
                 "LEFT JOIN images i ON i.folder_id = f.id GROUP BY f.id ORDER BY lower(f.name)").fetchall()
-        return [dict(r) for r in rows]
+            out = []
+            for r in rows:
+                if r["hidden"] and not (self._show_hidden or everything):
+                    continue
+                locked = bool(r["pin"])
+                unlocked = locked and r["id"] in self._unlocked
+                out.append({"id": r["id"], "name": r["name"], "created": r["created"],
+                            "count": r["count"] if unlocked or not locked else None,
+                            "hidden": bool(r["hidden"]), "locked": locked, "unlocked": unlocked})
+        return out
+
+    # ------------------------------------------------------------ privacy
+
+    def _blocked(self) -> set[str]:
+        """Folders whose items this session may not see: hidden ones (unless shown) and locked
+        ones not unlocked. Call with self._lock held."""
+        rows = self._db.execute("SELECT id, hidden, pin FROM folders WHERE hidden = 1 OR pin != ''").fetchall()
+        return {r["id"] for r in rows
+                if (r["hidden"] and not self._show_hidden) or (r["pin"] and r["id"] not in self._unlocked)}
+
+    def _folder_row(self, folder_id: str) -> sqlite3.Row | None:
+        """A folder this session can see (hidden ones only while shown), else None. Lock held."""
+        row = self._db.execute("SELECT id, hidden, pin FROM folders WHERE id = ?", (folder_id,)).fetchone()
+        if row is None or (row["hidden"] and not self._show_hidden):
+            return None
+        return row
+
+    def _require_open(self, row: sqlite3.Row) -> None:
+        if row["pin"] and row["id"] not in self._unlocked:
+            raise FolderLocked("This folder is locked. Unlock it with its PIN first.")
+
+    @property
+    def show_hidden(self) -> bool:
+        return self._show_hidden
+
+    def set_show_hidden(self, show: bool) -> None:
+        with self._lock:
+            self._show_hidden = bool(show)
+
+    def reset_privacy(self) -> None:
+        """Hide hidden folders and lock every unlocked one again, as at start."""
+        with self._lock:
+            self._show_hidden = False
+            self._unlocked.clear()
+
+    def blocked_folders(self) -> list[str]:
+        with self._lock:
+            return sorted(self._blocked())
+
+    def set_hidden(self, folder_id: str, hidden: bool) -> dict[str, Any] | None:
+        """Hide or show a folder. Needs no PIN: hiding shows nothing, and showing a locked
+        folder still keeps it locked."""
+        with self._lock:
+            if self._folder_row(folder_id) is None:
+                return None
+            self._db.execute("UPDATE folders SET hidden = ? WHERE id = ?", (int(bool(hidden)), folder_id))
+            self._db.commit()
+        return self._listed(folder_id)
+
+    def _check_tries(self, folder_id: str) -> None:
+        _, not_before = self._wrong_pins.get(folder_id, (0, 0.0))
+        wait = not_before - time.monotonic()
+        if wait > 0:
+            raise TooManyTries(wait)
+
+    def _verify(self, folder_id: str, stored: str, pin: object) -> None:
+        """Check a PIN against a folder's, counting wrong ones. Raises FolderLocked or TooManyTries."""
+        pin = _check_pin_format(pin)
+        with self._lock:
+            self._check_tries(folder_id)
+        if _pin_matches(pin, stored):  # slow on purpose; not under the lock
+            with self._lock:
+                self._wrong_pins.pop(folder_id, None)
+            return
+        with self._lock:
+            wrong, _ = self._wrong_pins.get(folder_id, (0, 0.0))
+            wrong += 1
+            wait = 0.0 if wrong < PIN_FREE_TRIES else min(PIN_MAX_WAIT, PIN_FIRST_WAIT * 2 ** (wrong - PIN_FREE_TRIES))
+            self._wrong_pins[folder_id] = (wrong, time.monotonic() + wait)
+        raise FolderLocked("Wrong PIN.")
+
+    def unlock(self, folder_id: str, pin: object) -> dict[str, Any] | None:
+        """Unlock a folder for this session."""
+        with self._lock:
+            row = self._folder_row(folder_id)
+        if row is None:
+            return None
+        if not row["pin"]:
+            raise FolderError("This folder has no PIN.")
+        self._verify(folder_id, row["pin"], pin)
+        with self._lock:
+            self._unlocked.add(folder_id)
+        return self._listed(folder_id)
+
+    def lock_again(self, folder_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            if self._folder_row(folder_id) is None:
+                return None
+            self._unlocked.discard(folder_id)
+        return self._listed(folder_id)
+
+    def set_pin(self, folder_id: str, pin: object, current: object = None) -> dict[str, Any] | None:
+        """Give a folder a PIN, change it, or (pin None) remove it. A folder that has one needs
+        it as `current`, even while unlocked, so an unattended unlocked studio cannot change it.
+        Setting a PIN leaves the folder unlocked for this session; it locks when the session ends."""
+        with self._lock:
+            row = self._folder_row(folder_id)
+        if row is None:
+            return None
+        if row["pin"]:
+            if current is None:
+                raise FolderLocked("Enter the folder's current PIN.")
+            self._verify(folder_id, row["pin"], current)
+        stored = "" if pin is None else _hash_pin(_check_pin_format(pin))
+        with self._lock:
+            self._db.execute("UPDATE folders SET pin = ? WHERE id = ?", (stored, folder_id))
+            self._db.commit()
+            if stored:
+                self._unlocked.add(folder_id)
+            else:
+                self._unlocked.discard(folder_id)
+        return self._listed(folder_id)
+
+    def _listed(self, folder_id: str) -> dict[str, Any] | None:
+        return next((f for f in self.list_folders(everything=True) if f["id"] == folder_id), None)
 
     def create_folder(self, name: object) -> dict[str, Any]:
         cleaned = self._clean_name(name)
@@ -273,28 +470,36 @@ class Gallery:
     def rename_folder(self, folder_id: str, name: object) -> dict[str, Any] | None:
         cleaned = self._clean_name(name)
         with self._lock:
-            if not self._folder_exists(folder_id):
+            row = self._folder_row(folder_id)
+            if row is None:
                 return None
+            self._require_open(row)
             if self._name_taken(cleaned, except_id=folder_id):
                 raise FolderError(f"There is already a folder called “{cleaned}”.")
             self._db.execute("UPDATE folders SET name = ? WHERE id = ?", (cleaned, folder_id))
             self._db.commit()
-        return next((f for f in self.list_folders() if f["id"] == folder_id), None)
+        return self._listed(folder_id)
 
     def delete_folder(self, folder_id: str) -> int | None:
-        """Remove a folder. What was in it stays in the gallery, in no folder. Returns how many items that was."""
+        """Remove a folder. What was in it stays in the gallery, in no folder. Returns how many items that was.
+        A locked folder must be unlocked first: deleting it would put what it holds in plain view."""
         with self._lock:
-            if not self._folder_exists(folder_id):
+            row = self._folder_row(folder_id)
+            if row is None:
                 return None
+            self._require_open(row)
             moved = self._db.execute("UPDATE images SET folder_id = '' WHERE folder_id = ?", (folder_id,)).rowcount
             self._db.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
             self._db.commit()
+            self._unlocked.discard(folder_id)
+            self._wrong_pins.pop(folder_id, None)
         return moved
 
     def delete(self, image_id: str) -> bool:
         with self._lock:
-            row = self._db.execute("SELECT file, thumb, last_frame FROM images WHERE id = ?", (image_id,)).fetchone()
-            if row is None:
+            row = self._db.execute("SELECT file, thumb, last_frame, folder_id FROM images WHERE id = ?",
+                                   (image_id,)).fetchone()
+            if row is None or (row["folder_id"] and row["folder_id"] in self._blocked()):
                 return False
             self._db.execute("DELETE FROM images WHERE id = ?", (image_id,))
             self._db.commit()
@@ -347,14 +552,25 @@ class Gallery:
     # ------------------------------------------------------------ read
 
     def get(self, image_id: str) -> dict[str, Any] | None:
+        """An item by id; None too for one in a hidden or locked folder this session cannot see."""
         with self._lock:
             row = self._db.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
+            if row is not None and row["folder_id"] and row["folder_id"] in self._blocked():
+                row = None
         return self._public(dict(row)) if row else None
 
     def list(self, *, offset: int = 0, limit: int = 60, query: str = "",
              favorites_only: bool = False, media: str = "", folder: str = "") -> dict[str, Any]:
         """`folder` narrows to one folder's items. Favourites are not narrowed by folder
-        unless a folder is given too: the favourites view shows every favourite."""
+        unless a folder is given too: the favourites view shows every favourite. Items in
+        hidden or locked folders this session cannot see are left out of every view; asking
+        for such a folder raises FolderError (hidden: as if it did not exist) or FolderLocked."""
+        if folder:
+            with self._lock:
+                row = self._folder_row(folder)
+                if row is None:
+                    raise FolderError("No such folder.")
+                self._require_open(row)
         where, args = [], []
         if query:
             escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -368,8 +584,12 @@ class Gallery:
         if folder:
             where.append("folder_id = ?")
             args.append(folder)
-        clause = f"WHERE {' AND '.join(where)}" if where else ""
         with self._lock:
+            blocked = sorted(self._blocked())
+            if blocked:
+                where.append(f"folder_id NOT IN ({', '.join('?' * len(blocked))})")
+                args.extend(blocked)
+            clause = f"WHERE {' AND '.join(where)}" if where else ""
             total = self._db.execute(f"SELECT COUNT(*) FROM images {clause}", args).fetchone()[0]
             rows = self._db.execute(
                 f"SELECT * FROM images {clause} ORDER BY created DESC LIMIT ? OFFSET ?",
@@ -384,7 +604,10 @@ class Gallery:
         column, media = {"image": ("file", "image"), "video": ("file", "video"),
                          "last": ("last_frame", "video"), "thumb": ("thumb", None)}[kind]
         with self._lock:
-            row = self._db.execute(f"SELECT {column}, media FROM images WHERE id = ?", (image_id,)).fetchone()
+            row = self._db.execute(f"SELECT {column}, media, folder_id FROM images WHERE id = ?",
+                                   (image_id,)).fetchone()
+            if row is not None and row["folder_id"] and row["folder_id"] in self._blocked():
+                row = None
         if row is None or not row[0] or (media is not None and row["media"] != media):
             return None
         path = (self.root / row[0]).resolve()

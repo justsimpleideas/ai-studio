@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { MediaKind } from '@shared/image.js'
+import type { EngineModelKind } from '@shared/image.js'
 import { IDLE_DOWNLOAD, MODEL_CATALOG, type CatalogModel, type ModelDownloadState, type ModelId } from '@shared/setup.js'
 import { api } from '../api.js'
 import { downloadSummary } from '../download.js'
@@ -20,7 +20,7 @@ export function useDownloadState(): ModelDownloadState {
 }
 
 interface Props {
-  kind: MediaKind
+  kind: EngineModelKind
   /** False while the engine is not installed: downloads need its Python. */
   enabled: boolean
   /** Called once a download has finished and the engine was pointed at it. */
@@ -31,7 +31,8 @@ export function ModelDownloadPanel({ kind, enabled, onSelected }: Props): React.
   const state = useDownloadState()
   const [open, setOpen] = useState<ModelId | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const models = MODEL_CATALOG.filter((m) => m.kind === kind)
+  // Parts other models need are downloaded by Import a model file…, not chosen here.
+  const models = MODEL_CATALOG.filter((m) => m.kind === kind && !m.part)
   const busy = state.phase === 'starting' || state.phase === 'downloading'
 
   useEffect(() => {

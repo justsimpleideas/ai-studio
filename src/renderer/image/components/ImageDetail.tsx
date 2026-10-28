@@ -105,7 +105,8 @@ export function ImageDetail({ image, list, onNavigate, onClose, onReuse, onFavor
             >
               <option value="">No folder</option>
               {folders.map((f) => (
-                <option key={f.id} value={f.id}>{f.name}</option>
+                // A locked folder takes items without its PIN; they then leave view until it is unlocked.
+                <option key={f.id} value={f.id}>{f.locked && !f.unlocked ? `🔒 ${f.name}` : f.name}</option>
               ))}
             </select>
           </label>

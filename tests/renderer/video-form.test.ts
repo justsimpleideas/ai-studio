@@ -4,10 +4,14 @@ import type { ImageRecord, Job, Status } from "../../src/renderer/image/types.js
 import { activeJob, engineReducer, initialEngineState } from "../../src/renderer/image/useEngine.js";
 import {
   DEFAULT_VIDEO_FORM,
+  GEOMETRY_14B,
+  GEOMETRY_5B,
   LENGTHS,
   QUALITIES,
   SHAPES,
+  fitVideoToModel,
   fromVideo,
+  geometryFor,
   loadVideoForm,
   qualityOf,
   shapeOf,
@@ -47,6 +51,42 @@ describe("video sizes and lengths", () => {
     expect(req.kind).toBe("video");
     expect(req.seed).toBe(-1);
     expect(req.start_image).toBeNull();
+  });
+});
+
+describe("the 14B models' sizes and lengths", () => {
+  // image_engine/params.py with a 14B profile: sides in 16s, at most 1280x720, 16 fps.
+  const accepts14b = (w: number, h: number) =>
+    w % 16 === 0 && h % 16 === 0 && w >= 256 && h >= 256 && w <= 1280 && h <= 1280 && w * h <= 1280 * 720;
+  const text14b = { name: "text-14b", label: "", steps: 40, guidance: 4, fixed: false, trained_frames: 81, experts: 2,
+                    start: "text", fps: 16 } as const;
+
+  it("every 14B preset is a size and length the engine accepts", () => {
+    for (const shape of SHAPES) {
+      QUALITIES.forEach((_q, i) => {
+        const { width, height } = sizeFor(shape.value, i, GEOMETRY_14B);
+        expect(accepts14b(width, height), `${shape.value} ${i}: ${width}x${height}`).toBe(true);
+        expect(qualityOf(width, height, GEOMETRY_14B)).toBe(i);
+      });
+    }
+    for (const { frames, seconds } of GEOMETRY_14B.lengths) {
+      expect((frames - 1) % 4).toBe(0);
+      expect(Math.abs(frames / 16 - seconds)).toBeLessThan(0.1);
+    }
+    expect(geometryFor(text14b)).toBe(GEOMETRY_14B);
+    expect(geometryFor(null)).toBe(GEOMETRY_5B);
+  });
+
+  it("switching models keeps the shape, quality and seconds, and takes the model's steps and start", () => {
+    const portrait540 = { ...DEFAULT_VIDEO_FORM, ...sizeFor("portrait", 1), frames: 73, steps: 30,
+                          start: { id: "0123456789abcdef", width: 544, height: 960 } };
+    const fitted = fitVideoToModel(portrait540, text14b);
+    expect([fitted.width, fitted.height, fitted.frames, fitted.steps, fitted.guidance]).toEqual([544, 960, 49, 40, 4]);
+    expect(fitted.start).toBeNull(); // text only
+    expect(fitted.model).toBe("text-14b");
+    expect(fitVideoToModel(fitted, text14b)).toBe(fitted); // already set for it
+    const back = fitVideoToModel(fitted, { ...text14b, name: "standard", experts: 1, steps: 50, guidance: 5, fps: 24, start: "any" });
+    expect([back.width, back.height, back.frames, back.steps]).toEqual([544, 960, 73, 50]);
   });
 });
 

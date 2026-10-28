@@ -9,6 +9,7 @@ import {
   type ImageJob,
   type ImageModelState,
   type ImageStatus,
+  type EngineModelKind,
   type MediaKind
 } from '@shared/image.js'
 
@@ -55,7 +56,7 @@ export class ImageEngine {
   private heldFor: string | null = null
 
   /** Mirrors of engine state, kept from its event stream for the GPU arbiter. */
-  models: Record<MediaKind, ImageModelState> = { image: 'unloaded', video: 'unloaded' }
+  models: Record<EngineModelKind, ImageModelState> = { image: 'unloaded', video: 'unloaded', caption: 'unloaded' }
   private jobs = new Map<string, ImageJob>()
 
   constructor(private readonly options: ImageEngineOptions) {
@@ -74,6 +75,7 @@ export class ImageEngine {
   get busyReason(): string | null {
     if (this.models.image === 'loading') return 'The image model is loading.'
     if (this.models.video === 'loading') return 'The video model is loading.'
+    if (this.models.caption === 'loading') return 'The captioning model is loading.'
     const active = [...this.jobs.values()].filter((j) => j.status === 'queued' || j.status === 'running')
     if (active.length > 0) {
       const what = active.some((j) => j.kind === 'video') ? 'Video generation' : 'Image generation'
@@ -83,8 +85,8 @@ export class ImageEngine {
   }
 
   /** The model on the GPU right now, if any (the engine keeps at most one). */
-  get loadedKind(): MediaKind | null {
-    for (const kind of ['video', 'image'] as const) {
+  get loadedKind(): EngineModelKind | null {
+    for (const kind of ['video', 'image', 'caption'] as const) {
       if (this.models[kind] === 'ready' || this.models[kind] === 'loading') return kind
     }
     return null
@@ -95,13 +97,14 @@ export class ImageEngine {
   }
 
   private resetModels(): void {
-    this.models = { image: 'unloaded', video: 'unloaded' }
+    this.models = { image: 'unloaded', video: 'unloaded', caption: 'unloaded' }
   }
 
   private takeStatus(status: Pick<ImageStatus, 'model' | 'models'>): void {
     this.models = {
       image: status.models?.image?.state ?? status.model.state,
-      video: status.models?.video?.state ?? 'unloaded'
+      video: status.models?.video?.state ?? 'unloaded',
+      caption: status.models?.caption?.state ?? 'unloaded'
     }
   }
 

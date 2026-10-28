@@ -8,6 +8,8 @@
  * shows images and videos through the private `studio-image:` protocol (decisions S3).
  */
 
+import type { ImportOptions, ImportTarget, ModelImportState } from './importing.js'
+import type { ModelInspectState } from './inspect.js'
 import type { EngineSetupState, ModelDownloadState, ModelId } from './setup.js'
 
 export const IMAGE_ENGINE_PORT = 5198
@@ -20,6 +22,8 @@ export type ImageModelState = 'unloaded' | 'loading' | 'ready' | 'error'
 export type ImageJobStatus = 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
 export type MemoryMode = 'auto' | 'full' | 'quality' | 'balanced' | 'low'
 export type MediaKind = 'image' | 'video'
+/** The models the image engine can hold, one at a time: the two that make media, and the captioning model. */
+export type EngineModelKind = MediaKind | 'caption'
 
 export interface GenerationRequest {
   prompt: string
@@ -31,7 +35,19 @@ export interface GenerationRequest {
   /** -1 asks the engine for a random seed. */
   seed: number
   count: number
+  /** LoRAs from the library, applied to these images. Omitted means none. */
+  loras?: LoraUse[]
 }
+
+/** A library LoRA applied to an image request, and how strongly (0..MAX_LORA_STRENGTH). */
+export interface LoraUse {
+  id: string
+  strength: number
+}
+
+/** The engine's limits for LoRAs in one request (image_engine/params.py). */
+export const MAX_LORAS = 3
+export const MAX_LORA_STRENGTH = 2
 
 export interface VideoRequest {
   kind: 'video'
@@ -60,10 +76,11 @@ export interface StartImage {
 /**
  * A video model the engine supports (image_engine/video_models.py): "standard" is
  * sampled in 50 steps with guidance; "fast" is a 3-step distillation whose steps and
- * guidance are fixed by the model.
+ * guidance are fixed by the model. The 14B models ("text-14b", "image-14b", and their
+ * few-step distillations "...-few") are two experts each, at 16 fps.
  */
 export interface VideoProfile {
-  name: 'standard' | 'fast'
+  name: 'standard' | 'fast' | 'text-14b' | 'image-14b' | 'text-14b-few' | 'image-14b-few'
   label: string
   steps: number
   guidance: number
@@ -71,6 +88,41 @@ export interface VideoProfile {
   fixed: boolean
   /** The clip length it was trained on. */
   trained_frames: number
+  /** Missing from older engines: 24, 32, 1280×704 and "any" then. */
+  fps?: number
+  side_multiple?: number
+  max_pixels?: number
+  /** What a clip starts from: text and optionally a picture, text only, or a picture. */
+  start?: 'any' | 'text' | 'image'
+  /** 2 for the 14B models: the second takes over at `boundary` of the noise schedule. */
+  experts?: number
+  boundary?: number | null
+  guidance_2?: number | null
+  /** A few-step 14B distillation: Euler steps on a schedule shifted this much. */
+  shift?: number | null
+}
+
+/**
+ * An image model the engine supports (image_engine/image_models.py): the 6B few-step
+ * model, which takes LoRAs and can be trained, or the 12B model, as a base model
+ * (28 steps with guidance) or a distilled one (8 steps, no guidance).
+ */
+export interface ImageProfile {
+  name: 'turbo' | 'base' | 'large' | 'large-fast'
+  label: string
+  /** Stored with every image. */
+  model_id: string
+  /** The model's own defaults for a request. */
+  steps: number
+  guidance: number
+  distilled: boolean
+  loras: boolean
+  training: boolean
+}
+
+export interface ImageModelInfo {
+  /** Which model the image folder holds; null when it holds none the engine supports. */
+  profile: ImageProfile | null
 }
 
 export interface VideoInfo {
@@ -116,19 +168,34 @@ export interface ImageStatus {
   /** The image model. */
   model: ModelInfo
   /** Every model the engine has; "video" is missing from an engine without video support. */
-  models?: Partial<Record<MediaKind, ModelInfo>>
+  models?: Partial<Record<EngineModelKind, ModelInfo>>
   device: DeviceInfo
   queue: { queued: number; running: number }
   limits: { min_side: number; max_side: number; side_multiple: number; max_steps: number; max_count: number }
   defaults: { width: number; height: number; steps: number; guidance: number; count: number }
+  /** The image model's profile. Missing from older engines (and test doubles): treat as the 6B model. */
+  image?: ImageModelInfo
   video?: VideoInfo
+  /** True when the engine can train LoRAs. Missing from older engines. */
+  training?: boolean
+  /** Whether training photos can be described: a verified captioning model is installed. */
+  captioning?: boolean
+}
+
+/** A training task (scan, train, compare) as the job queue reports it. */
+export interface TaskJobRequest {
+  kind: 'task'
+  task: 'training.scan' | 'training.train' | 'training.compare'
+  project: string
+  params: Record<string, unknown>
+  label: string
 }
 
 export interface ImageJob {
   id: string
-  /** Missing on jobs from an engine without video support: those are images. */
-  kind?: MediaKind
-  request: GenerationRequest | (VideoRequest & { fps: number })
+  /** Missing on jobs from an engine without video support: those are images. Training jobs are "task". */
+  kind?: MediaKind | 'task'
+  request: GenerationRequest | (VideoRequest & { fps: number }) | TaskJobRequest
   created: number
   status: ImageJobStatus
   stage: string
@@ -140,6 +207,9 @@ export interface ImageJob {
   error: string | null
   started: number | null
   finished: number | null
+  /** Tasks only: live details (training reports its last loss) and what the task returned. */
+  detail?: { loss?: number }
+  result?: Record<string, unknown> | null
 }
 
 export interface ImageRecord {
@@ -159,7 +229,15 @@ export interface ImageRecord {
   /** `encoder` says how a video file was made (MP4 through ffmpeg, or animated WebP). */
   stats: { peak_vram_bytes?: number; memory_plan?: string; encoder?: string }
   /** What made it, when known: app version, exact model revision ("repo@commit"), library versions. */
-  provenance: { app?: string; model_revision?: string; libraries?: Record<string, string> }
+  provenance: {
+    app?: string
+    model_revision?: string
+    libraries?: Record<string, string>
+    /** The LoRAs it was made with. */
+    loras?: { id: string; name: string; sha256: string; strength: number }[]
+    /** Made by a checkpoint comparison: which run and step (null step = without the LoRA). */
+    training_checkpoint?: { project: string; run: string; step: number | null }
+  }
   /** For a video, a still (its thumbnail). */
   image_url: string
   thumb_url: string
@@ -183,9 +261,18 @@ export interface GalleryFolder {
   id: string
   name: string
   created: number
-  /** How many images and videos it holds. */
-  count: number
+  /** How many images and videos it holds; null while it is locked. */
+  count: number | null
+  /** Left out of the folder list, and its items out of every view, unless hidden folders are shown. */
+  hidden: boolean
+  /** Has a six-digit PIN. */
+  locked: boolean
+  /** Locked, and unlocked for this session (until the window closes, or it is locked again). */
+  unlocked: boolean
 }
+
+/** A gallery folder PIN: exactly six digits. */
+export const FOLDER_PIN = /^[0-9]{6}$/
 
 /** The longest folder name the engine accepts. */
 export const FOLDER_NAME_MAX = 60
@@ -211,6 +298,8 @@ export interface ImageSettings {
   video_memory_mode: MemoryMode
   /** Empty: found automatically (PATH, then where winget installs it). */
   ffmpeg_path: string
+  /** The model that describes training photos. */
+  caption_model_dir: string
 }
 
 export interface GalleryQuery {
@@ -234,7 +323,9 @@ export type ImageEngineEvent =
   | { type: 'job'; job: ImageJob }
   | { type: 'image'; job_id: string; image: ImageRecord }
   /** `kind` is missing from an engine without video support: that is the image model. */
-  | { type: 'model'; kind?: MediaKind; state: ImageModelState; message: string }
+  | { type: 'model'; kind?: EngineModelKind; state: ImageModelState; message: string }
+  /** Folders were hidden, shown, locked or unlocked. `blocked`: the folders whose items are now out of view. */
+  | { type: 'privacy'; show_hidden: boolean; blocked: string[] }
 
 /** The engine process itself, as opposed to the model inside it. */
 export type ImageEngineState =
@@ -275,6 +366,14 @@ export interface ImageApi {
   deleteFolder(id: string): Promise<{ moved: number }>
   /** Put an image or video in a folder, or (null) in none. */
   moveToFolder(id: string, folderId: string | null): Promise<ImageRecord>
+  setFolderHidden(id: string, hidden: boolean): Promise<GalleryFolder>
+  /** Set, change or (pin null) remove a folder's PIN; a folder that has one needs it as `current`. */
+  setFolderPin(id: string, pin: string | null, current: string | null): Promise<GalleryFolder>
+  unlockFolder(id: string, pin: string): Promise<GalleryFolder>
+  lockFolder(id: string): Promise<GalleryFolder>
+  /** Whether hidden folders are shown. Per session: closing the window hides them again. */
+  showHiddenFolders(): Promise<boolean>
+  setShowHiddenFolders(show: boolean): Promise<boolean>
   /**
    * Opens a save dialog in the main process; resolves to the saved path or null
    * if cancelled. The prompt and settings are left out of the saved file unless
@@ -286,7 +385,7 @@ export interface ImageApi {
   includeSettingsInExports(): Promise<boolean>
   setIncludeSettingsInExports(value: boolean): Promise<boolean>
   /** Opens a folder picker for the image (or video) model folder and saves the choice. */
-  pickModelFolder(kind?: MediaKind): Promise<ImageSettings | null>
+  pickModelFolder(kind?: EngineModelKind): Promise<ImageSettings | null>
   /** Opens a file picker for ffmpeg and saves the choice. */
   pickFfmpeg(): Promise<ImageSettings | null>
   /** Opens a file picker for the Python interpreter and restarts the engine with it. */
@@ -313,6 +412,29 @@ export interface ImageApi {
   /** Opens the model's source page or its license in the browser. */
   openModelLink(id: ModelId, which: 'source' | 'license'): Promise<void>
   onDownloadState(handler: (state: ModelDownloadState) => void): () => void
+
+  /** Inspecting a model file (shared/inspect.ts): its header and SHA-256, nothing loaded or run. */
+  inspectState(): Promise<ModelInspectState>
+  /** Opens a file picker and inspects the chosen file; false if cancelled. Resolves when done or stopped. */
+  inspectModelFile(): Promise<boolean>
+  cancelInspect(): Promise<void>
+  onInspectState(handler: (state: ModelInspectState) => void): () => void
+
+  /** Importing a model from a single transformer file (shared/importing.ts). */
+  importState(): Promise<ModelImportState>
+  /**
+   * Opens a file picker and reads what the chosen file is; false if cancelled. `target`: the Settings
+   * card it is for; `slot` "second": a 14B video model's other expert.
+   */
+  pickImportFile(target: ImportTarget, slot?: 'first' | 'second'): Promise<boolean>
+  /** Exchange which of a 14B video model's two files is the first (high-noise) expert. */
+  swapImportExperts(): Promise<void>
+  /** Downloads missing parts, assembles the folder and selects it. Resolves when done or stopped. */
+  startImport(options: ImportOptions): Promise<void>
+  cancelImport(): Promise<void>
+  /** Forget the chosen file. */
+  clearImport(): Promise<void>
+  onImportState(handler: (state: ModelImportState) => void): () => void
 }
 
 // ---------------------------------------------------------------------------
@@ -340,7 +462,8 @@ const MEDIA_ROUTES: [RegExp, (m: RegExpExecArray) => string][] = [
   [/^studio-image:\/\/gallery\/([0-9a-f]{16})\.(png|webp)$/, (m) => `/images/${m[1]}.${m[2]}`],
   [/^studio-image:\/\/video\/([0-9a-f]{16})$/, (m) => `/videos/${m[1]}`],
   [/^studio-image:\/\/frame\/([0-9a-f]{16})-last\.png$/, (m) => `/frames/${m[1]}-last.png`],
-  [/^studio-image:\/\/input\/([0-9a-f]{16})\.png$/, (m) => `/inputs/${m[1]}.png`]
+  [/^studio-image:\/\/input\/([0-9a-f]{16})\.png$/, (m) => `/inputs/${m[1]}.png`],
+  [/^studio-image:\/\/training\/([0-9a-f]{16})\/([0-9a-f]{16})\.webp$/, (m) => `/training/${m[1]}/${m[2]}.webp`]
 ]
 
 /** Parse a `studio-image:` URL back to an engine path, refusing anything else. */

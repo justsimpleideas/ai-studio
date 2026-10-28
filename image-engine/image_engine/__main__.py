@@ -42,6 +42,9 @@ from .config import DEFAULT_PORT, SettingsStore, default_data_dir  # noqa: E402
 from .events import EventHub  # noqa: E402
 from .gallery import Gallery  # noqa: E402
 from .jobs import JobQueue  # noqa: E402
+from .lora_library import LoraLibrary  # noqa: E402
+from .training.service import TrainingService  # noqa: E402
+from .training.service import register as register_training  # noqa: E402
 from .server import App, serve  # noqa: E402
 
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
@@ -97,9 +100,10 @@ def _wait_for_pipe_close(fd: int) -> None:
 
 
 def main(argv: list[str] | None = None, backend_factory: Callable | None = None,
-         video_backend_factory: Callable | None = None) -> int:
-    """Run the engine. `backend_factory(settings_getter)` and `video_backend_factory(settings_getter)`
-    replace the real models in tests; a test that passes only the first runs without video."""
+         video_backend_factory: Callable | None = None, caption_backend_factory: Callable | None = None) -> int:
+    """Run the engine. `backend_factory(settings_getter)`, `video_backend_factory(settings_getter)` and
+    `caption_backend_factory(settings_getter)` replace the real models in tests; a test that passes
+    only the first runs without video and without the captioning model."""
     ap = argparse.ArgumentParser(prog="python -m image_engine", description="Local AI Studio image engine")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--host", default="127.0.0.1", help="loopback address to bind (default 127.0.0.1)")
@@ -121,9 +125,11 @@ def main(argv: list[str] | None = None, backend_factory: Callable | None = None,
     settings = SettingsStore(data_dir)
 
     if backend_factory is None:
-        from .backends.diffusion import DiffusionBackend
+        from .backends.image import ImageBackend
         from .backends.video import VideoBackend
-        backend_factory, video_backend_factory = DiffusionBackend, VideoBackend
+        from .backends.captioner import CaptionBackend
+        backend_factory, video_backend_factory = ImageBackend, VideoBackend
+        caption_backend_factory = CaptionBackend
 
     events = EventHub()
     gallery = Gallery(data_dir / "outputs")
@@ -131,10 +137,15 @@ def main(argv: list[str] | None = None, backend_factory: Callable | None = None,
     backends = {"image": backend}
     if video_backend_factory is not None:
         backends["video"] = video_backend_factory(settings.get)
+    if caption_backend_factory is not None:
+        backends["caption"] = caption_backend_factory(settings.get)
+    loras = LoraLibrary(data_dir / "loras")
     jobs = JobQueue(backends, gallery, events, app=app_label(),
-                    ffmpeg=lambda: video_io.find_ffmpeg(settings.get().ffmpeg_path))
+                    ffmpeg=lambda: video_io.find_ffmpeg(settings.get().ffmpeg_path), loras=loras)
+    training = TrainingService(data_dir / "training", loras, gallery)
+    register_training(jobs, training)
     app = App(settings=settings, backend=backend, gallery=gallery, events=events, jobs=jobs,
-              port=args.port, token=token)
+              port=args.port, token=token, training=training, loras=loras)
 
     try:
         httpd = serve(app, args.host)

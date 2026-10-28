@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FOLDER_NAME_MAX } from "@shared/image.js";
+import { FOLDER_NAME_MAX, FOLDER_PIN } from "@shared/image.js";
 import { api } from "../api";
 import { formatSeconds } from "../format";
 import type { GalleryFolder, ImageRecord, MediaKind } from "../types";
@@ -18,9 +18,13 @@ interface Props {
   /** Lets the parent push in-place updates (favorite, delete) without a refetch. */
   registerUpdater: (fn: (image: ImageRecord | { id: string; deleted: true }) => void) => void;
   onError: (message: string) => void;
+  /** File an item in a folder (null: take it out of its folder). */
+  onMove: (image: ImageRecord, folderId: string | null) => Promise<void>;
+  /** Delete an item for good (already confirmed). */
+  onDelete: (image: ImageRecord) => Promise<void>;
 }
 
-export function GalleryView({ version, folders, onOpen, registerUpdater, onError }: Props) {
+export function GalleryView({ version, folders, onOpen, registerUpdater, onError, onMove, onDelete }: Props) {
   const [items, setItems] = useState<ImageRecord[]>([]);
   const [total, setTotal] = useState(0);
   const [query, setQuery] = useState("");
@@ -28,11 +32,20 @@ export function GalleryView({ version, folders, onOpen, registerUpdater, onError
   const [media, setMedia] = useState<MediaKind | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [menu, setMenu] = useState<TileMenuAt | null>(null);
+  const closeMenu = useCallback(() => setMenu(null), []);
   const request = useRef(0);
 
   const folder = view.kind === "folder" ? folders.list.find((f) => f.id === view.id) : undefined;
 
+  // A folder that was just hidden or locked (or deleted) is no longer a view to stay in.
+  const viewGone = view.kind === "folder" && (!folder || (folder.locked && !folder.unlocked));
+  useEffect(() => {
+    if (viewGone) setView({ kind: "all" });
+  }, [viewGone]);
+
   const load = useCallback(async (offset: number) => {
+    if (viewGone) return;
     const id = ++request.current;
     setLoading(true);
     try {
@@ -53,7 +66,7 @@ export function GalleryView({ version, folders, onOpen, registerUpdater, onError
     } finally {
       if (id === request.current) setLoading(false);
     }
-  }, [query, view, media]);
+  }, [query, view, media, viewGone]);
 
   useEffect(() => {
     const t = window.setTimeout(() => load(0), query ? 200 : 0);
@@ -128,6 +141,18 @@ export function GalleryView({ version, folders, onOpen, registerUpdater, onError
                 e.dataTransfer.effectAllowed = "move";
               }}
               onClick={() => onOpen(img, items)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setMenu({ image: img, x: e.clientX, y: e.clientY });
+              }}
+              onKeyDown={(e) => {
+                // The keyboard's menu key, or Shift+F10, opens the same menu at the tile.
+                if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+                  e.preventDefault();
+                  const r = e.currentTarget.getBoundingClientRect();
+                  setMenu({ image: img, x: r.left + 12, y: r.top + 12 });
+                }
+              }}
               title={img.prompt}
             >
               <img src={img.thumb_url} alt={img.prompt} loading="lazy" style={{ aspectRatio: `${img.width} / ${img.height}` }} />
@@ -144,7 +169,127 @@ export function GalleryView({ version, folders, onOpen, registerUpdater, onError
           </div>
         )}
       </div>
+      {menu && (
+        <TileMenu
+          at={menu}
+          folders={folders.list}
+          onClose={closeMenu}
+          onOpen={() => onOpen(menu.image, items)}
+          onMove={(folderId) => onMove(menu.image, folderId)}
+          onDelete={() => onDelete(menu.image)}
+          onError={onError}
+        />
+      )}
     </section>
+  );
+}
+
+// ------------------------------------------------------------ tile menu
+
+interface TileMenuAt {
+  image: ImageRecord;
+  x: number;
+  y: number;
+}
+
+const MENU_WIDTH = 240;
+const MENU_MAX_HEIGHT = 360;
+
+/**
+ * Right-click on a tile: open it, file it in a folder (or take it out of its folder), or
+ * delete it, which asks once more. Folders that are locked are left out until unlocked.
+ * Closes on a click elsewhere, Escape, scrolling or resizing.
+ */
+function TileMenu({ at, folders, onClose, onOpen, onMove, onDelete, onError }: {
+  at: TileMenuAt;
+  folders: GalleryFolder[];
+  onClose: () => void;
+  onOpen: () => void;
+  onMove: (folderId: string | null) => Promise<void>;
+  onDelete: () => Promise<void>;
+  onError: (message: string) => void;
+}) {
+  const [confirm, setConfirm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const image = at.image;
+  const targets = folders.filter((f) => f.id !== image.folder_id && !(f.locked && !f.unlocked));
+  const current = folders.find((f) => f.id === image.folder_id);
+
+  useEffect(() => {
+    const away = (e: MouseEvent) => {
+      if (!ref.current?.contains(e.target as Node)) onClose();
+    };
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("mousedown", away);
+    document.addEventListener("keydown", key);
+    window.addEventListener("resize", onClose);
+    window.addEventListener("scroll", onClose, true);
+    return () => {
+      document.removeEventListener("mousedown", away);
+      document.removeEventListener("keydown", key);
+      window.removeEventListener("resize", onClose);
+      window.removeEventListener("scroll", onClose, true);
+    };
+  }, [onClose]);
+
+  // Keyboard users land on the first item, once per menu and again when the delete question shows.
+  useEffect(() => {
+    ref.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [at, confirm]);
+
+  const run = (action: () => Promise<void>) => () => {
+    setBusy(true);
+    void action().then(onClose, (e: Error) => {
+      setBusy(false);
+      onError(e.message);
+    });
+  };
+
+  // Kept inside the window: opened near the right or bottom edge, it opens to the left or upward.
+  const left = Math.max(8, Math.min(at.x, window.innerWidth - MENU_WIDTH - 8));
+  const top = Math.max(8, Math.min(at.y, window.innerHeight - MENU_MAX_HEIGHT - 8));
+  const noun = image.media === "video" ? "video" : "image";
+
+  return (
+    <div
+      ref={ref}
+      className="tile-menu"
+      role="menu"
+      aria-label={`Options for this ${noun}`}
+      style={{ left, top, width: MENU_WIDTH, maxHeight: MENU_MAX_HEIGHT }}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      {confirm ? (
+        <div className="tile-menu-confirm" role="alertdialog" aria-label={`Delete this ${noun}`}>
+          <p>Delete this {noun} for good? This cannot be undone.</p>
+          <div className="row-gap">
+            <button className="danger small" disabled={busy} onClick={run(onDelete)}>Delete for good</button>
+            <button className="ghost small" onClick={() => setConfirm(false)}>Cancel</button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <button role="menuitem" className="ghost small" onClick={() => { onOpen(); onClose(); }}>Open</button>
+          <p className="tile-menu-label">{current ? `In “${current.name}”. Move to` : "Move to folder"}</p>
+          {targets.length === 0 && !current && <p className="tile-menu-note">No folders yet. Make one in the folder list.</p>}
+          {targets.map((f) => (
+            <button key={f.id} role="menuitem" className="ghost small" disabled={busy} title={f.name} onClick={run(() => onMove(f.id))}>
+              <span className="folder-name">{f.name}</span>
+            </button>
+          ))}
+          {current && (
+            <button role="menuitem" className="ghost small" disabled={busy} onClick={run(() => onMove(null))}>
+              Take out of “{current.name}”
+            </button>
+          )}
+          <hr />
+          <button role="menuitem" className="ghost small danger-text" onClick={() => setConfirm(true)}>Delete…</button>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -229,6 +374,7 @@ function FolderList({ view, onView, folders, onError }: {
         <FolderRow
           key={f.id}
           folder={f}
+          folders={folders}
           active={view.kind === "folder" && view.id === f.id}
           onSelect={() => onView({ kind: "folder", id: f.id })}
           onDropItem={(id) => void attempt(() => folders.move(id, f.id))}
@@ -240,23 +386,100 @@ function FolderList({ view, onView, folders, onError }: {
               if (view.kind === "folder" && view.id === f.id) onView({ kind: "all" });
             })
           }
+          onError={onError}
         />
       ))}
     </aside>
   );
 }
 
-function FolderRow({ folder, active, onSelect, onDropItem, onRename, onDelete }: {
+type RowMode = "idle" | "rename" | "confirm" | "menu" | "unlock" | "set-pin" | "change-pin" | "remove-pin";
+
+function FolderRow({ folder, folders, active, onSelect, onDropItem, onRename, onDelete, onError }: {
   folder: GalleryFolder;
+  folders: Folders;
   active: boolean;
   onSelect: () => void;
   onDropItem: (id: string) => void;
   onRename: (name: string) => Promise<boolean>;
   onDelete: () => Promise<boolean>;
+  onError: (message: string) => void;
 }) {
-  const [mode, setMode] = useState<"idle" | "rename" | "confirm">("idle");
+  const [mode, setMode] = useState<RowMode>("idle");
   const drop = useDropTarget(onDropItem);
+  const closed = folder.locked && !folder.unlocked;
+  const run = (action: () => Promise<unknown>) => () =>
+    void action().then(() => setMode("idle"), (e: Error) => onError(e.message));
 
+  if (mode === "unlock") {
+    return (
+      <PinForm
+        title={`Unlock “${folder.name}”`}
+        fields={["PIN"]}
+        submitLabel="Unlock"
+        onSubmit={async ([pin = ""]) => {
+          await folders.unlock(folder.id, pin);
+          setMode("idle");
+          onSelect();
+        }}
+        onCancel={() => setMode("idle")}
+      />
+    );
+  }
+  if (mode === "set-pin" || mode === "change-pin") {
+    const change = mode === "change-pin";
+    return (
+      <PinForm
+        title={change ? `New PIN for “${folder.name}”` : `Lock “${folder.name}” with a PIN`}
+        fields={change ? ["Current PIN", "New PIN", "New PIN again"] : ["PIN", "PIN again"]}
+        submitLabel={change ? "Change PIN" : "Lock"}
+        note="Six digits. There is no way to recover a forgotten PIN."
+        onSubmit={async (values) => {
+          const [current = null, pin = "", again = ""] = change ? values : [null, ...values];
+          if (pin !== again) throw new Error("The two PINs are not the same.");
+          await folders.setPin(folder.id, pin, current);
+          setMode("idle");
+        }}
+        onCancel={() => setMode("idle")}
+      />
+    );
+  }
+  if (mode === "remove-pin") {
+    return (
+      <PinForm
+        title={`Remove the PIN of “${folder.name}”`}
+        fields={["Current PIN"]}
+        submitLabel="Remove PIN"
+        onSubmit={async ([current = ""]) => {
+          await folders.setPin(folder.id, null, current);
+          setMode("idle");
+        }}
+        onCancel={() => setMode("idle")}
+      />
+    );
+  }
+  if (mode === "menu") {
+    return (
+      <div className="folder-menu" role="menu" aria-label={`Options for ${folder.name}`}>
+        <p className="folder-menu-title" title={folder.name}>{folder.name}</p>
+        <button role="menuitem" className="ghost small" onClick={run(() => folders.setHidden(folder.id, !folder.hidden))}>
+          {folder.hidden ? "Show in the folder list" : "Hide"}
+        </button>
+        {!folder.locked && (
+          <button role="menuitem" className="ghost small" onClick={() => setMode("set-pin")}>Lock with a PIN…</button>
+        )}
+        {folder.unlocked && (
+          <>
+            <button role="menuitem" className="ghost small" onClick={run(() => folders.lock(folder.id))}>Lock now</button>
+            <button role="menuitem" className="ghost small" onClick={() => setMode("change-pin")}>Change PIN…</button>
+            <button role="menuitem" className="ghost small" onClick={() => setMode("remove-pin")}>Remove PIN…</button>
+          </>
+        )}
+        {closed && <p className="folder-menu-note">Unlock it to rename, delete or change its PIN.</p>}
+        <button className="ghost small" onClick={() => setMode("idle")}>Close</button>
+      </div>
+    );
+  }
   if (mode === "rename") {
     return (
       <NameInput
@@ -274,7 +497,7 @@ function FolderRow({ folder, active, onSelect, onDropItem, onRename, onDelete }:
       <div className="folder-confirm" role="alertdialog" aria-label={`Delete folder ${folder.name}`}>
         <p>
           Delete “{folder.name}”?{" "}
-          {folder.count > 0 ? `Its ${folder.count} item${folder.count === 1 ? "" : "s"} stay in All.` : "It is empty."}
+          {folder.count ? `Its ${folder.count} item${folder.count === 1 ? "" : "s"} stay in All.` : "It is empty."}
         </p>
         <div className="row-gap">
           <button className="danger small" onClick={() => void onDelete().then((ok) => ok || setMode("idle"))}>Delete folder</button>
@@ -284,16 +507,93 @@ function FolderRow({ folder, active, onSelect, onDropItem, onRename, onDelete }:
     );
   }
   return (
-    <div className={`folder-row ${active ? "active" : ""} ${drop.over ? "drop" : ""}`} {...drop.handlers}>
-      <button className="folder-item" onClick={onSelect} onDoubleClick={() => setMode("rename")} title={folder.name}>
+    <div className={`folder-row ${active ? "active" : ""} ${drop.over ? "drop" : ""} ${folder.hidden ? "hidden-folder" : ""}`} {...drop.handlers}>
+      <button
+        className="folder-item"
+        onClick={closed ? () => setMode("unlock") : onSelect}
+        onDoubleClick={closed ? undefined : () => setMode("rename")}
+        title={closed ? `${folder.name} (locked)` : folder.name}
+      >
         <span className="folder-name">{folder.name}</span>
-        <span className="folder-count">{folder.count}</span>
+        {folder.hidden && <span className="folder-tag">hidden</span>}
+        {closed ? (
+          <span className="folder-lock" aria-label="Locked">🔒</span>
+        ) : (
+          <span className="folder-count">{folder.count}</span>
+        )}
       </button>
       <span className="folder-actions">
-        <button className="icon-button small" title="Rename" aria-label={`Rename ${folder.name}`} onClick={() => setMode("rename")}>✎</button>
-        <button className="icon-button small" title="Delete folder" aria-label={`Delete ${folder.name}`} onClick={() => setMode("confirm")}>✕</button>
+        {!closed && (
+          <>
+            <button className="icon-button small" title="Rename" aria-label={`Rename ${folder.name}`} onClick={() => setMode("rename")}>✎</button>
+            <button className="icon-button small" title="Delete folder" aria-label={`Delete ${folder.name}`} onClick={() => setMode("confirm")}>✕</button>
+          </>
+        )}
+        <button className="icon-button small" title="Hide or lock" aria-label={`Options for ${folder.name}`} onClick={() => setMode("menu")}>⋯</button>
       </span>
     </div>
+  );
+}
+
+/** Six-digit PIN fields, shown in place of a folder row. Errors (a wrong PIN) stay in the form. */
+function PinForm({ title, fields, submitLabel, note, onSubmit, onCancel }: {
+  title: string;
+  fields: string[];
+  submitLabel: string;
+  note?: string;
+  onSubmit: (values: string[]) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [values, setValues] = useState<string[]>(() => fields.map(() => ""));
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const complete = values.every((v) => FOLDER_PIN.test(v));
+  return (
+    <form
+      className="folder-pin"
+      aria-label={title}
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (!complete || busy) return;
+        setBusy(true);
+        setError(null);
+        void onSubmit(values)
+          .catch((err: Error) => {
+            setError(err.message);
+            setValues(fields.map(() => ""));
+          })
+          .finally(() => setBusy(false));
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onCancel();
+      }}
+    >
+      <p className="folder-pin-title" title={title}>{title}</p>
+      {fields.map((label, i) => (
+        <input
+          key={label}
+          className="input pin-input"
+          type="password"
+          inputMode="numeric"
+          autoComplete="off"
+          autoFocus={i === 0}
+          maxLength={6}
+          placeholder={label}
+          aria-label={label}
+          value={values[i]}
+          onChange={(e) => {
+            const digits = e.target.value.replace(/[^0-9]/g, "").slice(0, 6);
+            setValues((prev) => prev.map((v, j) => (j === i ? digits : v)));
+          }}
+        />
+      ))}
+      {note && <p className="folder-pin-note">{note}</p>}
+      {error && <p className="error-text small" role="alert">{error}</p>}
+      <div className="row-gap">
+        <button type="submit" className="small" disabled={!complete || busy}>{busy ? "…" : submitLabel}</button>
+        <button type="button" className="ghost small" onClick={onCancel}>Cancel</button>
+      </div>
+    </form>
   );
 }
 

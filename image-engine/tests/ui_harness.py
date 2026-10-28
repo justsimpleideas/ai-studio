@@ -7,17 +7,21 @@ of the real engine for end-to-end tests without a GPU or model weights:
 
 It produces flat placeholder gradients (moving ones for video) and is not part of
 the application. Set HARNESS_STEP_DELAY (seconds per step, default 0.15) to slow
-it down.
+it down. In a Python with torch and diffusers, the image model can also be
+trained: a tiny random-weight transformer on the CPU (tests/fakes.py).
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 
 from image_engine.__main__ import main
 
-from .fakes import FakeBackend, FakeVideoBackend
+from .fakes import FakeBackend, FakeCaptionBackend, FakeTrainingBackend, FakeVideoBackend
+
+TRAINABLE = all(importlib.util.find_spec(m) for m in ("torch", "safetensors", "diffusers"))
 
 
 def _delay() -> float:
@@ -25,12 +29,17 @@ def _delay() -> float:
 
 
 def fake_backend(_get_settings):
-    return FakeBackend(step_delay=_delay())
+    return (FakeTrainingBackend if TRAINABLE else FakeBackend)(step_delay=_delay())
 
 
 def fake_video_backend(_get_settings):
     return FakeVideoBackend(step_delay=_delay())
 
 
+def fake_caption_backend(_get_settings):
+    return FakeCaptionBackend(step_delay=_delay())
+
+
 if __name__ == "__main__":
-    sys.exit(main(backend_factory=fake_backend, video_backend_factory=fake_video_backend))
+    sys.exit(main(backend_factory=fake_backend, video_backend_factory=fake_video_backend,
+                  caption_backend_factory=fake_caption_backend))

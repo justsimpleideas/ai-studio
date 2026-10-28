@@ -109,7 +109,9 @@ def inspect_wheel(path: Path) -> list[str]:
         for line in zf.read(record_name).decode("utf-8").splitlines():
             parts = line.rsplit(",", 2)
             if len(parts) == 3 and parts[1].startswith("sha256="):
-                recorded[parts[0]] = parts[1][len("sha256="):]
+                # Some Windows builds (torchvision's DLLs added after the build) write the
+                # path with backslashes; zip entries always use "/". Same file, same check.
+                recorded[parts[0].replace("\\", "/")] = parts[1][len("sha256="):]
         for name in names:
             if name.endswith("/") or name == record_name or name.endswith((".dist-info/RECORD.jws", ".dist-info/RECORD.p7s")):
                 continue

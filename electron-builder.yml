@@ -25,6 +25,9 @@ extraResources:
     filter:
       - image_engine/**
       - scripts/fetch_model.py
+      - scripts/collect_photos.py
+      - scripts/import_model.py
+      - scripts/inspect_model.py
       - requirements.txt
       - constraints.txt
       - "!**/__pycache__/**"

@@ -29,6 +29,7 @@ const NATIVE = [
 // installs them into their own Python environment for the image engine.
 const PYTHON = [
   ['PyTorch (torch)', 'BSD-3-Clause'],
+  ['torchvision', 'BSD-3-Clause'],
   ['diffusers', 'Apache-2.0'],
   ['transformers', 'Apache-2.0'],
   ['accelerate', 'Apache-2.0'],

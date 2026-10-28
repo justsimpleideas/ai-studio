@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_FORM, fromImage, loadForm, toRequest } from '../../src/renderer/image/form.js';
+import { DEFAULT_FORM, fitToModel, fromImage, loadForm, loadSeenModel, saveSeenModel, toRequest } from '../../src/renderer/image/form.js';
 import { formatBytes, formatDuration, stageLabel } from '../../src/renderer/image/format.js';
 import { ASPECT_RATIOS, SQUARE, closestRatio, isValidSide, sizeFor, snap } from '../../src/renderer/image/sizes.js';
 import type { ImageRecord, Job } from '../../src/renderer/image/types.js';
@@ -64,6 +64,29 @@ describe("form", () => {
     expect(form).toMatchObject({ prompt: "p", width: 768, height: 1344, seed: 77, randomSeed: false, count: 1 });
   });
 
+  it("a newly chosen model brings its own steps and guidance unless the user changed them", () => {
+    const large = { steps: 28, guidance: 4.5 };
+    const sixB = { steps: 8, guidance: 0 };
+    // First sight of the 12B model, coming from the form's defaults (the 6B model's).
+    expect(fitToModel(DEFAULT_FORM, null, large)).toMatchObject(large);
+    // Back to the 6B model.
+    expect(fitToModel({ ...DEFAULT_FORM, ...large }, large, sixB)).toMatchObject(sixB);
+    // Values the user chose stay.
+    const chosen = { ...DEFAULT_FORM, steps: 12, guidance: 0 };
+    expect(fitToModel(chosen, sixB, large)).toBe(chosen);
+    // Nothing to change: the same object comes back.
+    expect(fitToModel(DEFAULT_FORM, null, sixB)).toBe(DEFAULT_FORM);
+  });
+
+  it("the model the form was fitted to survives a restart, and bad storage reads as none", () => {
+    let stored = "";
+    saveSeenModel({ name: "large", steps: 28, guidance: 4.5 }, { setItem: (_k, v) => (stored = v) });
+    expect(loadSeenModel({ getItem: () => stored })).toEqual({ name: "large", steps: 28, guidance: 4.5 });
+    expect(loadSeenModel({ getItem: () => "{not json" })).toBeNull();
+    expect(loadSeenModel({ getItem: () => JSON.stringify({ name: "large", steps: "28" }) })).toBeNull();
+    expect(loadSeenModel({ getItem: () => null })).toBeNull();
+  });
+
   it("loadForm ignores corrupt or mistyped storage", () => {
     expect(loadForm({ getItem: () => "{not json" })).toEqual(DEFAULT_FORM);
     const loaded = loadForm({ getItem: () => JSON.stringify({ prompt: "kept", width: "huge", evil: 1 }) });
@@ -113,6 +136,26 @@ describe("engine state", () => {
     expect(s.galleryVersion).toBe(2);
     s = engineReducer(s, { type: "forget-image", id: "2" });
     expect(s.session.map((i) => i.id)).toEqual(["1"]);
+  });
+
+  it("a folder going out of view takes its items out of the session strip", () => {
+    const img = (id: string, folder_id: string | null) => ({ id, folder_id } as ImageRecord);
+    let s = initialEngineState;
+    for (const image of [img("loose", null), img("kept", "open"), img("secret", "vault")]) {
+      s = engineReducer(s, { type: "event", event: { type: "image", job_id: "j", image } });
+    }
+    s = engineReducer(s, { type: "event", event: { type: "privacy", show_hidden: false, blocked: ["vault"] } });
+    expect(s.session.map((i) => i.id)).toEqual(["kept", "loose"]);
+    expect(s.blockedFolders).toEqual(["vault"]);
+    expect([s.privacyVersion, s.galleryVersion]).toEqual([1, 4]);
+  });
+
+  it("images from a training task go to the gallery only, not the session strip", () => {
+    const task = { ...job("t", "running", 1), kind: "task" as const };
+    let s = engineReducer(initialEngineState, { type: "event", event: { type: "job", job: task } });
+    s = engineReducer(s, { type: "event", event: { type: "image", job_id: "t", image: { id: "c" } as ImageRecord } });
+    expect(s.session).toEqual([]);
+    expect(s.galleryVersion).toBe(1);
   });
 
   it("job events upsert by id", () => {

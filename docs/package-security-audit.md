@@ -133,6 +133,35 @@ file against RECORD, no `.pth`, native or script files, a clean antivirus scan, 
 scan of the code for network, process, dynamic-code and file-writing calls (none).
 Both are pinned in `image-engine/requirements.txt`.
 
+## Addition 2026-10-27: torchvision 0.26.0+cu128
+
+**Why.** The captioning model of the Train tab (Qwen3-VL) is fed through its
+transformers image processor, and in transformers 5.20 both the fast and the
+slow image processor import torchvision. Without it no photo can be described.
+It is PyTorch's own companion package, built and published together with torch
+on the same index; 0.26.0 is the release paired with torch 2.11.0.
+
+**Checks** (the wheel for Python 3.14, the version this engine was audited on):
+
+| Check | Result |
+|---|---|
+| Official hash | matches download.pytorch.org: `6319e1ba49c6f62ac9902f73d0eab207b8a4dc6b4d3392fe9edd9903fff1be0a`, 9,678,588 bytes |
+| RECORD integrity | 214 / 214 files match (see the note below) |
+| `.pth` files | none |
+| Executables | none; 11 native libraries (the package's own `_C.pyd` and `image.pyd`, and the DLLs they load: libjpeg, libpng, libwebp, nvjpeg, the CUDA runtime, and a `python314.dll`) |
+| Defender | No threats |
+| Dependencies | numpy, pillow and torch, all already pinned here; installed with `--no-deps`, `pip check` clean, nothing else changed |
+
+The same release for Python 3.12 and 3.13 is published under the hashes
+`8c0d1c4fbb2c9a4d5d41d0aaa87da20e525bcb2a154ce405725b0be59456804b` (cp312) and
+`0232cb219927a52d6c98ff202f32d1cdf4802c2195a85fc1f1a0c1b0b4983a4d` (cp313).
+
+**Note on RECORD.** The audit script first reported ten files "not listed in
+RECORD". They were listed, with backslashes in their paths (`torchvision\image.pyd`):
+the DLLs are added to the Windows wheel after it is built, and that step writes
+Windows paths. Each of the ten matches its recorded hash. The script now reads
+either separator; like the earlier fix, the defect could only cause false alarms.
+
 ## Ages of all audited packages
 
 Official upload dates (PyPI). The PyTorch index does not publish upload dates.
@@ -177,6 +206,7 @@ Official upload dates (PyPI). The PyTorch index does not publish upload dates.
 | sympy | 1.14.0 | 2025-04-27 |
 | tokenizers | 0.23.3 | 2026-10-09 |
 | torch | 2.11.0+cu128 | not published by the index |
+| torchvision | 0.26.0+cu128 | not published by the index |
 | tqdm | 4.70.1 | 2026-09-11 |
 | transformers | 5.20.2 | 2026-10-19 |
 | truststore | 0.10.5 | 2026-10-12 |

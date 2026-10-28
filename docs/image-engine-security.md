@@ -22,6 +22,26 @@ At every model load the engine repeats the cheap part of this (`image-engine/ima
 the manifest exists, each file still has its verified size, and no unlisted file has
 appeared. It then loads with `local_files_only=True` and `use_safetensors=True`.
 
+### A model imported from a single file
+
+A single transformer file of the 6B or 12B image model, of the 5B video model, or each of a 14B video model's two expert files (*Import a model file…*), is a
+`.safetensors` file the user downloads, so there is no repository commit to pin it to.
+`image-engine/scripts/import_model.py` checks it instead, reading only its header
+(`image_engine/single_file.py`, pure Python) before a single weight is loaded:
+
+| Check | How |
+|---|---|
+| Really safetensors | A file that starts like a zip archive or a pickle is refused by name. |
+| Well-formed header | Valid UTF-8 JSON, no tensor name given twice (two readers could otherwise disagree on which entry counts), string-only metadata, known dtypes, byte lengths matching shapes, tensors tiling the data exactly with nothing after the last one. |
+| Exactly the model | The dimensions are read off the shapes, and the full list of the model's tensors is derived from them: every one must be present with that shape, and no other tensor may be. |
+| Known quantization | fp8 only for linear weights, each with a float scale of one value per tensor or per output row. The per-layer quantization tags (a few bytes stored as `U8` tensors) must be short JSON objects naming a known format with no settings the engine does not know; they are read, checked and not loaded. In the older fp8 layout, each input scale must be one float belonging to an fp8 weight, and the `scaled_fp8` marker an empty fp8 tensor in a file that has fp8 weights; both are checked and not loaded. |
+| Integrity | Its SHA-256 is recorded in the folder's manifest, and compared with the hash on its download page when one is given (`--sha256`). |
+| Known companions | Every other part must come from a folder `fetch_model.py` verified at its pinned commit, with its files unchanged since: for the 6B model the 6B download or its parts (`DEFAULT_*`), and its transformer configuration must match the file's shapes; for the 12B model the captioning model and the VAE (`CAPTION_*`, `LARGE_VAE_*`); for the video model the original video download or its parts (`VIDEO_*`), and for a 14B one its own parts (`VIDEO_14B_*`), and each transformer configuration must match its file's shapes; a 14B model's two files must be experts of the same model, and different files. Missing parts are downloaded that way first, after the user has seen their source and license. |
+| Nothing extra | The assembled folder may hold only the files the import put there. |
+
+The engine repeats the structure check before every load of that folder, on top of the
+usual manifest check, and `import_model.py --verify-only` hashes every file again.
+
 ## Python packages
 
 - **Binary wheels only** (`--only-binary=:all:`), so no package runs a `setup.py`

@@ -19,11 +19,12 @@ class ModelFolderError(Exception):
     pass
 
 
-def check_model_folder(folder: Path, fetch_args: str = "") -> dict:
+def check_model_folder(folder: Path, fetch_args: str = "", script: str | None = None) -> dict:
     """Return the manifest if the folder is safe to load, else raise ModelFolderError.
 
-    `fetch_args` goes into the suggested fetch command, e.g. "--model video"."""
-    script = f"scripts/fetch_model.py{' ' + fetch_args if fetch_args else ''}"
+    `fetch_args` goes into the suggested fetch command, e.g. "--model video"; `script`
+    replaces that command for folders another script puts together."""
+    script = script or f"scripts/fetch_model.py{' ' + fetch_args if fetch_args else ''}"
     if not folder.is_dir():
         raise ModelFolderError(
             f"Model folder not found: {folder}. Download it with "

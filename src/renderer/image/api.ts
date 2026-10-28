@@ -1,5 +1,8 @@
-import type { GalleryQuery, GenerationRequest, GifOptions, ImageSettings, MediaKind, VideoRequest } from '@shared/image.js'
+import type { EngineModelKind, GalleryQuery, GenerationRequest, GifOptions, ImageSettings, MediaKind, VideoRequest } from '@shared/image.js'
+import type { ImportOptions, ImportTarget } from '@shared/importing.js'
 import type { ModelId } from '@shared/setup.js'
+import type { Subject } from '@shared/subject.js'
+import type { CaptionView, CollectPlan, CompareRequest, TrainSettings } from '@shared/training.js'
 
 /**
  * The image UI's calls, routed through the main process.
@@ -43,11 +46,18 @@ export const api = {
   renameFolder: (id: string, name: string) => call(() => image().renameFolder(id, name)),
   deleteFolder: (id: string) => call(() => image().deleteFolder(id)),
   moveToFolder: (id: string, folderId: string | null) => call(() => image().moveToFolder(id, folderId)),
+  setFolderHidden: (id: string, hidden: boolean) => call(() => image().setFolderHidden(id, hidden)),
+  setFolderPin: (id: string, pin: string | null, current: string | null) =>
+    call(() => image().setFolderPin(id, pin, current)),
+  unlockFolder: (id: string, pin: string) => call(() => image().unlockFolder(id, pin)),
+  lockFolder: (id: string) => call(() => image().lockFolder(id)),
+  showHiddenFolders: () => call(() => image().showHiddenFolders()),
+  setShowHiddenFolders: (show: boolean) => call(() => image().setShowHiddenFolders(show)),
   saveImageAs: (id: string) => call(() => image().saveImageAs(id)),
   saveAsGif: (id: string, options: GifOptions) => call(() => image().saveAsGif(id, options)),
   includeSettingsInExports: () => call(() => image().includeSettingsInExports()),
   setIncludeSettingsInExports: (value: boolean) => call(() => image().setIncludeSettingsInExports(value)),
-  pickModelFolder: (kind?: MediaKind) => call(() => image().pickModelFolder(kind)),
+  pickModelFolder: (kind?: EngineModelKind) => call(() => image().pickModelFolder(kind)),
   pickFfmpeg: () => call(() => image().pickFfmpeg()),
   pickPython: () => call(() => image().pickPython()),
   start: () => call(() => image().start()),
@@ -57,5 +67,42 @@ export const api = {
   chooseModelsFolder: () => call(() => image().chooseModelsFolder()),
   downloadModel: (id: ModelId) => call(() => image().downloadModel(id)),
   cancelDownload: () => call(() => image().cancelDownload()),
-  openModelLink: (id: ModelId, which: 'source' | 'license') => call(() => image().openModelLink(id, which))
+  openModelLink: (id: ModelId, which: 'source' | 'license') => call(() => image().openModelLink(id, which)),
+  inspectState: () => call(() => image().inspectState()),
+  inspectModelFile: () => call(() => image().inspectModelFile()),
+  cancelInspect: () => call(() => image().cancelInspect()),
+  pickImportFile: (target: ImportTarget, slot: 'first' | 'second' = 'first') => call(() => image().pickImportFile(target, slot)),
+  swapImportExperts: () => call(() => image().swapImportExperts()),
+  startImport: (options: ImportOptions) => call(() => image().startImport(options)),
+  cancelImport: () => call(() => image().cancelImport()),
+  clearImport: () => call(() => image().clearImport())
+}
+
+const training = () => window.api.training
+
+export const trainingApi = {
+  projects: () => call(() => training().projects()),
+  subjectPresets: () => call(() => training().subjectPresets()),
+  createProject: (name: string, subject: Subject) => call(() => training().createProject(name, subject)),
+  project: (id: string) => call(() => training().project(id)),
+  setSubject: (id: string, subject: Subject) => call(() => training().setSubject(id, subject)),
+  deleteProject: (id: string) => call(() => training().deleteProject(id)),
+  scan: (id: string) => call(() => training().scan(id)),
+  caption: (id: string) => call(() => training().caption(id)),
+  captions: (id: string, view: CaptionView, offset: number, limit: number) =>
+    call(() => training().captions(id, view, offset, limit)),
+  review: (id: string, item: string, action: 'accept' | 'edit' | 'exclude', edits?: Record<string, string>) =>
+    call(() => training().review(id, item, action, edits)),
+  train: (id: string, settings: TrainSettings) => call(() => training().train(id, settings)),
+  compare: (id: string, request: CompareRequest) => call(() => training().compare(id, request)),
+  log: (id: string, run: string) => call(() => training().log(id, run)),
+  useCheckpoint: (id: string, run: string, step: number, name: string) =>
+    call(() => training().useCheckpoint(id, run, step, name)),
+  loras: () => call(() => training().loras()),
+  renameLora: (id: string, name: string) => call(() => training().renameLora(id, name)),
+  deleteLora: (id: string) => call(() => training().deleteLora(id)),
+  collectState: () => call(() => training().collectState()),
+  collect: (plan: CollectPlan) => call(() => training().collect(plan)),
+  checkCollect: (plan: CollectPlan) => call(() => training().checkCollect(plan)),
+  cancelCollect: () => call(() => training().cancelCollect())
 }

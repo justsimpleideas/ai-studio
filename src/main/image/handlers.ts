@@ -2,6 +2,7 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import type { BrowserWindow, Dialog, IpcMain, OpenDialogOptions } from 'electron'
 import {
+  FOLDER_PIN,
   MAX_START_IMAGE_BYTES,
   engineImagePath,
   gifFileName,
@@ -25,6 +26,8 @@ import { catalogModel } from '@shared/setup.js'
 import type { GpuArbiter } from '../gpu.js'
 import type { ConfigStore } from '../store.js'
 import type { ModelDownloads } from './downloads.js'
+import type { ModelImporter } from './importer.js'
+import type { ModelInspector } from './inspect.js'
 import type { ImageEngine } from './engine.js'
 import { withoutPngMetadata } from './png-metadata.js'
 import type { EngineSetup } from './setup.js'
@@ -48,6 +51,8 @@ interface Deps {
   getWindow: () => BrowserWindow | null
   setup: EngineSetup
   downloads: ModelDownloads
+  inspector: ModelInspector
+  importer: ModelImporter
   /** Where downloads go when no folder has been chosen. */
   defaultModelsFolder: string
   openExternal: (url: string) => Promise<void>
@@ -59,7 +64,8 @@ const SETTING_KEYS = new Set([
   'load_on_start',
   'video_model_dir',
   'video_memory_mode',
-  'ffmpeg_path'
+  'ffmpeg_path',
+  'caption_model_dir'
 ])
 
 function requireId(id: unknown): string {
@@ -93,6 +99,8 @@ export function registerImageHandlers({
   getWindow,
   setup,
   downloads,
+  inspector,
+  importer,
   defaultModelsFolder,
   openExternal
 }: Deps): void {
@@ -215,6 +223,40 @@ export function registerImageHandlers({
     return rewriteRecord((await api('PATCH', `/api/gallery/${requireId(id)}`, { folder })) as ImageRecord)
   })
 
+  // Hidden and locked folders. The engine keeps what this session has shown or unlocked in
+  // memory only, and the PIN is checked there; here only that values have the right shape.
+  const folderPin = (pin: unknown): string => {
+    if (typeof pin !== 'string' || !FOLDER_PIN.test(pin)) throw new Error('A PIN is six digits.')
+    return pin
+  }
+
+  ipcMain.handle('image:setFolderHidden', (_e, id: unknown, hidden: unknown) => {
+    if (typeof hidden !== 'boolean') throw new Error('Invalid value.')
+    return api('PATCH', `/api/folders/${requireId(id)}`, { hidden })
+  })
+
+  ipcMain.handle('image:setFolderPin', (_e, id: unknown, pin: unknown, current: unknown) =>
+    api('PUT', `/api/folders/${requireId(id)}/pin`, {
+      pin: pin === null ? null : folderPin(pin),
+      ...(current === null ? {} : { current: folderPin(current) })
+    })
+  )
+
+  ipcMain.handle('image:unlockFolder', (_e, id: unknown, pin: unknown) =>
+    api('POST', `/api/folders/${requireId(id)}/unlock`, { pin: folderPin(pin) })
+  )
+
+  ipcMain.handle('image:lockFolder', (_e, id: unknown) => api('POST', `/api/folders/${requireId(id)}/lock`, {}))
+
+  ipcMain.handle('image:showHiddenFolders', async () =>
+    ((await api('GET', '/api/folders')) as { show_hidden: boolean }).show_hidden
+  )
+
+  ipcMain.handle('image:setShowHiddenFolders', async (_e, show: unknown) => {
+    if (typeof show !== 'boolean') throw new Error('Invalid value.')
+    return ((await api('PUT', '/api/gallery/privacy', { show_hidden: show })) as { show_hidden: boolean }).show_hidden
+  })
+
   ipcMain.handle('image:saveAs', async (_e, id: unknown) => {
     const imageId = requireId(id)
     const record = (await api('GET', `/api/gallery/${imageId}`)) as ImageRecord
@@ -291,14 +333,15 @@ export function registerImageHandlers({
   }
 
   ipcMain.handle('image:pickModelFolder', async (_e, kind: unknown) => {
-    const video = optionalKind(kind) === 'video'
+    const which = kind === 'caption' ? 'caption' : optionalKind(kind) ?? 'image'
     const picked = await pickOpenPath('STUDIO_PICK_MODEL_FOLDER', {
-      title: video ? 'Choose the video model folder' : 'Choose the image model folder',
+      title: `Choose the ${which === 'caption' ? 'captioning' : which} model folder`,
       properties: ['openDirectory'],
       buttonLabel: 'Use this folder'
     })
     if (!picked) return null
-    return (await api('PUT', '/api/settings', video ? { video_model_dir: picked } : { model_dir: picked })) as ImageSettings
+    const key = { image: 'model_dir', video: 'video_model_dir', caption: 'caption_model_dir' }[which]
+    return (await api('PUT', '/api/settings', { [key]: picked })) as ImageSettings
   })
 
   ipcMain.handle('image:pickFfmpeg', async () => {
@@ -391,6 +434,76 @@ export function registerImageHandlers({
   })
 
   ipcMain.handle('image:cancelDownload', () => downloads.cancel())
+
+  // ---- Inspecting a model file (shared/inspect.ts): header and hash, nothing loaded or run
+
+  ipcMain.handle('image:inspectState', () => inspector.state)
+
+  ipcMain.handle('image:inspectModelFile', async () => {
+    if (inspector.running) throw new Error('A file is already being inspected.')
+    if (setup.running) throw new Error('The engine is being installed. Wait for it to finish first.')
+    const picked = await pickOpenPath('STUDIO_PICK_INSPECT_FILE', {
+      title: 'Choose a model file to inspect',
+      properties: ['openFile'],
+      filters: [
+        { name: 'Model files', extensions: ['safetensors', 'gguf', 'ckpt', 'pt', 'pth', 'bin'] },
+        { name: 'All files', extensions: ['*'] }
+      ],
+      buttonLabel: 'Inspect'
+    })
+    if (!picked) return false
+    await inspector.inspect(picked)
+    return true
+  })
+
+  ipcMain.handle('image:cancelInspect', () => inspector.cancel())
+
+  // ---- Importing a model from a single transformer file (shared/importing.ts)
+
+  ipcMain.handle('image:importState', () => importer.state)
+
+  ipcMain.handle('image:pickImportFile', async (_e, target: unknown, slot: unknown = 'first') => {
+    if (target !== 'image' && target !== 'video') throw new Error('Invalid import target.')
+    if (slot !== 'first' && slot !== 'second') throw new Error('Invalid import file.')
+    if (importer.running) throw new Error('An import is already running.')
+    if (setup.running) throw new Error('The engine is being installed. Wait for it to finish first.')
+    const picked = await pickOpenPath(slot === 'second' ? 'STUDIO_PICK_IMPORT_FILE_2' : 'STUDIO_PICK_IMPORT_FILE', {
+      title: slot === 'second' ? 'Choose the other expert’s file' : 'Choose a model file to import',
+      properties: ['openFile'],
+      filters: [{ name: 'safetensors', extensions: ['safetensors'] }],
+      buttonLabel: 'Choose'
+    })
+    if (!picked) return false
+    if (slot === 'second') await importer.pickSecond(picked)
+    else await importer.pick(picked, target)
+    return true
+  })
+
+  ipcMain.handle('image:swapImportExperts', () => importer.swap())
+
+  ipcMain.handle('image:startImport', async (_e, options: unknown) => {
+    if (!options || typeof options !== 'object') throw new Error('Invalid import options.')
+    const o = options as Record<string, unknown>
+    const optionalNumber = (v: unknown): v is number | null | undefined => v == null || typeof v === 'number'
+    if (typeof o['sha256'] !== 'string' || typeof o['name'] !== 'string' || typeof o['acceptLicenses'] !== 'boolean'
+        || (o['variant'] !== 'base' && o['variant'] !== 'distilled')
+        || !(o['sha256_2'] == null || typeof o['sha256_2'] === 'string') || !optionalNumber(o['steps']) || !optionalNumber(o['shift'])) {
+      throw new Error('Invalid import options.')
+    }
+    if (setup.running) throw new Error('The engine is being installed. Wait for it to finish first.')
+    await importer.start({
+      variant: o['variant'],
+      sha256: o['sha256'],
+      name: o['name'],
+      acceptLicenses: o['acceptLicenses'],
+      sha256_2: typeof o['sha256_2'] === 'string' ? o['sha256_2'] : '',
+      steps: typeof o['steps'] === 'number' ? o['steps'] : null,
+      shift: typeof o['shift'] === 'number' ? o['shift'] : null
+    })
+  })
+
+  ipcMain.handle('image:cancelImport', () => importer.cancel())
+  ipcMain.handle('image:clearImport', () => importer.clear())
 
   ipcMain.handle('image:openModelLink', async (_e, id: unknown, which: unknown) => {
     const model = catalogModel(id)

@@ -1,9 +1,11 @@
-import type { ImageRecord, StartImage, VideoRequest } from "./types";
+import type { ImageRecord, StartImage, VideoProfile, VideoRequest } from "./types";
 
 /**
  * The video form: what it holds, the sizes and lengths it offers, and how it
  * becomes a request. Every preset here is a size and frame count the engine
- * accepts (sides in multiples of 32, at most 1280×704 pixels; 4k + 1 frames).
+ * accepts for its model (image_engine/params.py): for the 5B model sides in
+ * multiples of 32, at most 1280×704 pixels, at 24 fps; for the 14B models sides
+ * in multiples of 16, at most 1280×720, at 16 fps; 4k + 1 frames for both.
  */
 
 const STORAGE_KEY = "lis.videoForm.v1";
@@ -29,6 +31,8 @@ export interface VideoFormState {
   count: number;
   /** The picture the video opens on, or null for text alone. */
   start: StartImage | null;
+  /** The model (profile name) the sizes, length, steps and guidance were set for; "" before any. */
+  model: string;
 }
 
 export const DEFAULT_VIDEO_FORM: VideoFormState = {
@@ -43,6 +47,7 @@ export const DEFAULT_VIDEO_FORM: VideoFormState = {
   randomSeed: true,
   count: 1,
   start: null,
+  model: "",
 };
 
 export type Shape = "landscape" | "portrait" | "square";
@@ -60,21 +65,54 @@ export const QUALITIES = [
   { label: "480p", hint: "fastest" },
 ];
 
-const SIZES: Record<Shape, { width: number; height: number }[]> = {
-  landscape: [{ width: 1280, height: 704 }, { width: 960, height: 544 }, { width: 832, height: 480 }],
-  portrait: [{ width: 704, height: 1280 }, { width: 544, height: 960 }, { width: 480, height: 832 }],
-  square: [{ width: 928, height: 928 }, { width: 736, height: 736 }, { width: 640, height: 640 }],
+/** The sizes and lengths a model offers, at its frame rate. */
+export interface VideoGeometry {
+  fps: number;
+  /** Three sizes per shape, largest first (QUALITIES). */
+  sizes: Record<Shape, { width: number; height: number }[]>;
+  lengths: { seconds: number; frames: number }[];
+}
+
+/** The 5B model: trained at 1280×704, 121 frames (5 s at 24 fps). */
+export const GEOMETRY_5B: VideoGeometry = {
+  fps: 24,
+  sizes: {
+    landscape: [{ width: 1280, height: 704 }, { width: 960, height: 544 }, { width: 832, height: 480 }],
+    portrait: [{ width: 704, height: 1280 }, { width: 544, height: 960 }, { width: 480, height: 832 }],
+    square: [{ width: 928, height: 928 }, { width: 736, height: 736 }, { width: 640, height: 640 }],
+  },
+  lengths: [
+    { seconds: 2, frames: 49 },
+    { seconds: 3, frames: 73 },
+    { seconds: 4, frames: 97 },
+    { seconds: 5, frames: 121 },
+  ],
 };
 
-export const LENGTHS = [
-  { seconds: 2, frames: 49 },
-  { seconds: 3, frames: 73 },
-  { seconds: 4, frames: 97 },
-  { seconds: 5, frames: 121 },
-];
+/** The 14B models: 720p or 480p, 81 frames (5 s at 16 fps). */
+export const GEOMETRY_14B: VideoGeometry = {
+  fps: 16,
+  sizes: {
+    landscape: [{ width: 1280, height: 720 }, { width: 960, height: 544 }, { width: 832, height: 480 }],
+    portrait: [{ width: 720, height: 1280 }, { width: 544, height: 960 }, { width: 480, height: 832 }],
+    square: [{ width: 960, height: 960 }, { width: 720, height: 720 }, { width: 624, height: 624 }],
+  },
+  lengths: [
+    { seconds: 2, frames: 33 },
+    { seconds: 3, frames: 49 },
+    { seconds: 4, frames: 65 },
+    { seconds: 5, frames: 81 },
+  ],
+};
 
-export function sizeFor(shape: Shape, quality: number): { width: number; height: number } {
-  const sizes = SIZES[shape];
+export const LENGTHS = GEOMETRY_5B.lengths;
+
+export function geometryFor(profile: VideoProfile | null | undefined): VideoGeometry {
+  return profile && profile.experts === 2 ? GEOMETRY_14B : GEOMETRY_5B;
+}
+
+export function sizeFor(shape: Shape, quality: number, geometry: VideoGeometry = GEOMETRY_5B): { width: number; height: number } {
+  const sizes = geometry.sizes[shape];
   return sizes[Math.min(Math.max(0, quality), sizes.length - 1)]!;
 }
 
@@ -86,8 +124,8 @@ export function shapeOf(width: number, height: number): Shape {
 }
 
 /** The preset size closest in pixel count, so the UI can highlight it. */
-export function qualityOf(width: number, height: number): number {
-  const sizes = SIZES[shapeOf(width, height)];
+export function qualityOf(width: number, height: number, geometry: VideoGeometry = GEOMETRY_5B): number {
+  const sizes = geometry.sizes[shapeOf(width, height)];
   let best = 0;
   sizes.forEach((s, i) => {
     if (Math.abs(s.width * s.height - width * height) < Math.abs(sizes[best]!.width * sizes[best]!.height - width * height)) best = i;
@@ -96,9 +134,38 @@ export function qualityOf(width: number, height: number): number {
 }
 
 /** The form with a start picture, reshaped to the picture's orientation at the same quality. */
-export function withStart(form: VideoFormState, start: StartImage | null): VideoFormState {
+export function withStart(form: VideoFormState, start: StartImage | null, geometry: VideoGeometry = GEOMETRY_5B): VideoFormState {
   if (!start) return { ...form, start: null };
-  return { ...form, start, ...sizeFor(shapeOf(start.width, start.height), qualityOf(form.width, form.height)) };
+  return { ...form, start, ...sizeFor(shapeOf(start.width, start.height), qualityOf(form.width, form.height, geometry), geometry) };
+}
+
+/** The geometry of a model by its profile name (the 14B ones are named "...-14b..."). */
+function geometryOfName(name: string): VideoGeometry {
+  return name.includes("-14b") ? GEOMETRY_14B : GEOMETRY_5B;
+}
+
+/**
+ * The form set for another model: the same shape at the same quality and about the same
+ * length in its sizes and frame rate, the model's own steps and guidance, and no start
+ * picture for a model that starts from text only. A form saved before forms recorded
+ * their model was set for the 5B model.
+ */
+export function fitVideoToModel(form: VideoFormState, profile: VideoProfile): VideoFormState {
+  const fromName = form.model || "standard";
+  if (fromName === profile.name) return form.model === profile.name ? form : { ...form, model: profile.name };
+  const from = geometryOfName(fromName);
+  const to = geometryFor(profile);
+  const seconds = form.frames / from.fps;
+  const length = to.lengths.reduce((a, b) => (Math.abs(b.seconds - seconds) < Math.abs(a.seconds - seconds) ? b : a));
+  return {
+    ...form,
+    ...sizeFor(shapeOf(form.width, form.height), qualityOf(form.width, form.height, from), to),
+    frames: length.frames,
+    steps: profile.steps,
+    guidance: profile.guidance,
+    start: profile.start === "text" ? null : form.start,
+    model: profile.name,
+  };
 }
 
 export function toVideoRequest(form: VideoFormState): VideoRequest {

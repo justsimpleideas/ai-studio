@@ -7,7 +7,9 @@
 //
 //   npm run build && npm run e2e [-- --shots <dir>]
 //
-// Needs a Python with Pillow on PATH (or STUDIO_PYTHON=/path/to/python).
+// Needs a Python with Pillow on PATH (or STUDIO_PYTHON=/path/to/python). With torch
+// and diffusers in that Python too, the Train tab trains for real on a tiny CPU model;
+// without them it checks that training fails with a clear message.
 
 import { spawn, spawnSync, execSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -71,6 +73,15 @@ writeFileSync(join(workspaceDir, 'readme.txt'), 'A demo project.')
 const exportPath = join(dirname(workspaceDir), 'exported.png')
 // Where downloaded models would go, standing in for the folder picker (nothing is downloaded).
 const modelsDir = join(dirname(workspaceDir), 'models')
+// Synthetic training photos, standing in for the photo-folder picker of the Train tab.
+const trainingPhotos = join(dirname(workspaceDir), 'photos')
+const PYTHON = process.env.STUDIO_PYTHON ?? 'python'
+execSync(`"${PYTHON}" "${join(ROOT, 'scripts', 'e2e-training-photos.py')}" "${trainingPhotos}"`, { stdio: 'inherit' })
+const TRAINS_FOR_REAL = spawnSync(PYTHON, ['-c', 'import torch, diffusers, safetensors'], { stdio: 'ignore' }).status === 0
+// A local stand-in for Wikimedia Commons and Openverse, so collecting photos is tested without the internet.
+const FAKE_SOURCES_PORT = 9362
+const fakeSources = spawn(PYTHON, ['-m', 'tests.fake_photo_sources', String(FAKE_SOURCES_PORT)], { cwd: join(ROOT, 'image-engine'), stdio: 'ignore' })
+const collectedPhotos = join(dirname(workspaceDir), 'collected')
 const env = { ...process.env }
 delete env.ELECTRON_RUN_AS_NODE
 Object.assign(env, {
@@ -82,6 +93,10 @@ Object.assign(env, {
   // The start-picture picker answers with the exported PNG, which exists by the time it is asked.
   STUDIO_PICK_START_IMAGE: exportPath,
   STUDIO_PICK_MODELS_FOLDER: modelsDir,
+  STUDIO_PICK_TRAINING_FOLDER: trainingPhotos,
+  STUDIO_PICK_COLLECT_FOLDER: collectedPhotos,
+  STUDIO_COLLECT_COMMONS_API: `http://127.0.0.1:${FAKE_SOURCES_PORT}/commons/api.php`,
+  STUDIO_COLLECT_OPENVERSE_API: `http://127.0.0.1:${FAKE_SOURCES_PORT}/openverse/v1/images/`,
   HARNESS_STEP_DELAY: '0.15',
   // No tray balloons popping up on the desktop during the test.
   STUDIO_NO_BALLOON: '1'
@@ -142,8 +157,13 @@ function closeLikeTheCloseButton() {
   return spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { stdio: 'ignore' }).status === 0
 }
 
+// While someone uses the desktop, other windows can cover the test window. Windows then
+// reports it occluded, Chromium stops painting it, and lazy-loaded pictures never start
+// loading. The test window is treated as always visible instead.
+const ALWAYS_VISIBLE = ['--disable-features=CalculateNativeWinOcclusion', '--disable-backgrounding-occluded-windows']
+
 function launch() {
-  return spawn(electronExe, ['.', `--remote-debugging-port=${DEBUG_PORT}`], { cwd: ROOT, env, stdio: 'ignore' })
+  return spawn(electronExe, ['.', `--remote-debugging-port=${DEBUG_PORT}`, ...ALWAYS_VISIBLE], { cwd: ROOT, env, stdio: 'ignore' })
 }
 
 async function connect() {
@@ -425,12 +445,24 @@ try {
   check('the video model has its own card', await waitFor(`document.querySelector(${q(inImage('.settings'))})?.textContent.includes("fake-video")`))
   check('settings say how videos will be saved', await waitFor(`/saved as MP4|saved as animated WebP/.test(document.querySelector(${q(inImage('.settings'))})?.textContent ?? "")`))
 
+  // Settings search: cards and settings whose text has every word; a matching card title keeps the card whole.
+  const shownCards = `[...document.querySelectorAll(${q(inImage('.settings > .card'))})].filter((c) => getComputedStyle(c).display !== "none").map((c) => c.querySelector("h2")?.textContent)`
+  await setValue(inImage('.settings-search input'), 'ffmpeg')
+  check('searching settings keeps the cards that mention it', await waitFor(`(() => { const s = ${shownCards}; return s.length === 1 && s[0] === "Video model" })()`), String(await js(shownCards)))
+  check('and within them only the settings that do', await js(`[...document.querySelectorAll(${q(inImage('.settings > .card .field'))})].filter((f) => getComputedStyle(f).display !== "none").every((f) => f.textContent.toLowerCase().includes("ffmpeg"))`))
+  await setValue(inImage('.settings-search input'), 'hidden folders')
+  check('a card title keeps its card whole', await waitFor(`(() => { const s = ${shownCards}; return s.includes("Hidden folders") })()`))
+  await setValue(inImage('.settings-search input'), 'no such setting anywhere')
+  check('no match says so', await waitFor(`(() => { const e = document.querySelector(${q(inImage('.search-empty'))}); return !!e && !e.hidden && ${shownCards}.length === 0 })()`))
+  await setValue(inImage('.settings-search input'), '')
+  check('clearing the search shows every card again', await waitFor(`${shownCards}.length === document.querySelectorAll(${q(inImage('.settings > .card'))}).length`))
+
   console.log('engine install and model downloads')
   await clickText(inImage('.setup button'), 'Install the engine')
   check('installing first says what it downloads and from where', await waitFor(`document.querySelector(${q(inImage('.setup-box'))})?.textContent.includes("official PyTorch and PyPI indexes")`))
   await clickText(inImage('.setup-box button'), 'Cancel')
   check('and can be backed out of', await waitFor(`!document.querySelector(${q(inImage('.setup .setup-box'))})`))
-  check('every supported model is offered for download', (await count(inImage('.download-row'))) === 3)
+  check('every supported model is offered for download', (await count(inImage('.download-row'))) === 4)
   await clickText(inImage('.download-row button'), 'Download')
   check('a download first shows where the model comes from', await waitFor(`document.querySelector(${q(inImage('.download-row .facts'))})?.textContent.includes("@ f332072")`))
   check('and its license', (await text(inImage('.download-row .facts'))).includes('Apache License 2.0'))
@@ -596,12 +628,78 @@ try {
 
   check('dragging onto All takes an item out of its folder', await dragTile(favorite.id, `.studio-pane:not([hidden]) .image-studio .folder-item`))
   check('and its folder counts one fewer', await waitFor(`(${folderRow('Holidays')})?.querySelector(".folder-count")?.textContent === "1"`))
+
+  // Right-click on a tile: move to a folder, take out of it, delete (asked first).
+  const rightClick = (id) =>
+    js(`(() => { const t = document.querySelector(${q(inImage(`.tile[data-id="${id}"]`))}); if (!t) return false; const r = t.getBoundingClientRect(); t.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: r.left + 10, clientY: r.top + 10 })); return true })()`)
+  const menuOpen = `!!document.querySelector(${q(inImage('.tile-menu'))})`
+  check('right-clicking a tile opens its menu', (await rightClick(favorite.id)) && (await waitFor(menuOpen)))
+  check('which offers the folders to move it to', (await text(inImage('.tile-menu'))).includes('Holidays'))
+  await clickText(inImage('.tile-menu button'), 'Holidays')
+  check('moving there files it', await waitFor(`(${folderRow('Holidays')})?.querySelector(".folder-count")?.textContent === "2"`))
+  check('and closes the menu', await waitFor(`!${menuOpen}`))
+  await rightClick(favorite.id)
+  await waitFor(menuOpen)
+  await clickText(inImage('.tile-menu button'), 'Take out of')
+  check('it can be taken out of its folder the same way', await waitFor(`(${folderRow('Holidays')})?.querySelector(".folder-count")?.textContent === "1"`))
+  await rightClick(favorite.id)
+  await waitFor(menuOpen)
+  await clickText(inImage('.tile-menu button'), 'Delete')
+  check('deleting from the menu asks first', await waitFor(`document.querySelector(${q(inImage('.tile-menu-confirm'))})?.textContent.includes("cannot be undone")`))
+  await clickText(inImage('.tile-menu-confirm button'), 'Cancel')
+  await js(`document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`)
+  check('and Escape closes it, leaving the item', (await waitFor(`!${menuOpen}`)) && (await js(`window.api.image.gallery({})`)).total === everything.length)
+
   await js(`${folderRow('Holidays')}.querySelector('[aria-label="Delete Holidays"]').click()`)
   check('deleting asks first, and says the items stay', await waitFor(`document.querySelector(${q(inImage('.folder-confirm'))})?.textContent.includes("stay in All")`))
   await clickText(inImage('.folder-confirm button'), 'Delete folder')
   check('the folder goes', await waitFor(`!(${folderRow('Holidays')})`))
   check('and nothing that was in it is lost', (await js(`window.api.image.gallery({})`)).total === everything.length)
   check('it is back in no folder', (await js(`window.api.image.gallery({})`)).items.find((i) => i.id === video.id)?.folder_id === null)
+
+  console.log('hidden and locked folders')
+  const pinField = (label) => inImage(`.folder-pin input[aria-label="${label}"]`)
+  const submitPin = () => js(`document.querySelector(${q(inImage('.folder-pin'))}).requestSubmit()`)
+  const openMenu = (name) => js(`${folderRow(name)}.querySelector('[aria-label="Options for ${name}"]').click()`)
+  const tileShown = (id) => `!!document.querySelector(${q(inImage(`.tile[data-id="${id}"]`))})`
+  await click(inImage('.folder-head button'))
+  await nameFolder('Vault')
+  check('another folder is made', await waitFor(`!!(${folderRow('Vault')})`))
+  await click(inImage('.folder-item'))  // All
+  await waitFor(tileShown(favorite.id))
+  check('and given an item', (await dragTile(favorite.id, `.studio-pane:not([hidden]) .image-studio .folder-row`)) && (await waitFor(`(${folderRow('Vault')})?.querySelector(".folder-count")?.textContent === "1"`)))
+  await openMenu('Vault')
+  await clickText(inImage('.folder-menu button'), 'Lock with a PIN')
+  await setValue(pinField('PIN'), '246810')
+  await setValue(pinField('PIN again'), '135790')
+  await submitPin()
+  check('two different PINs are refused', await waitFor(`document.querySelector(${q(inImage('.folder-pin [role=alert]'))})?.textContent.includes("not the same")`))
+  await setValue(pinField('PIN'), '246810')
+  await setValue(pinField('PIN again'), '246810')
+  await submitPin()
+  check('a folder can be locked with a PIN, and stays open for now', await waitFor(`window.api.image.folders().then((f) => f.some((x) => x.name === "Vault" && x.locked && x.unlocked))`))
+  await openMenu('Vault')
+  await clickText(inImage('.folder-menu button'), 'Lock now')
+  check('locking it shows a lock instead of a count', await waitFor(`!!(${folderRow('Vault')})?.querySelector(".folder-lock")`))
+  check('and takes what it holds out of All', await waitFor(`!(${tileShown(favorite.id)}) && document.querySelectorAll(${q(inImage('.tile'))}).length === ${everything.length - 1}`))
+  check('and out of Favorites and search', (await js(`window.api.image.gallery({ favorites: true })`)).total === 0)
+  await js(`${folderRow('Vault')}.querySelector(".folder-item").click()`)
+  await setValue(pinField('PIN'), '000000')
+  await submitPin()
+  check('a wrong PIN is refused', await waitFor(`document.querySelector(${q(inImage('.folder-pin [role=alert]'))})?.textContent.includes("Wrong PIN")`))
+  await setValue(pinField('PIN'), '246810')
+  await submitPin()
+  check('the right one opens it', await waitFor(`document.querySelector(${q(inImage('.gallery-heading'))})?.textContent === "Vault" && ${tileShown(favorite.id)}`))
+  await shot('12-gallery-locked-folder')
+  await openMenu('Vault')
+  await clickText(inImage('.folder-menu button'), 'Hide')
+  check('a hidden folder leaves the folder list', await waitFor(`!(${folderRow('Vault')})`))
+  check('and the view goes back to All, without its items', await waitFor(`document.querySelector(${q(inImage('.gallery-heading'))})?.textContent === "All" && !(${tileShown(favorite.id)})`))
+  await clickText(inImage('.tabs button'), 'Settings')
+  await clickText(inImage('.settings label.toggle'), 'Show hidden folders')
+  check('settings can show hidden folders', await waitFor(`window.api.image.showHiddenFolders()`))
+  await clickText(inImage('.tabs button'), 'Gallery')
+  check('which come back, marked hidden', await waitFor(`(${folderRow('Vault')})?.querySelector(".folder-tag")?.textContent === "hidden"`))
   await click(inImage('.folder-item'))
 
   console.log('without ffmpeg')
@@ -614,12 +712,113 @@ try {
   check('as an animated WebP that plays as a picture', await waitFor(`(() => { const i = document.querySelector(${q(inImage('.stage-video img.video-frame'))}); return !!i && i.src.startsWith("studio-image://video/") && i.complete && i.naturalWidth > 0 })()`))
   await js(`window.api.image.saveSettings({ ffmpeg_path: "" })`)
 
+  console.log('training')
+  const train = (sel) => inImage(`.train-view ${sel}`)
+  const cardsText = `[...document.querySelectorAll(${q(train('.caption-text'))})].map((e) => e.textContent)`
+  await clickText(inImage('.tabs button'), 'Train')
+  check('the Train tab opens', await waitFor(`!!document.querySelector(${q(train('.train-new'))})`))
+  await setValue(train('.train-new input'), 'Example coupes')
+  await js(`document.querySelector(${q(train('.train-new'))}).requestSubmit()`)
+  check('a project is made from the chosen folder and scanned', await waitFor(`document.querySelectorAll(${q(train('.caption-card'))}).length === 4`, 20000))
+  check('captions come from the folder names', await js(`${cardsText}.every((t) => t === "Example Motors Coupe GT")`))
+  check('a new project is about any subject, and asks what the photos show', await js(`(() => { const t = document.querySelector(${q(train('.subject-section'))})?.textContent ?? ""; return t.includes("Not said what the photos show yet") && t.includes("Name / Variant") })()`))
+  await clickText(train('.subject-section button'), 'Edit subject')
+  await setValue(train('.subject-section input[aria-label="What the photos show"]'), 'coupe')
+  await setValue(train('.subject-section input[aria-label="Trigger word"]'), 'excoupe')
+  check('the editor shows an example caption', await waitFor(`document.querySelector(${q(train('.subject-preview'))})?.textContent.includes("excoupe, <Name> <Variant>, coupe, front view")`))
+  await setValue(train('.subject-section input[aria-label="Trigger word"]'), 'ex coupe')
+  check('a bad definition is explained, and cannot be saved', await waitFor(`(() => { const e = document.querySelector(${q(train('.subject-editor .error-text'))}); const b = [...document.querySelectorAll(${q(train('.subject-section button'))})].find((x) => x.textContent.startsWith("Save")); return !!e && e.textContent.includes("one word") && b.disabled })()`))
+  await setValue(train('.subject-section input[aria-label="Trigger word"]'), 'excoupe')
+  await clickText(train('.subject-section button'), 'Save and rescan')
+  check('the subject is saved and the captions follow it', await waitFor(`${cardsText}.length === 4 && ${cardsText}.every((t) => t === "excoupe, Example Motors Coupe GT, coupe")`, 20000))
+  check('the duplicate and the too-small photo are reported', await waitFor(`(() => { const t = document.querySelector(${q(train('.train-main'))}).textContent; return t.includes("1 duplicates") && t.includes("1 too small") })()`))
+  check('photos show as thumbnails', await waitFor(`(() => { const i = document.querySelector(${q(train('.caption-card img'))}); return !!i && i.src.startsWith("studio-image://training/") && i.complete && i.naturalWidth > 0 })()`),
+    await js(`(async () => {
+      const imgs = [...document.querySelectorAll(${q(train('.caption-card img'))})].map((i) => [i.getAttribute("src").slice(-22), i.complete, i.naturalWidth]);
+      const src = document.querySelector(${q(train('.caption-card img'))})?.src;
+      const fresh = await new Promise((r) => { const i = new Image(); const t = setTimeout(() => r("pending 3s"), 3000); i.onload = () => (clearTimeout(t), r("load")); i.onerror = () => (clearTimeout(t), r("error")); i.src = src; });
+      const gallery = await window.api.image.gallery({ limit: 1 });
+      const g = await new Promise((r) => { const i = new Image(); const t = setTimeout(() => r("pending 3s"), 3000); i.onload = () => (clearTimeout(t), r("load")); i.onerror = () => (clearTimeout(t), r("error")); i.src = gallery.items[0].thumb_url; });
+      const open = performance.getEntriesByType("resource").filter((e) => e.name.startsWith("studio-image:") && e.responseEnd === 0).map((e) => e.name.slice(15, 60));
+      return JSON.stringify({ imgs, fresh, galleryThumb: g, videos: document.querySelectorAll("video").length, unfinished: open });
+    })()`))
+  await clickText(train('.caption-card .caption-actions button'), 'Edit')
+  await js(`(() => { const s = document.querySelector(${q(train('.caption-editor select'))}); s.value = "side"; s.dispatchEvent(new Event("change", { bubbles: true })); return true })()`)
+  await clickText(train('.caption-editor button'), 'Save')
+  check('a caption can be corrected by hand', await waitFor(`${cardsText}.some((t) => t === "excoupe, Example Motors Coupe GT, coupe, side view")`))
+  const firstPhoto = await js(`document.querySelectorAll(${q(train('.caption-card'))})[3].querySelector(".caption-text").textContent`)
+  await js(`[...document.querySelectorAll(${q(train('.caption-card'))})][3].querySelector(".danger-text").click()`)
+  check('a photo can be excluded', await waitFor(`!!document.querySelector(${q(train('.caption-card.excluded'))})`) && firstPhoto.length > 0)
+  await clickText(train('.train-section button'), 'Describe photos')
+  check('the captioning model describes the photos', await waitFor(`${cardsText}.filter((t) => t === "excoupe, Example Motors Coupe GT, coupe, front view, grey, grey, daylight, whole in frame").length === 3`, 20000),
+    await js(`JSON.stringify(${cardsText})`))
+  check('a hand correction outlives the model', await js(`${cardsText}.some((t) => t.startsWith("excoupe, Example Motors Coupe GT, coupe, side view"))`))
+  check('and it says how many it looked at', await waitFor(`document.querySelector(${q(train('.train-main'))}).textContent.includes("4 of 4 described")`))
+  await shot('12-train-captions')
+
+  await setValue(train('.train-settings input[type="number"]'), 4)
+  await js(`document.querySelectorAll(${q(train('.train-settings input[type="number"]'))})[1].focus()`)
+  await js(`(() => {
+    const [steps, every] = document.querySelectorAll(${q(train('.train-settings input[type="number"]'))});
+    const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+    set.call(every, "2"); every.dispatchEvent(new Event("input", { bubbles: true }));
+    const side = [...document.querySelectorAll(${q(train('.train-settings select'))})].find((s) => [...s.options].some((o) => o.value === "512"));
+    side.value = "512"; side.dispatchEvent(new Event("change", { bubbles: true }));
+    return steps.value === "4";
+  })()`)
+  await clickText(train('button'), 'Start a new run')
+  if (TRAINS_FOR_REAL) {
+    check('a run trains to its last step', await waitFor(`(() => { const r = document.querySelector(${q(train('.run-card'))}); return !!r && r.textContent.includes("finished") && r.textContent.includes("step 4 / 4") })()`, 120000))
+    await clickText(train('.run-card button'), 'Show loss')
+    check('its loss can be shown as a chart', await waitFor(`!!document.querySelector(${q(train('.loss-plot svg path.avg'))})`))
+    await clickText(train('.run-card button'), 'Compare')
+    check('checkpoints are compared with the base model', await waitFor(`(() => { const g = document.querySelector(${q(train('.compare-grid'))}); return !!g && g.querySelectorAll("img").length >= 3 })()`, 90000))
+    check('comparison images land in a gallery folder', (await js(`window.api.image.folders()`)).some((f) => f.name === 'Training: Example coupes' && f.count >= 3))
+    await shot('13-train-run')
+    await clickText(train('.run-card button'), 'Use as LoRA')
+    check('a checkpoint goes into the LoRA library', await waitFor(`document.querySelector(${q(train('.lora-library'))}).textContent.includes("Example coupes")`))
+    const [lora] = await js(`window.api.training.loras()`)
+    await clickText(inImage('.tabs button'), 'Image')
+    check('the Image tab offers the LoRA', await waitFor(`[...document.querySelectorAll(${q(inImage('.lora-picker option'))})].some((o) => o.value === ${q(lora.id)})`))
+    await js(`(() => { const s = document.querySelector(${q(inImage('.lora-picker select'))}); s.value = ${q(lora.id)}; s.dispatchEvent(new Event("change", { bubbles: true })); return true })()`)
+    check('and shows it with a strength', await waitFor(`!!document.querySelector(${q(inImage('.lora-row input[type="range"]'))})`))
+    const before = (await js(`window.api.image.gallery({})`)).total
+    await click(inImage('.generate-button'))
+    check('an image is made with the LoRA, and says so', await waitFor(`window.api.image.gallery({}).then((g) => g.total > ${before} && g.items[0].provenance?.loras?.[0]?.id === ${q(lora.id)})`, 30000))
+    await js(`document.querySelector(${q(inImage('.lora-row .icon-button'))}).click()`)
+    check('the LoRA can be taken off again', await waitFor(`!document.querySelector(${q(inImage('.lora-row'))})`))
+  } else {
+    check('without a trainable model, training fails with a clear message', await waitFor(`document.querySelector(${q(train('.train-main'))})?.textContent.includes("cannot be trained")`, 20000))
+  }
+
+  console.log('collecting photos')
+  await clickText(inImage('.tabs button'), 'Train')
+  await clickText(train('.folder-item'), 'Collect photos from the web')
+  check('the collect panel says what is sent where', await waitFor(`(() => { const t = document.querySelector(${q(train('.collect-notice'))})?.textContent ?? ""; return t.includes("commons.wikimedia.org") && t.includes("CC BY") })()`))
+  await setValue(train('.collect-panel input[aria-label="Project name"]'), 'Collected coupes')
+  await setValue(train('.collect-panel input[aria-label="What the photos show"]'), 'coupe')
+  check('the columns are the subject\'s folder levels', await waitFor(`(() => { const h = document.querySelector(${q(train('.collect-row.head'))})?.textContent ?? ""; return h.includes("Name") && h.includes("Variant (optional)") && h.includes("Search words") && !h.includes("Make") })()`))
+  for (const [key, value] of [['Name', 'Example Motors Coupe GT'], ['Variant', 'Mk2'], ['category', 'Example Coupe']]) {
+    await setValue(train(`.collect-row input[aria-label="Row 1 ${key}"]`), value)
+  }
+  await setValue(train('.collect-row input[aria-label="Row 1 photos"]'), 3)
+  await clickText(train('.collect-panel button'), 'Choose a folder and collect')
+  check('openly licensed photos are collected', await waitFor(`document.querySelector(${q(train('.collect-progress'))})?.textContent.includes("3 photos")`, 30000))
+  check('and a project is ready', await waitFor(`!!document.querySelector(${q(train('.collect-progress button.primary'))})`, 15000))
+  const credits = (() => { try { return readFileSync(join(collectedPhotos, 'CREDITS.md'), 'utf8') } catch { return '' } })()
+  check('credits are written next to the photos', credits.includes('Photographer 101') && credits.includes('CC BY 4.0'))
+  check('share-alike and personality-rights photos are not taken', !credits.includes('coupe-sa') && !credits.includes('coupe-people'))
+  await shot('14-collect')
+  await clickText(train('.collect-progress button'), 'Open the project')
+  check('the collected project opens with its subject and captions', await waitFor(`document.querySelectorAll(${q(train('.caption-card'))}).length === 3 && ${cardsText}.every((t) => t === "Example Motors Coupe GT Mk2, coupe")`, 20000))
+
   console.log('switching sides keeps state')
   await clickText('.rail-button', 'Chat')
   check('chat side back', await waitFor(`!document.querySelector(".studio-pane:not([hidden]) .image-studio")`))
   await clickText('.rail-button', 'Image')
   await clickText(inImage('.tabs button'), 'Image')
-  check('session images survive the switch', (await count(inImage('.film'))) === 2)
+  // Two from the image section, plus the one made with a LoRA when the Train tab trained for real.
+  check('session images survive the switch', (await count(inImage('.film'))) === (TRAINS_FOR_REAL ? 3 : 2))
   check('prompt survives the switch', await js(`document.querySelector(${q(inImage('textarea.prompt'))}).value.includes("lighthouse")`))
 
   check('no console errors', consoleErrors.length === 0, consoleErrors.join(' | '))
@@ -650,6 +849,10 @@ try {
   await sleep(4500) // longer than one background check
   check('a model set to stay loaded stays on the GPU', await js(`window.api.image.status().then((s) => s.model.state === "ready")`))
   check('a second launch exits and brings the window back', (await launchSecond()) && (await waitFor(`document.visibilityState === "visible"`)))
+  check('hidden folders are hidden again after the window closed', (await js(`window.api.image.showHiddenFolders()`)) === false && !(await js(`window.api.image.folders()`)).some((f) => f.name === 'Vault'))
+  await js(`window.api.image.setShowHiddenFolders(true)`)
+  check('and unlocked folders locked again', (await js(`window.api.image.folders()`)).some((f) => f.name === 'Vault' && f.locked && !f.unlocked))
+  await js(`window.api.image.setShowHiddenFolders(false)`)
 
   await js(`[...document.querySelectorAll(".keep-row")].find((r) => r.textContent.startsWith("Image model")).querySelectorAll("button")[1].click()`)
   check('a model can be set to unload', await waitFor(`window.api.getConfig().then((c) => c.background.keepLoaded.image === false)`))
@@ -693,6 +896,7 @@ try {
     /* already closed */
   }
   if (app) app.kill()
+  fakeSources.kill()
   await sleep(500)
   try {
     rmSync(profile, { recursive: true, force: true })

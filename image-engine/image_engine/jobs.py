@@ -17,7 +17,7 @@ import time
 import traceback
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, ClassVar
 
 from PIL import Image, ImageOps
 
@@ -33,10 +33,73 @@ COND_CACHE_SIZE = 4
 KINDS = ("image", "video")
 
 
+@dataclass(frozen=True)
+class TaskRequest:
+    """A non-generation job for the GPU worker, such as training (registered with JobQueue.register_task)."""
+
+    kind: ClassVar[str] = "task"
+
+    task: str
+    project: str
+    params: dict = field(default_factory=dict)
+    label: str = ""
+    count: int = 1
+    steps: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "task": self.task, "project": self.project, "params": self.params,
+                "label": self.label}
+
+
+class TaskContext:
+    """What a task gets from the worker: the backends, progress reporting, and cancellation."""
+
+    def __init__(self, queue: "JobQueue", job: "Job") -> None:
+        self._queue, self._job = queue, job
+
+    def backend(self, kind: str = "image") -> Backend:
+        self._queue._ensure_loaded(kind)
+        return self._queue.backends[kind]
+
+    def unloaded_backend(self, kind: str = "image") -> Backend:
+        """The backend without loading its model, to check what it can do first."""
+        return self._queue.backends[kind]
+
+    def progress(self, done: int, total: int, stage: str | None = None, **detail: Any) -> None:
+        job = self._job
+        job.step, job.steps = done, total
+        if stage is not None:
+            job.stage = stage
+        if detail:
+            job.detail = {**job.detail, **detail}
+        self._queue._publish(job)
+
+    def stop_requested(self) -> bool:
+        """For tasks that stop gracefully (training saves a checkpoint) rather than being cut off."""
+        return self._job.cancel_requested
+
+    def check_cancel(self) -> None:
+        self._queue._check_cancel(self._job)
+
+    def forget_prompt_cache(self) -> None:
+        self._queue._cond_cache.clear()
+
+    def publish_image(self, record: dict[str, Any]) -> None:
+        self._queue.events.publish("image", {"job_id": self._job.id, "image": record})
+
+    @property
+    def gallery(self) -> Gallery:
+        return self._queue.gallery
+
+    @property
+    def app(self) -> str | None:
+        return self._queue.app
+
+
 @dataclass
 class Job:
     id: str
-    request: GenerationRequest | VideoRequest
+    request: GenerationRequest | VideoRequest | TaskRequest
     created: float = field(default_factory=time.time)
     status: str = QUEUED
     stage: str = "queued"
@@ -48,6 +111,9 @@ class Job:
     started: float | None = None
     finished: float | None = None
     cancel_requested: bool = False
+    # Tasks only: live details (e.g. the last loss) and what the task returned.
+    detail: dict[str, Any] = field(default_factory=dict)
+    result: dict[str, Any] | None = None
 
     @property
     def kind(self) -> str:
@@ -60,12 +126,14 @@ class Job:
             "count": self.request.count, "step": self.step, "steps": self.steps,
             "images": list(self.images), "error": self.error,
             "started": self.started, "finished": self.finished,
+            **({"detail": dict(self.detail), "result": self.result} if self.kind == "task" else {}),
         }
 
 
 class JobQueue:
     def __init__(self, backends: Backend | dict[str, Backend], gallery: Gallery, events: EventHub,
-                 app: str | None = None, ffmpeg: Callable[[], str | None] = lambda: None) -> None:
+                 app: str | None = None, ffmpeg: Callable[[], str | None] = lambda: None,
+                 loras: Any = None) -> None:
         if isinstance(backends, Backend):
             backends = {backends.kind: backends}
         self.backends = dict(backends)
@@ -73,6 +141,8 @@ class JobQueue:
         self.events = events
         self.app = app  # recorded with every image, e.g. "Local AI Studio 0.1.0"
         self.ffmpeg = ffmpeg  # where ffmpeg is right now; asked again for every video
+        self.loras = loras  # the LoRA library (lora_library.LoraLibrary), or None
+        self._tasks: dict[str, Callable[[Job, TaskContext], dict[str, Any] | None]] = {}
         self._jobs: OrderedDict[str, Job] = OrderedDict()
         self._pending: list[str] = []
         self._cv = threading.Condition()
@@ -110,7 +180,13 @@ class JobQueue:
             self._cv.notify_all()
         self._worker.join(timeout)
 
-    def submit(self, request: GenerationRequest | VideoRequest) -> Job:
+    def register_task(self, name: str, fn: Callable[[Job, TaskContext], dict[str, Any] | None]) -> None:
+        self._tasks[name] = fn
+
+    def has_task(self, name: str) -> bool:
+        return name in self._tasks
+
+    def submit(self, request: GenerationRequest | VideoRequest | TaskRequest) -> Job:
         job = Job(id=secrets.token_hex(8), request=request)
         with self._cv:
             self._jobs[job.id] = job
@@ -216,12 +292,17 @@ class JobQueue:
 
     def _execute(self, job: Job) -> None:
         req = job.request
+        if isinstance(req, TaskRequest):
+            self._stage(job, "starting")
+            job.result = self._tasks[req.task](job, TaskContext(self, job))
+            return
         self._stage(job, "loading model")
         self._ensure_loaded(job.kind)
         backend = self.backends[job.kind]
         self._check_cancel(job)
 
         start_frame = self._start_frame(req) if isinstance(req, VideoRequest) else None
+        used_loras = self._apply_loras(backend, getattr(req, "loras", ()))
 
         key = (job.kind, req.prompt, req.negative_prompt, backend.uses_cfg(req.guidance))
         cond = self._cond_cache.get(key)
@@ -250,7 +331,8 @@ class JobQueue:
             self._stage(job, "decoding")
             output = backend.decode(latents)
             duration_ms = int((time.perf_counter() - started) * 1000)
-            provenance = {**({"app": self.app} if self.app else {}), **backend.provenance()}
+            provenance = {**({"app": self.app} if self.app else {}), **backend.provenance(),
+                          **({"loras": used_loras} if used_loras else {})}
             common = {"job_id": job.id, "model": backend.model_id, "request": req.to_dict(), "seed": seed,
                       "duration_ms": duration_ms, "stats": backend.stats(), "provenance": provenance}
             if isinstance(req, VideoRequest):
@@ -260,6 +342,18 @@ class JobQueue:
                 record = self.gallery.save(output, **common)
             job.images.append(record["id"])
             self.events.publish("image", {"job_id": job.id, "image": record})
+
+    def _apply_loras(self, backend: Backend, uses: tuple) -> list[dict[str, Any]]:
+        """Put exactly the request's LoRAs on the model; returns what to record with each image."""
+        resolved, record = [], []
+        for use in uses:
+            item = self.loras.get(use.id) if self.loras is not None else None
+            if item is None:
+                raise BackendError("A LoRA in this request is no longer in the library.")
+            resolved.append((use.id, self.loras.path_of(use.id), use.strength))
+            record.append({"id": use.id, "name": item["name"], "sha256": item["sha256"], "strength": use.strength})
+        backend.set_loras(resolved)
+        return record
 
     def _start_frame(self, req: VideoRequest) -> Image.Image | None:
         if not req.start_image:

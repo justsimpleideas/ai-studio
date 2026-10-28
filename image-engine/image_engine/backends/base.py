@@ -75,6 +75,12 @@ class Backend(ABC):
         """Optional per-image measurements (for example peak memory) gathered during the last sample."""
         return {}
 
+    def set_loras(self, loras: list[tuple[str, Any, float]]) -> None:
+        """Apply exactly these LoRAs to the next samples: (library id, file path, strength).
+        An empty list removes them all. Backends that cannot take LoRAs refuse a non-empty list."""
+        if loras:
+            raise BackendError("This model does not support LoRAs.")
+
     def provenance(self) -> dict[str, Any]:
         """Where the loaded model and the code running it came from, recorded with every image
         so it can be reproduced: `model_revision` ("repo@commit") and `libraries` (name -> version)."""

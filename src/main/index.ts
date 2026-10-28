@@ -29,8 +29,12 @@ import { isGgufFile } from './gguf.js'
 import { GpuArbiter } from './gpu.js'
 import { MODEL_CATALOG } from '@shared/setup.js'
 import { ModelDownloads } from './image/downloads.js'
+import { ModelImporter, type EngineFolders } from './image/importer.js'
+import { ModelInspector } from './image/inspect.js'
 import { ImageEngine } from './image/engine.js'
 import { registerImageHandlers, serveImage } from './image/handlers.js'
+import { PhotoCollector } from './image/collect.js'
+import { registerTrainingHandlers } from './image/training-handlers.js'
 import { EngineSetup } from './image/setup.js'
 import { Journal } from './tools/fs-tools.js'
 import { ConfigStore } from './store.js'
@@ -580,10 +584,63 @@ const modelDownloads = new ModelDownloads({
     return null
   },
   async applyFolder(model, dest) {
+    if (model.part) return // a part of another model: the import uses it, the engine is not pointed at it
     await imageEngine.start()
-    await imageEngine.request('PUT', '/api/settings', model.kind === 'video' ? { video_model_dir: dest } : { model_dir: dest })
+    const key = { image: 'model_dir', video: 'video_model_dir', caption: 'caption_model_dir' }[model.kind]
+    await imageEngine.request('PUT', '/api/settings', { [key]: dest })
   },
   onState: latestEvery('image:downloadState', 250)
+})
+
+const modelImporter = new ModelImporter({
+  python: imagePython,
+  script: path.join(imageEngineDir, 'scripts', 'import_model.py'),
+  modelsFolder: () => store.get().image.modelsFolder ?? path.join(imageDataDir, 'models'),
+  engineFolders: async () =>
+    imageEngine.state.state === 'running'
+      ? ((await imageEngine.request('GET', '/api/settings')) as EngineFolders)
+      : null,
+  knownFolders: () => store.get().image.partFolders,
+  async rememberFolders(folders) {
+    // Newest first, and a bounded list: a folder deleted long ago only costs one failed read.
+    await store.update((c) => {
+      c.image.partFolders = [...new Set([...folders, ...c.image.partFolders])].slice(0, 32)
+    })
+  },
+  downloads: modelDownloads,
+  async selectFolder(dest, target) {
+    await imageEngine.start()
+    await imageEngine.request('PUT', '/api/settings', { [target === 'video' ? 'video_model_dir' : 'model_dir']: dest })
+  },
+  onState: latestEvery('image:importState', 250)
+})
+
+const modelInspector = new ModelInspector({
+  python: imagePython,
+  script: path.join(imageEngineDir, 'scripts', 'inspect_model.py'),
+  onState: latestEvery('image:inspectState', 250)
+})
+
+const photoCollector = new PhotoCollector({
+  python: imagePython,
+  script: path.join(imageEngineDir, 'scripts', 'collect_photos.py'),
+  workDir: path.join(imageDataDir, 'collect'),
+  // Set only by the end-to-end test, which runs a local stand-in for both services.
+  apis: {
+    ...(process.env['STUDIO_COLLECT_COMMONS_API'] ? { commons: process.env['STUDIO_COLLECT_COMMONS_API'] } : {}),
+    ...(process.env['STUDIO_COLLECT_OPENVERSE_API'] ? { openverse: process.env['STUDIO_COLLECT_OPENVERSE_API'] } : {})
+  },
+  async makeProject(name, folder, subject) {
+    await imageEngine.start()
+    const { items } = (await imageEngine.request('GET', '/api/training/projects')) as { items: { id: string; photo_root: string }[] }
+    const same = items.find((p) => path.resolve(p.photo_root).toLowerCase() === path.resolve(folder).toLowerCase())
+    // An existing project keeps its own subject: the user may have refined it since.
+    const id = same?.id ?? ((await imageEngine.request('POST', '/api/training/projects', { name, photo_root: folder, subject })) as { id: string }).id
+    // A project that is busy is scanned by the user later; the photos are there either way.
+    await imageEngine.request('POST', `/api/training/projects/${id}/scan`, {}).catch(() => undefined)
+    return id
+  },
+  onState: latestEvery('training:collectState', 250)
 })
 
 const gpu = new GpuArbiter(
@@ -595,9 +652,10 @@ const gpu = new GpuArbiter(
       unload: unloadChat
     },
     image: {
-      // The image engine holds the image model or the video model, never both.
+      // The image engine holds one of its models at a time: image, video or captioning.
       get label() {
-        return imageEngine.loadedKind === 'video' ? 'video model' : 'image model'
+        const kind = imageEngine.loadedKind
+        return kind === 'video' ? 'video model' : kind === 'caption' ? 'captioning model' : 'image model'
       },
       isLoaded: () => imageEngine.state.state === 'running' && imageEngine.modelLoaded,
       busyReason: () => imageEngine.busyReason,
@@ -660,9 +718,19 @@ function ensureTray(): void {
   tray.on('click', showWindow)
 }
 
+/**
+ * Hidden gallery folders hide again and unlocked ones lock again whenever the window
+ * goes away, as they do when the studio quits and the engine with it (gallery.py).
+ */
+function resetGalleryPrivacy(): void {
+  if (imageEngine.state.state !== 'running') return
+  void imageEngine.request('POST', '/api/gallery/privacy/reset', {}).catch(() => undefined)
+}
+
 function toBackground(): void {
   if (!window) return
   window.hide()
+  resetGalleryPrivacy()
   ensureTray()
   backgroundUnloader.start()
   if (!toldAboutTray) {
@@ -744,6 +812,7 @@ function createWindow(): void {
   })
   window.on('closed', () => {
     window = null
+    resetGalleryPrivacy()
     // Anything still waiting on a dialog that no longer exists is refused.
     for (const [id, resolve] of pendingApprovals) {
       pendingApprovals.delete(id)
@@ -1150,9 +1219,12 @@ app.whenReady().then(() => {
     getWindow: () => window,
     setup: engineSetup,
     downloads: modelDownloads,
+    inspector: modelInspector,
+    importer: modelImporter,
     defaultModelsFolder: path.join(imageDataDir, 'models'),
     openExternal: (url) => shell.openExternal(url)
   })
+  registerTrainingHandlers({ ipcMain, dialog, imageEngine, gpu, getWindow: () => window, collector: photoCollector })
   protocol.handle(IMAGE_SCHEME, (request) => serveImage(imageEngine, request.url, request.headers.get('Range')))
   createWindow()
   engine.start()

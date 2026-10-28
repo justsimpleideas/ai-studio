@@ -3,7 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from image_engine.video_models import FAST, STANDARD, UnknownVideoModel, profile_of, try_profile_of
+from image_engine.video_models import (FAST, IMAGE_14B, STANDARD, TEXT_14B, UnknownVideoModel, profile_of,
+                                       try_profile_of)
 
 
 def model_folder(root: Path, class_name: str | None) -> Path:
@@ -55,6 +56,49 @@ class ProfileTests(unittest.TestCase):
         self.assertNotIn("sigmas", shown)
         self.assertEqual(shown["name"], "fast")
         self.assertTrue(shown["fixed"])
+        self.assertEqual((shown["experts"], shown["fps"], shown["start"]), (1, 24, "any"))
+
+
+class FourteenBProfileTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def folder(self, name: str, index: dict) -> Path:
+        folder = self.root / name
+        folder.mkdir()
+        (folder / "model_index.json").write_text(json.dumps(index), encoding="utf-8")
+        return folder
+
+    def test_two_experts_are_told_apart_by_their_pipeline_and_boundary(self):
+        text = profile_of(self.folder("t", {"_class_name": "WanPipeline", "boundary_ratio": 0.875}))
+        image = profile_of(self.folder("i", {"_class_name": "WanImageToVideoPipeline", "boundary_ratio": 0.9}))
+        self.assertIs(text, TEXT_14B)
+        self.assertIs(image, IMAGE_14B)
+        # The models' own settings: 40 steps, 16 fps, 81 frames, 480p by default, sides in 16s.
+        self.assertEqual((text.steps, text.guidance, text.guidance_2, text.start, text.experts), (40, 4.0, 3.0, "text", 2))
+        self.assertEqual((image.guidance, image.guidance_2, image.start), (3.5, 3.5, "image"))
+        self.assertEqual((text.fps, text.trained_frames, text.width, text.height, text.side_multiple), (16, 81, 832, 480, 16))
+
+    def test_a_few_step_setting_makes_a_fixed_distilled_profile(self):
+        few = profile_of(self.folder("f", {"_class_name": "WanPipeline", "boundary_ratio": 0.875,
+                                            "few_step": {"steps": 4, "shift": 5.0}}))
+        self.assertEqual((few.name, few.steps, few.guidance, few.guidance_2, few.shift, few.fixed),
+                         ("text-14b-few", 4, 1.0, 1.0, 5.0, True))
+        self.assertEqual(few.boundary, 0.875)
+
+    def test_wrong_boundaries_and_few_step_settings_are_refused(self):
+        for name, index in (("b", {"_class_name": "WanPipeline", "boundary_ratio": 0.5}),
+                            ("s", {"_class_name": "WanPipeline", "boundary_ratio": 0.875, "few_step": {"steps": 0, "shift": 5}}),
+                            ("x", {"_class_name": "WanPipeline", "boundary_ratio": 0.875, "few_step": {"steps": 4}}),
+                            ("n", {"_class_name": "WanPipeline", "boundary_ratio": 0.875,
+                                   "few_step": {"steps": 4, "shift": float("nan")}}),
+                            ("d", {"_class_name": "WanDMDPipeline", "boundary_ratio": 0.875})):
+            with self.subTest(name=name), self.assertRaises(UnknownVideoModel):
+                profile_of(self.folder(name, index))
 
 
 if __name__ == "__main__":

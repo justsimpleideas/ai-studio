@@ -1,4 +1,4 @@
-import type { MediaKind } from './image.js'
+import type { EngineModelKind } from './image.js'
 
 /**
  * Setting up the image side from inside the studio: the Python environment the
@@ -14,11 +14,20 @@ import type { MediaKind } from './image.js'
 // ---------------------------------------------------------------------------
 // Supported models
 
-export type ModelId = 'image' | 'video-fast' | 'video'
+export type ModelId =
+  | 'image'
+  | 'video-fast'
+  | 'video'
+  | 'caption'
+  | 'large-vae'
+  | 'image-parts'
+  | 'video-parts'
+  | 'video-14b-text-parts'
+  | 'video-14b-image-parts'
 
 export interface CatalogModel {
   id: ModelId
-  kind: MediaKind
+  kind: EngineModelKind
   label: string
   /** One line on what to expect, shown under the label. */
   detail: string
@@ -32,6 +41,8 @@ export interface CatalogModel {
   /** Folder name created inside the chosen models folder. */
   folder: string
   recommended?: boolean
+  /** A part another model needs (Import a model file…), not a model to choose on its own: not listed for download. */
+  part?: boolean
 }
 
 const APACHE_2 = { license: 'Apache License 2.0', licenseUrl: 'https://www.apache.org/licenses/LICENSE-2.0' }
@@ -72,6 +83,80 @@ export const MODEL_CATALOG: readonly CatalogModel[] = [
     ...APACHE_2,
     bytes: 34_201_418_400,
     folder: 'video-model'
+  },
+  {
+    id: 'caption',
+    kind: 'caption',
+    label: 'Captioning model · 4B vision-language',
+    detail: 'Used only by the Train tab: describes training photos and checks that they show the subject. It needs the GPU to itself while it runs.',
+    repo: 'Qwen/Qwen3-VL-4B-Instruct',
+    revision: 'ebb281ec70b05090aa6165b016eac8ec08e71b17',
+    ...APACHE_2,
+    bytes: 8_887_284_080,
+    folder: 'caption-model',
+    recommended: true
+  },
+  {
+    id: 'image-parts',
+    kind: 'image',
+    label: 'Parts of the 6B image model',
+    detail: 'Everything but its transformer: what a single transformer file of the 6B model needs around it.',
+    repo: 'Tongyi-MAI/Z-Image-Turbo',
+    revision: 'f332072aa78be7aecdf3ee76d5c247082da564a6',
+    ...APACHE_2,
+    bytes: 8_228_565_676,
+    folder: 'image-parts',
+    part: true
+  },
+  {
+    id: 'large-vae',
+    kind: 'image',
+    label: 'VAE for the 12B image model',
+    detail: "The image decoder the 12B model was trained with, from another model's repository.",
+    repo: 'Qwen/Qwen-Image',
+    revision: '75e0b4be04f60ec59a75f475837eced720f823b6',
+    ...APACHE_2,
+    bytes: 253_807_696,
+    folder: 'large-vae',
+    part: true
+  },
+  {
+    id: 'video-parts',
+    kind: 'video',
+    label: 'Parts of the 5B video model',
+    detail: 'Everything but its transformer: what a single transformer file of the video model needs around it.',
+    repo: 'Wan-AI/Wan2.2-TI2V-5B-Diffusers',
+    revision: 'b8fff7315c768468a5333511427288870b2e9635',
+    ...APACHE_2,
+    bytes: 14_202_110_471,
+    folder: 'video-parts',
+    part: true
+  },
+  {
+    id: 'video-14b-text-parts',
+    kind: 'video',
+    label: 'Parts of the 14B text-to-video model',
+    detail:
+      'Everything but its two experts. Its text encoder is the 5B model’s: with the 5B model already here, only about 0.5 GB is new.',
+    repo: 'Wan-AI/Wan2.2-T2V-A14B-Diffusers',
+    revision: '5be7df9619b54f4e2667b2755bc6a756675b5cd7',
+    ...APACHE_2,
+    bytes: 11_890_924_072,
+    folder: 'video-14b-text-parts',
+    part: true
+  },
+  {
+    id: 'video-14b-image-parts',
+    kind: 'video',
+    label: 'Parts of the 14B image-to-video model',
+    detail:
+      'Everything but its two experts. Its text encoder is the 5B model’s: with the 5B model already here, only about 0.5 GB is new.',
+    repo: 'Wan-AI/Wan2.2-I2V-A14B-Diffusers',
+    revision: '596658fd9ca6b7b71d5057529bbf319ecbc61d74',
+    ...APACHE_2,
+    bytes: 11_890_924_174,
+    folder: 'video-14b-image-parts',
+    part: true
   }
 ]
 
@@ -179,15 +264,16 @@ const PIP_COMMON = ['-m', 'pip', 'install', '--disable-pip-version-check', '--no
  * are published there and not on PyPI. Everything else comes from PyPI in the next
  * step, so no package is ever looked up in two places.
  */
+/** PyTorch and torchvision (the captioning model's image processor needs it), from the PyTorch index. */
 export function torchInstallArgs(constraints: string, source: PipSource = {}): string[] {
   const where = source.wheelhouse ? ['--no-index', '--find-links', source.wheelhouse] : ['--index-url', PYTORCH_INDEX]
-  return [...PIP_COMMON, ...where, '--no-deps', '-c', constraints, 'torch']
+  return [...PIP_COMMON, ...where, '--no-deps', '-c', constraints, 'torch', 'torchvision']
 }
 
 /** The engine's requirements, plus PyTorch's own dependencies, from PyPI. */
 export function packagesInstallArgs(requirements: string, constraints: string, source: PipSource = {}): string[] {
   const where = source.wheelhouse ? ['--no-index', '--find-links', source.wheelhouse] : []
-  return [...PIP_COMMON, ...where, '-c', constraints, '-r', requirements, 'torch']
+  return [...PIP_COMMON, ...where, '-c', constraints, '-r', requirements, 'torch', 'torchvision']
 }
 
 /** Printed by the finished environment; parsed by parseVerify. */

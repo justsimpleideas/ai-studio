@@ -2,6 +2,7 @@ import unittest
 
 from image_engine.params import (VIDEO_DEFAULTS, VIDEO_FPS, GenerationRequest, RequestError, VideoRequest,
                                  parse_job, parse_video_request)
+from image_engine.video_models import IMAGE_14B, TEXT_14B
 
 
 class ParseVideoRequestTests(unittest.TestCase):
@@ -56,6 +57,30 @@ class ParseVideoRequestTests(unittest.TestCase):
         self.assertEqual(data["kind"], "video")
         self.assertEqual(data["seed"], 3)
         self.assertEqual(data["frames"], VIDEO_DEFAULTS["frames"])
+
+
+class FourteenBRequestTests(unittest.TestCase):
+    """A request checked against a 14B model: its sizes, frame rate, defaults and start."""
+
+    def test_defaults_sizes_and_frame_rate_are_the_models(self):
+        req = parse_video_request({"prompt": "x"}, TEXT_14B)
+        self.assertEqual((req.width, req.height, req.frames, req.fps, req.steps, req.guidance),
+                         (832, 480, 81, 16, 40, 4.0))
+        self.assertEqual((parse_video_request({"prompt": "x", "width": 1280, "height": 720}, TEXT_14B).height), 720)
+        for w, h in ((1280, 736), (840, 480)):  # more than 720p's pixels; not a multiple of 16
+            with self.subTest(size=(w, h)), self.assertRaises(RequestError):
+                parse_video_request({"prompt": "x", "width": w, "height": h}, TEXT_14B)
+
+    def test_each_model_takes_only_its_own_start(self):
+        picture = {"prompt": "x", "start_image": "0123456789abcdef"}
+        self.assertEqual(parse_video_request(picture, IMAGE_14B).start_image, "0123456789abcdef")
+        with self.assertRaises(RequestError) as ctx:
+            parse_video_request({"prompt": "x"}, IMAGE_14B)
+        self.assertIn("start picture", str(ctx.exception))
+        with self.assertRaises(RequestError) as ctx:
+            parse_video_request(picture, TEXT_14B)
+        self.assertIn("text only", str(ctx.exception))
+        self.assertIsInstance(parse_job({"kind": "video", **picture}, IMAGE_14B), VideoRequest)
 
 
 class ParseJobTests(unittest.TestCase):

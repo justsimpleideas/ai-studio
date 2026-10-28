@@ -234,6 +234,11 @@ automatically.
 - **Folders and favorites.** Make, rename and delete your own folders and drag images
   and videos onto them; deleting a folder never deletes what was in it. Favorites are
   their own view, showing every starred item wherever it is filed.
+- **Hidden and locked folders.** A folder can be hidden (it leaves the folder list, and
+  what it holds leaves every view and search until *Settings → Show hidden folders*) or
+  locked with a six-digit PIN. Both reset whenever the window closes: hidden folders hide
+  again and unlocked ones lock. This keeps the studio's own views private; it does not
+  encrypt the files on disk.
 - **Reproducible files, private exports.** Each image in the gallery carries its full
   generation settings and where it came from (app version, the model's exact revision,
   library versions). Drop such a PNG on the image side, or choose one with *Use the
@@ -243,6 +248,13 @@ automatically.
 - **Checked downloads.** Model files are pinned to a commit, hash-verified and inspected
   before they are ever loaded; only safetensors weights are accepted. See
   [docs/image-engine-security.md](docs/image-engine-security.md).
+- **Inspect any model file yourself.** *Settings → Inspect a model file* shows a
+  downloaded file's SHA-256 (paste the publisher's to compare) and what
+  `image-engine/scripts/inspect_model.py` finds in its header and metadata: pickle
+  checkpoints, a malformed header, code-like text, embedded files or encoded blobs, text
+  hidden in byte tensors, and whether it matches a model structure the studio knows.
+  It reads the file without loading or running it, on this computer only; a malware scan
+  is left to your antivirus.
 
 ![The gallery: images and videos, searchable by prompt, with favorites and folders](docs/screenshots/gallery.webp)
 
@@ -260,6 +272,86 @@ system RAM and visit the GPU briefly.
 | Low VRAM | fp8 storage | every part moved in only while it runs | ~6 GB |
 
 **Automatic** picks the fastest mode that fits the detected GPU.
+
+### Models shared as a single file
+
+Some models are shared as one `.safetensors` file holding only the transformer (often in
+fp8, with a scale per tensor) rather than as a diffusers folder. *Settings → Image model →
+Import a model file…* takes such a file for either image model, and *Settings → Video
+model → Import a model file…* one of the video model:
+
+- **the 6B model** (any fine-tune of it, distilled or base): the rest of its folder (text
+  encoder, tokenizer, VAE, scheduler, the transformer's configuration) comes from the 6B
+  download, or, if that is not there, from an 8.2 GB download of just those parts;
+- **a 12B single-stream model** that reads its prompt through a 4B vision-language model
+  (the same one the Train tab uses for captions) and needs a 254 MB VAE. It comes as a
+  base model (28 steps, guidance 4.5) or a distilled one (8 steps, no guidance), takes no
+  LoRAs and cannot be trained yet; the window says so and keeps the LoRA picker out of the way;
+- **the 5B video model** (the architecture of the video downloads, as the original or a
+  3-step distillation like the distilled download): the rest of its folder comes from the
+  original video download, or from a 14.2 GB download of just those parts;
+- **a 14B video model**, text to video or image to video: two files of the same size, one
+  per "expert" (the first works on the noisy start of a clip, the second on the details).
+  You choose both; files named "high noise" and "low noise" are put in order by
+  themselves. It comes as the original (40 steps with guidance) or a few-step distillation,
+  for which you enter the steps and shift its download page gives. The rest of its folder
+  is an 11.9 GB download, of which only 0.5 GB is new when the 5B model is already there
+  (they share the text encoder). The 14B models make 480p or 720p at 16 fps; the text
+  model never takes a start picture and the image model always needs one.
+
+A file of any other size of these model families is refused by its structure, before any
+part is downloaded.
+
+The file is never loaded as it is. The import reads its header and says which model it
+is, then checks every tensor against that model's structure (names, shapes, dtypes, the
+fp8 scales and the small quantization tags stored next to them), hashes it and compares
+it with the hash from its download page if you paste one, downloads any missing part
+after showing its source and license, and links everything into a new model folder (hard
+links where the disk allows, so no second copy), which it selects. You say whether the
+file is a distilled or a base model; for the image models that sets the default steps and
+guidance, for the video model it chooses between the original 50-step sampling and the
+fixed 3-step schedule. The same steps from a terminal:
+
+```
+python image-engine/scripts/import_model.py --transformer <download>.safetensors --probe
+python image-engine/scripts/import_model.py --transformer <download>.safetensors --variant distilled \
+    --parts-from <models>/image-model --dest <models>/my-6b-model --sha256 <published SHA-256>
+python image-engine/scripts/import_model.py --transformer <download>.safetensors --variant base \
+    --text-encoder-from <models>/caption-model --vae-from <models>/large-vae --dest <models>/my-12b-model
+python image-engine/scripts/import_model.py --transformer <download>.safetensors --variant distilled \
+    --parts-from <models>/video-parts --dest <models>/my-video-model
+python image-engine/scripts/import_model.py --transformer <high noise>.safetensors \
+    --transformer-2 <low noise>.safetensors --variant distilled --steps 4 --shift 5 \
+    --parts-from <models>/video-14b-text-parts --dest <models>/my-14b-model
+```
+
+A 6B file stored in fp8 stays in fp8 in every memory mode and takes LoRAs like the
+download does (training them needs the distilled model); a bf16 one behaves exactly like
+the download. For the 12B model, the linear weights stay in fp8 in every memory mode (a
+bf16 file is quantized per output row as it loads) and are widened to bf16 just before
+each matmul. A video file stored in fp8 likewise stays in fp8 in every video memory mode
+(about 5 GB instead of 10 for the transformer); a bf16 or fp16 one behaves like the download.
+
+A 14B expert is about 14 GB even in fp8 (a bf16 file is quantized as it loads), more than
+a 12 GB card holds, so there it is streamed from RAM block by block (*Balanced*). Only one
+expert runs at a time. When both fit in RAM with the text encoder (about 48 GB) both stay
+loaded; otherwise the first is dropped when the second takes over, and each clip reads
+both from disk once (about 28 GB: seconds from an internal SSD, longer from a USB drive).
+*Low VRAM* always keeps just one. A 14B clip takes many minutes on a 12 GB card; a
+few-step distillation is what makes it practical there.
+
+The 12B model's memory modes:
+
+| Mode | Transformer | Text encoder | VRAM |
+|---|---|---|---|
+| Everything on GPU | fp8, resident | resident | ~26 GB |
+| Model on GPU | fp8, resident | on the CPU | ~17 GB |
+| Balanced | fp8, streamed from RAM block by block | swapped in per prompt | ~11 GB |
+| Low VRAM | fp8, streamed | on the CPU | ~4 GB |
+
+Streamed, the transformer's 28 blocks wait in pinned RAM (about 13 GB, plus 8 GB for the
+text encoder) and visit the GPU one at a time, the next one copied while the current one
+computes, so a 12 GB card runs the model without holding it.
 
 ## Video
 
@@ -362,6 +454,7 @@ Every action appears in the activity log, marked if it ran without asking.
 | Image · 6B, 8 steps               |  32.8 GB | [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)                                    | Apache 2.0 |
 | Video · 5B, 3-step distilled      |  24.2 GB | [FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers](https://huggingface.co/FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers) | Apache 2.0 |
 | Video · 5B, 50 steps              |  34.2 GB | [Wan-AI/Wan2.2-TI2V-5B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers)                      | Apache 2.0 |
+| Captioning · 4B (Train tab only)  |   8.9 GB | [Qwen/Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct)                                  | Apache 2.0 |
 
 The two video models share 14 GB of files (text encoder and decoder); with one already
 downloaded, the other links them instead of downloading them again. The distilled one is
@@ -422,8 +515,8 @@ To set up the engine's environment by hand instead (any platform with an NVIDIA 
 
 ```bash
 python -m venv /path/to/studio-python
-/path/to/studio-python/bin/python -m pip install --only-binary=:all: --no-deps -c image-engine/constraints.txt --index-url https://download.pytorch.org/whl/cu128 torch
-/path/to/studio-python/bin/python -m pip install --only-binary=:all: -c image-engine/constraints.txt -r image-engine/requirements.txt torch
+/path/to/studio-python/bin/python -m pip install --only-binary=:all: --no-deps -c image-engine/constraints.txt --index-url https://download.pytorch.org/whl/cu128 torch torchvision
+/path/to/studio-python/bin/python -m pip install --only-binary=:all: -c image-engine/constraints.txt -r image-engine/requirements.txt torch torchvision
 python image-engine/scripts/fetch_model.py --model video-fast --dest /path/to/models/video-model-fast
 ```
 
@@ -483,6 +576,12 @@ The models generate whatever they are asked to, and the studio adds no content f
 What you make with them, and whether you may publish it, is your responsibility under the
 models' licenses and the law where you live. Every image and video records the app, the
 model and its revision in the gallery.
+
+The same goes for collecting training photos from Wikimedia Commons and Openverse (Train
+tab): it runs from your computer, so following Wikimedia's policies and each photo's
+license, complying with the law where you live, and collecting sparingly are up to you.
+Wikimedia asks tools to name a way to contact the person running them; enter your own
+contact in the collect form (an email address, a website, or a Wikimedia user page).
 
 ## License
 

@@ -3,10 +3,9 @@ import { studioMediaUrl } from "@shared/image.js";
 import type { VideoInfo } from "../types";
 import {
   DEFAULT_VIDEO_FORM,
-  LENGTHS,
   QUALITIES,
   SHAPES,
-  VIDEO_FPS,
+  geometryFor,
   qualityOf,
   shapeOf,
   sizeFor,
@@ -31,15 +30,23 @@ const MAX_SEED = 2 ** 32 - 1;
 export function VideoPanel({ form, onChange, onGenerate, canGenerate, pending, error, video, onPickStart }: Props) {
   const [advanced, setAdvanced] = useState(false);
   const set = <K extends keyof VideoFormState>(key: K, value: VideoFormState[K]) => onChange({ ...form, [key]: value });
+  const profile = video?.profile ?? null;
+  const geometry = geometryFor(profile);
+  const fps = video?.limits.fps ?? geometry.fps;
   const shape = shapeOf(form.width, form.height);
-  const quality = qualityOf(form.width, form.height);
+  const quality = qualityOf(form.width, form.height, geometry);
   const available = video !== undefined;
   // A distilled model fixes steps and guidance itself; the form keeps its own values for the original.
-  const fast = video?.profile?.fixed ? video.profile : null;
+  const fast = profile?.fixed ? profile : null;
   const cfg = !fast && form.guidance > 1;
+  const large = profile?.experts === 2;
+  // The 14B models: one starts from text only, the other from a picture only.
+  const start = profile?.start ?? "any";
+  const needsStart = start === "image" && !form.start;
+  const defaults = video?.defaults ?? DEFAULT_VIDEO_FORM;
 
   const submit = () => {
-    if (canGenerate && available && form.prompt.trim()) onGenerate();
+    if (canGenerate && available && form.prompt.trim() && !needsStart) onGenerate();
   };
 
   return (
@@ -68,28 +75,41 @@ export function VideoPanel({ form, onChange, onGenerate, canGenerate, pending, e
         <span className="hint">Say what moves and how the camera moves. One or two actions fit in a few seconds.</span>
       </label>
 
+      {start === "text" ? (
+        <div className="field">
+          <span className="field-label">Start picture</span>
+          <span className="hint">
+            This model makes video from the prompt alone. To start from a picture, choose an image-to-video model in
+            Settings.
+          </span>
+        </div>
+      ) : (
       <div className="field">
         <span className="field-label">
-          Start picture <span className="value">{form.start ? `${form.start.width} × ${form.start.height}` : "optional"}</span>
+          Start picture{" "}
+          <span className="value">
+            {form.start ? `${form.start.width} × ${form.start.height}` : start === "image" ? "required" : "optional"}
+          </span>
         </span>
         {form.start ? (
           <div className="start-picture">
             <img src={studioMediaUrl(form.start.id, "input")} alt="The picture the video starts from" />
             <div className="start-actions">
               <button type="button" className="small" onClick={onPickStart}>Change…</button>
-              <button type="button" className="small ghost" onClick={() => set("start", null)}>Remove</button>
+              {start !== "image" && <button type="button" className="small ghost" onClick={() => set("start", null)}>Remove</button>}
             </div>
           </div>
         ) : (
           <div className="start-empty">
             <button type="button" onClick={onPickStart}>Choose a picture…</button>
             <span className="hint">
-              Or drop one on this side, or use “Animate” on an image in the gallery. Without one, the video comes from
-              the prompt alone.
+              Or drop one on this side, or use “Animate” on an image in the gallery.{" "}
+              {start === "image" ? "This model makes video from a picture: it needs one." : "Without one, the video comes from the prompt alone."}
             </span>
           </div>
         )}
       </div>
+      )}
 
       <div className="field">
         <span className="field-label">Shape</span>
@@ -101,7 +121,7 @@ export function VideoPanel({ form, onChange, onGenerate, canGenerate, pending, e
               role="radio"
               aria-checked={shape === s.value}
               className={`chip ${shape === s.value ? "active" : ""}`}
-              onClick={() => onChange({ ...form, ...sizeFor(s.value as Shape, quality) })}
+              onClick={() => onChange({ ...form, ...sizeFor(s.value as Shape, quality, geometry) })}
             >
               <span className="ratio-glyph" style={{ aspectRatio: `${s.w} / ${s.h}` }} aria-hidden />
               {s.label}
@@ -126,21 +146,27 @@ export function VideoPanel({ form, onChange, onGenerate, canGenerate, pending, e
               aria-checked={quality === i}
               className={quality === i ? "active" : ""}
               title={q.hint ? `${q.label}, ${q.hint}` : q.label}
-              onClick={() => onChange({ ...form, ...sizeFor(shape, i) })}
+              onClick={() => onChange({ ...form, ...sizeFor(shape, i, geometry) })}
             >
               {q.label}
             </button>
           ))}
         </div>
-        {quality > 0 && <span className="hint">The model is trained at 720p. Smaller is much faster but can look softer.</span>}
+        {large ? (
+          <span className="hint">
+            The model makes 480p and 720p. On a 12 GB card 480p is the practical size: 720p takes more than twice as long.
+          </span>
+        ) : (
+          quality > 0 && <span className="hint">The model is trained at 720p. Smaller is much faster but can look softer.</span>
+        )}
       </div>
 
       <div className="field">
         <span className="field-label">
-          Length <span className="value">{form.frames} frames · {VIDEO_FPS} fps</span>
+          Length <span className="value">{form.frames} frames · {fps} fps</span>
         </span>
         <div className="segmented" role="radiogroup" aria-label="Length">
-          {LENGTHS.map((l) => (
+          {geometry.lengths.map((l) => (
             <button
               type="button"
               key={l.frames}
@@ -156,8 +182,8 @@ export function VideoPanel({ form, onChange, onGenerate, canGenerate, pending, e
         <span className="hint">5 seconds is the longest one take. Longer videos: continue a clip from its last frame.</span>
         {fast && form.frames !== fast.trained_frames && (
           <span className="hint warn-text fast-length-note">
-            The fast model is trained on {Math.round(fast.trained_frames / VIDEO_FPS)}-second clips; shorter ones can
-            lose quality toward the end.
+            The {large ? "distilled" : "fast"} model is trained on {Math.round(fast.trained_frames / fps)}-second clips;
+            shorter ones can lose quality toward the end.
           </span>
         )}
       </div>
@@ -187,7 +213,9 @@ export function VideoPanel({ form, onChange, onGenerate, canGenerate, pending, e
               Steps <span className="value">{form.steps}</span>
             </span>
             <input type="range" min={10} max={50} value={form.steps} onChange={(e) => set("steps", Number(e.target.value))} />
-            <span className="hint">50 is the model's default. Around 30 makes a quicker draft.</span>
+            <span className="hint">
+              {defaults.steps} is the model's default. Around {Math.round(defaults.steps * 0.6)} makes a quicker draft.
+            </span>
           </div>
           <div className="field">
             <span className="field-label">
@@ -196,8 +224,11 @@ export function VideoPanel({ form, onChange, onGenerate, canGenerate, pending, e
             <input type="range" min={1} max={10} step={0.5} value={form.guidance}
                    onChange={(e) => set("guidance", Number(e.target.value))} />
             <span className="hint">
-              5 is the model's default. At 1 the negative prompt is off and each step takes half the time, usually at a
-              cost in quality.
+              {defaults.guidance} is the model's default
+              {large && profile?.guidance_2 && profile.guidance_2 !== profile.guidance
+                ? ` (the second expert runs at ${profile.guidance_2}, in the same proportion)`
+                : ""}
+              . At 1 the negative prompt is off and each step takes half the time, usually at a cost in quality.
             </span>
           </div>
           <label className="field">
@@ -240,7 +271,7 @@ export function VideoPanel({ form, onChange, onGenerate, canGenerate, pending, e
               type="button"
               className="link-button"
               onClick={() =>
-                onChange({ ...form, steps: DEFAULT_VIDEO_FORM.steps, guidance: DEFAULT_VIDEO_FORM.guidance, negative_prompt: DEFAULT_VIDEO_FORM.negative_prompt })
+                onChange({ ...form, steps: defaults.steps, guidance: defaults.guidance, negative_prompt: DEFAULT_VIDEO_FORM.negative_prompt })
               }
             >
               Reset to the model's defaults
@@ -259,11 +290,15 @@ export function VideoPanel({ form, onChange, onGenerate, canGenerate, pending, e
           </div>
         )}
         {error && <div className="error-text" role="alert">{error}</div>}
-        <button type="submit" className="primary generate-button" disabled={!canGenerate || !available || !form.prompt.trim()}>
+        {needsStart && <div className="hint warn-text">Choose a start picture: this model makes video from a picture.</div>}
+        <button type="submit" className="primary generate-button"
+                disabled={!canGenerate || !available || !form.prompt.trim() || needsStart}>
           {pending > 0 ? `Add to queue (${pending} waiting)` : form.count > 1 ? `Generate ${form.count} videos` : "Generate video"}
         </button>
         <span className="hint center">
-          {fast ? `Ctrl + Enter · ${fast.steps} steps per clip with the fast model` : "Ctrl + Enter · a 720p clip takes minutes, not seconds"}
+          {large
+            ? `Ctrl + Enter · ${fast ? `${fast.steps} steps` : "a clip"} with a 14B model takes many minutes on a 12 GB card`
+            : fast ? `Ctrl + Enter · ${fast.steps} steps per clip with the fast model` : "Ctrl + Enter · a 720p clip takes minutes, not seconds"}
         </span>
       </div>
     </form>

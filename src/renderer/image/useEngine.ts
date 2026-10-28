@@ -13,6 +13,10 @@ export interface EngineState {
   session: ImageRecord[]
   /** Increments whenever the gallery changed on the engine side. */
   galleryVersion: number
+  /** Folders whose items are out of view this session (hidden, or locked); see gallery.py. */
+  blockedFolders: string[]
+  /** Increments whenever folders were hidden, shown, locked or unlocked. */
+  privacyVersion: number
 }
 
 export type EngineAction =
@@ -29,7 +33,9 @@ export const initialEngineState: EngineState = {
   status: null,
   jobs: {},
   session: [],
-  galleryVersion: 0
+  galleryVersion: 0,
+  blockedFolders: [],
+  privacyVersion: 0
 }
 
 const SESSION_LIMIT = 48
@@ -56,6 +62,8 @@ export function engineReducer(state: EngineState, action: EngineAction): EngineS
         case 'job':
           return { ...state, jobs: { ...state.jobs, [e.job.id]: e.job } }
         case 'image':
+          // Images a training task made (checkpoint comparisons) belong to the gallery, not this session's strip.
+          if (state.jobs[e.job_id]?.kind === 'task') return { ...state, galleryVersion: state.galleryVersion + 1 }
           return {
             ...state,
             session: [e.image, ...state.session.filter((i) => i.id !== e.image.id)].slice(0, SESSION_LIMIT),
@@ -69,13 +77,24 @@ export function engineReducer(state: EngineState, action: EngineAction): EngineS
           const models = { ...state.status.models, [kind]: info }
           return { ...state, status: { ...state.status, models, ...(kind === 'image' ? { model: info } : {}) } }
         }
+        case 'privacy': {
+          // Whatever this window still shows from a folder that just went out of view goes too.
+          const blocked = new Set(e.blocked)
+          return {
+            ...state,
+            session: state.session.filter((i) => !i.folder_id || !blocked.has(i.folder_id)),
+            blockedFolders: e.blocked,
+            galleryVersion: state.galleryVersion + 1,
+            privacyVersion: state.privacyVersion + 1
+          }
+        }
       }
     }
   }
   return state
 }
 
-export function jobKind(job: Job): MediaKind {
+export function jobKind(job: Job): MediaKind | 'task' {
   return job.kind ?? 'image'
 }
 

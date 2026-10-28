@@ -62,6 +62,12 @@ export interface ImagePreferences {
   /** Where downloaded models go. Null means the image data folder's models/. */
   modelsFolder: string | null
   /**
+   * Folders seen holding a verified download, wherever they are. Importing a model
+   * file looks here for the parts it needs, so they are still found after the image
+   * model folder has been switched to something else.
+   */
+  partFolders: string[]
+  /**
    * Whether "Save as…" keeps the prompt and settings inside the saved PNG. Off
    * by default: a prompt can be private, and a shared file carries it along.
    */
@@ -145,7 +151,7 @@ export const DEFAULT_CONFIG: AppConfig = {
     }
   ],
   model: { lastModelPath: null, backend: 'auto', gpuLayers: null, contextSize: null, kvCache: 'f16' },
-  image: { pythonPath: null, modelsFolder: null, includeSettingsInExports: false },
+  image: { pythonPath: null, modelsFolder: null, partFolders: [], includeSettingsInExports: false },
   background: DEFAULT_BACKGROUND,
   lastWorkspaceId: null
 }

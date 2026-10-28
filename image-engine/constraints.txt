@@ -1,5 +1,5 @@
 # Every package the image engine's environment ends up with, pinned to the versions
-# audited in docs/package-security-audit.md (45 wheels). The studio's engine setup
+# audited in docs/package-security-audit.md (46 wheels). The studio's engine setup
 # installs with this file as constraints, so a new release of any dependency is never
 # picked up without being audited first. Regenerate with `pip freeze` from an audited
 # environment.
@@ -42,6 +42,7 @@ shellingham==1.5.4
 sympy==1.14.0
 tokenizers==0.23.3
 torch==2.11.0+cu128
+torchvision==0.26.0+cu128
 tqdm==4.70.1
 transformers==5.20.2
 truststore==0.10.5

@@ -6,22 +6,43 @@ import { GeneratePanel } from './components/GeneratePanel.js'
 import { ImageDetail } from './components/ImageDetail.js'
 import { Preview } from './components/Preview.js'
 import { SettingsView } from './components/SettingsView.js'
+import { TrainView } from './training/TrainView.js'
+import { useLoras } from './useLoras.js'
 import { StatusChip } from './components/StatusChip.js'
 import { VideoPanel } from './components/VideoPanel.js'
 import { VideoPreview } from './components/VideoPreview.js'
-import { fromImage, loadForm, saveForm, toRequest, type FormState } from './form.js'
+import {
+  fitToModel,
+  fromImage,
+  loadForm,
+  loadSeenModel,
+  saveForm,
+  saveSeenModel,
+  toRequest,
+  type FormState,
+  type SeenModel
+} from './form.js'
 import { MAX_PNG_BYTES, settingsFromPng } from './png-settings.js'
 import type { ImageRecord, StartImage } from './types.js'
 import { activeJob, jobKind, queuedCount, useEngine } from './useEngine.js'
 import { useFolders } from './useFolders.js'
-import { fromVideo, loadVideoForm, saveVideoForm, toVideoRequest, withStart, type VideoFormState } from './videoForm.js'
+import {
+  fitVideoToModel,
+  fromVideo,
+  geometryFor,
+  loadVideoForm,
+  saveVideoForm,
+  toVideoRequest,
+  withStart,
+  type VideoFormState
+} from './videoForm.js'
 import './styles.css'
 
-type Tab = 'generate' | 'video' | 'gallery' | 'settings'
+type Tab = 'generate' | 'video' | 'train' | 'gallery' | 'settings'
 type GalleryUpdate = ImageRecord | { id: string; deleted: true }
 type Note = { ok: boolean; text: string } | null
 
-const TAB_LABEL: Record<Tab, string> = { generate: 'Image', video: 'Video', gallery: 'Gallery', settings: 'Settings' }
+const TAB_LABEL: Record<Tab, string> = { generate: 'Image', video: 'Video', train: 'Train', gallery: 'Gallery', settings: 'Settings' }
 const PICTURE_TYPES = ['image/png', 'image/jpeg', 'image/webp']
 
 export function ImageStudio({ active }: { active: boolean }): React.JSX.Element {
@@ -35,10 +56,39 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
   const [note, setNote] = useState<Note>(null)
   const [dragging, setDragging] = useState(false)
   const galleryUpdater = useRef<((u: GalleryUpdate) => void) | null>(null)
-  const folders = useFolders(engine.connected)
+  const folders = useFolders(engine.connected, engine.privacyVersion)
+  const canTrain = engine.status?.training === true
+  const loras = useLoras(engine.connected && canTrain)
+  const imageProfile = engine.status?.image?.profile ?? null
+  // Engines that do not report a profile run the 6B model, which takes LoRAs.
+  const useLoraLibrary = canTrain && (imageProfile?.loras ?? true)
+  const seenModel = useRef<SeenModel | null>(loadSeenModel())
 
   useEffect(() => saveForm(form), [form])
+
+  // A newly chosen image model brings its own steps and guidance, unless the user changed them.
+  useEffect(() => {
+    if (!imageProfile || seenModel.current?.name === imageProfile.name) return
+    const previous = seenModel.current
+    setForm((f) => fitToModel(f, previous, imageProfile))
+    seenModel.current = { name: imageProfile.name, steps: imageProfile.steps, guidance: imageProfile.guidance }
+    saveSeenModel(seenModel.current)
+  }, [imageProfile])
   useEffect(() => saveVideoForm(videoForm), [videoForm])
+  // The video model decides the sizes, lengths, frame rate, steps and start a clip takes.
+  const videoProfile = engine.status?.video?.profile ?? null
+  const videoGeometry = geometryFor(videoProfile)
+  useEffect(() => {
+    if (videoProfile) setVideoForm((f) => fitVideoToModel(f, videoProfile))
+  }, [videoProfile?.name])
+
+  // A folder hidden or locked again (the window closing does both) takes the open details with it,
+  // and the details' list loses that folder's items.
+  useEffect(() => {
+    const blocked = new Set(engine.blockedFolders)
+    const out = (i: ImageRecord): boolean => !!i.folder_id && blocked.has(i.folder_id)
+    setDetail((d) => (d === null || out(d.image) ? null : { ...d, list: d.list.filter((i) => !out(i)) }))
+  }, [engine.privacyVersion, engine.blockedFolders])
 
   // A success note fades on its own; a refusal stays until dismissed.
   useEffect(() => {
@@ -62,7 +112,7 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
   const generate = async (): Promise<void> => {
     setSubmitError(null)
     try {
-      await api.submit(toRequest(form))
+      await api.submit(toRequest(form, useLoraLibrary ? new Set(loras.list.map((l) => l.id)) : new Set()))
     } catch (e) {
       setSubmitError((e as Error).message)
     }
@@ -125,7 +175,7 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
 
   /** Put a start picture into the video form and show the Video tab. */
   const applyStart = (start: StartImage, change?: (f: VideoFormState) => Partial<VideoFormState>): void => {
-    setVideoForm((f) => ({ ...withStart(f, start), ...change?.(f) }))
+    setVideoForm((f) => ({ ...withStart(f, start, videoGeometry), ...change?.(f) }))
     setDetail(null)
     setTab('video')
   }
@@ -238,7 +288,7 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
       )}
       <header className="topbar">
         <nav className="tabs" aria-label="Image sections">
-          {(Object.keys(TAB_LABEL) as Tab[]).map((t) => (
+          {(Object.keys(TAB_LABEL) as Tab[]).filter((t) => t !== 'train' || canTrain).map((t) => (
             <button
               key={t}
               className={tab === t ? 'active' : ''}
@@ -289,6 +339,8 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
               pending={pending}
               error={submitError ?? (failed && !job ? `Last job failed: ${failed.error ?? 'unknown error'}` : null)}
               onImport={(file) => void importPng(file)}
+              library={useLoraLibrary ? loras.list : null}
+              profile={imageProfile}
             />
             <Preview
               job={job}
@@ -332,9 +384,16 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
               onOpen={(image, list) => setDetail({ image, list })}
               registerUpdater={registerUpdater}
               onError={(text) => setNote({ ok: false, text })}
+              onMove={moveToFolder}
+              onDelete={remove}
             />
           ))}
-        {tab === 'settings' && <SettingsView status={engine.status} engine={engine.engine} />}
+        {tab === 'train' && (
+          <TrainView jobs={engine.jobs} connected={engine.connected} captioning={engine.status?.captioning === true} library={loras.list} onLibraryChanged={() => void loras.refresh()} />
+        )}
+        {tab === 'settings' && (
+          <SettingsView status={engine.status} engine={engine.engine} privacyVersion={engine.privacyVersion} />
+        )}
       </main>
 
       {detail && (

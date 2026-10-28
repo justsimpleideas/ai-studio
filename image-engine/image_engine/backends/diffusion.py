@@ -1,7 +1,12 @@
-"""The supported image model (6B, few-step) through Hugging Face diffusers.
+"""The 6B image model through Hugging Face diffusers.
 
-The model folder is the one fetch_model.py downloads. The pipeline class is
-imported by name below rather than looked up from the folder's model_index.json.
+The model folder is the one fetch_model.py downloads, or one scripts/import_model.py
+put together around a single transformer file (fp8 or bf16): the rest of that folder
+(text encoder, tokenizer, VAE, scheduler and the transformer's config.json) comes from
+the downloaded model, and model_index.json names the file (`transformer_file`). Such a
+file is checked tensor by tensor before it loads (single_file.inspect), and its fp8
+weights stay in fp8 (fp8.ScaledFP8Linear). The pipeline class is imported by name
+below rather than looked up from the folder's model_index.json.
 
 Heavy imports (torch, diffusers) happen lazily so the rest of the engine, and its
 tests, run without them.
@@ -12,10 +17,13 @@ from __future__ import annotations
 import gc
 import importlib.metadata
 import json
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
+from .. import single_file
 from ..config import Settings
+from ..image_models import TURBO, ImageProfile, UnknownImageModel, profile_of, read_index, try_profile_of
 from ..memory import MemoryPlan, choose_plan
 from ..model_check import ModelFolderError, check_model_folder
 from ..params import GenerationRequest
@@ -67,15 +75,42 @@ def gpu_device_info(plan_label: str | None) -> dict[str, Any]:
     return info
 
 
-class DiffusionBackend(Backend):
-    model_id = "turbo-6b"
+def single_transformer(folder: Path) -> Path | None:
+    """The transformer file an imported folder names in model_index.json, or None for a downloaded folder."""
+    if not (folder / "model_index.json").is_file():
+        return None
+    try:
+        named = read_index(folder).get("transformer_file")
+    except UnknownImageModel:
+        return None
+    if not isinstance(named, str) or not named:
+        return None
+    if "/" in named or "\\" in named or not named.endswith(".safetensors"):
+        raise BackendError("transformer_file in model_index.json must be a .safetensors file name")
+    return folder / "transformer" / named
 
+
+class DiffusionBackend(Backend):
     def __init__(self, get_settings: Callable[[], Settings]) -> None:
         self._get_settings = get_settings
         self._pipe: Any = None
         self._plan: MemoryPlan | None = None
+        self._profile: ImageProfile | None = None
         self._last_stats: dict[str, Any] = {}
         self._provenance: dict[str, Any] = {}
+        self._loras: dict[str, tuple[str, float]] = {}  # library id -> (file, strength) now on the transformer
+
+    @property
+    def profile(self) -> ImageProfile:
+        """The loaded model's profile, else that of the folder in settings."""
+        if self._profile is not None:
+            return self._profile
+        folder = try_profile_of(self._get_settings().model_dir)
+        return folder if folder is not None and folder.family == "diffusion" else TURBO
+
+    @property
+    def model_id(self) -> str:  # type: ignore[override]
+        return self.profile.model_id
 
     # ------------------------------------------------------------ device
 
@@ -98,9 +133,18 @@ class DiffusionBackend(Backend):
         settings = self._get_settings()
         folder = Path(settings.model_dir)
         on_status("Checking model files")
+        single = single_transformer(folder)
+        inspection = config = None
         try:
-            check_model_folder(folder)
-        except ModelFolderError as exc:
+            check_model_folder(folder, script="scripts/import_model.py" if single else None)
+            profile = profile_of(folder) if (folder / "model_index.json").is_file() else TURBO
+            if single is not None:
+                on_status("Checking the transformer file")
+                inspection = single_file.inspect(single)
+                if inspection.family != "diffusion":
+                    raise BackendError(f"{single.name} holds the {inspection.label}, not the 6B one")
+                config = json.loads((folder / "transformer" / "config.json").read_text(encoding="utf-8"))
+        except (ModelFolderError, UnknownImageModel, single_file.SingleFileError, OSError, ValueError) as exc:
             raise BackendError(str(exc)) from exc
         if not torch.cuda.is_available():
             raise BackendError("No CUDA GPU found. The image model needs an NVIDIA GPU with at least 6 GB of memory.")
@@ -112,8 +156,14 @@ class DiffusionBackend(Backend):
         from diffusers import ZImagePipeline
 
         try:
+            parts = {}
+            if single is not None:
+                from ..transformer_file import build_six_b
+
+                parts["transformer"] = build_six_b(single, inspection, config)
             pipe = ZImagePipeline.from_pretrained(
                 folder,
+                **parts,
                 torch_dtype=torch.bfloat16,
                 local_files_only=True,   # never reach the network
                 use_safetensors=True,    # never unpickle
@@ -123,8 +173,10 @@ class DiffusionBackend(Backend):
             raise BackendError(f"Could not load the model: {exc}") from exc
 
         on_status(f"Placing model on GPU ({plan.label})")
+        stored_fp8 = inspection is not None and bool(inspection.quantized)
         try:
-            if plan.transformer_fp8:
+            # A file stored in fp8 already keeps its weights in fp8, whatever the plan.
+            if plan.transformer_fp8 and not stored_fp8:
                 # transformer.dtype then reports the compute dtype (bf16), which is what the
                 # pipeline casts latents to; the fp8 copies stay internal to each layer.
                 pipe.transformer.enable_layerwise_casting(
@@ -146,12 +198,16 @@ class DiffusionBackend(Backend):
                 "Choose a lower mode in Settings.") from exc
 
         pipe.set_progress_bar_config(disable=True)
-        self._pipe, self._plan = pipe, plan
+        self._pipe, self._plan, self._profile = pipe, plan, profile
         self._provenance = _provenance(folder)
+        if inspection is not None:
+            self._provenance["weights"] = inspection.storage
 
     def unload(self) -> None:
         self._pipe = None
         self._plan = None
+        self._profile = None
+        self._loras = {}
         self._free()
 
     @staticmethod
@@ -226,8 +282,11 @@ class DiffusionBackend(Backend):
 
         pipe, plan = self._require()
         vae = pipe.vae
+        # With every part offloaded the VAE waits in RAM and its hook moves only the VAE to the GPU
+        # when it runs, so the latents must be sent there themselves.
+        device = torch.device("cuda") if plan.cpu_offload else vae.device
         with torch.inference_mode():
-            latents = latents.to(device=vae.device, dtype=vae.dtype)
+            latents = latents.to(device=device, dtype=vae.dtype)
             latents = latents / vae.config.scaling_factor + vae.config.shift_factor
             image = vae.decode(latents, return_dict=False)[0]
             pil = pipe.image_processor.postprocess(image, output_type="pil")[0]
@@ -237,11 +296,130 @@ class DiffusionBackend(Backend):
     def stats(self) -> dict[str, Any]:
         return dict(self._last_stats)
 
+    # ------------------------------------------------------------ LoRA
+
+    def set_loras(self, loras: list[tuple[str, Any, float]]) -> None:
+        from safetensors import safe_open
+
+        from .. import lora
+
+        pipe, _ = self._require()
+        transformer = pipe.transformer
+        wanted = {lora_id: (str(path), strength) for lora_id, path, strength in loras}
+        for lora_id, (path, _) in list(self._loras.items()):
+            if wanted.get(lora_id, (None,))[0] != path:
+                lora.remove(transformer, _lora_name(lora_id))
+                del self._loras[lora_id]
+        for lora_id, (path, strength) in wanted.items():
+            name = _lora_name(lora_id)
+            if lora_id not in self._loras:
+                with safe_open(path, "pt") as fh:
+                    tensors = {k: fh.get_tensor(k) for k in fh.keys()}
+                    meta = fh.metadata()
+                try:
+                    lora.load(transformer, name, tensors, meta, strength=strength, dtype=torch_bf16())
+                except lora.LoRAError as exc:
+                    raise BackendError(f"This LoRA does not fit the image model: {exc}") from exc
+            else:
+                lora.set_strength(transformer, name, strength)
+            self._loras[lora_id] = (path, strength)
+
+    # ------------------------------------------------------------ training
+
+    @contextmanager
+    def training_session(self) -> Iterator["TrainingParts"]:
+        """The loaded pipeline's parts, arranged for training; put back as they were afterwards.
+
+        The text encoder waits on the CPU while the transformer trains (it is only needed to
+        cache caption embeddings), generation LoRAs come off, and the transformer leaves in
+        inference shape: no LoRA from training, no gradient checkpointing, eval mode."""
+        import torch
+
+        from .. import lora
+
+        pipe, plan = self._require()
+        if plan.cpu_offload:
+            raise BackendError("Training needs the model on the GPU. Choose a memory mode other than Low.")
+        self.set_loras([])
+        te_device = next(pipe.text_encoder.parameters()).device
+        pipe.text_encoder.to("cpu")
+        self._free()
+        parts = TrainingParts(self, pipe)
+        try:
+            yield parts
+        finally:
+            transformer = pipe.transformer
+            for name in list(lora.adapters(transformer)):
+                lora.remove(transformer, name)
+            if getattr(transformer, "gradient_checkpointing", False):
+                transformer.disable_gradient_checkpointing()
+            transformer.eval()
+            for p in transformer.parameters():
+                p.requires_grad_(False)
+            pipe.text_encoder.to(te_device)
+            self._free()
+            torch.cuda.reset_peak_memory_stats()
+
     def provenance(self) -> dict[str, Any]:
         return dict(self._provenance)
+
+    def model_key(self) -> str:
+        """Identifies the weights in cache names: the verified revision, else the folder."""
+        return self._provenance.get("model_revision") or str(Path(self._get_settings().model_dir).resolve())
 
     def _require(self) -> tuple[Any, MemoryPlan]:
         if self._pipe is None or self._plan is None:
             raise BackendError("Model is not loaded")
         return self._pipe, self._plan
 
+
+
+def _lora_name(lora_id: str) -> str:
+    return f"lib_{lora_id}"
+
+
+def torch_bf16() -> Any:
+    import torch
+
+    return torch.bfloat16
+
+
+class TrainingParts:
+    """What the training service needs from the loaded image model, and nothing more."""
+
+    def __init__(self, backend: DiffusionBackend, pipe: Any) -> None:
+        import torch
+
+        self._backend, self._pipe = backend, pipe
+        self.transformer = pipe.transformer
+        self.device = "cuda"
+        self.dtype = torch.bfloat16
+        self.shift = float(pipe.scheduler.config.get("shift", 3.0))
+        self.model_key = backend.model_key()
+
+    def vae_encoder(self) -> tuple[Callable, str]:
+        from ..training.cache import vae_encoder
+
+        self._pipe.vae.to("cuda")
+        return vae_encoder(self._pipe.vae), f"{self.model_key}|vae"
+
+    @contextmanager
+    def text_encoder(self) -> Iterator[tuple[Callable[[str], Any], str]]:
+        """Caption -> embedding (tokens x features), with the text encoder on the GPU meanwhile."""
+        import torch
+
+        pipe = self._pipe
+        pipe.text_encoder.to("cuda")
+
+        @torch.inference_mode()
+        def encode(text: str) -> Any:
+            embeds, _ = pipe.encode_prompt(prompt=text, device=torch.device("cuda"),
+                                           do_classifier_free_guidance=False,
+                                           max_sequence_length=MAX_SEQUENCE_LENGTH)
+            return embeds[0]
+
+        try:
+            yield encode, f"{self.model_key}|text|{MAX_SEQUENCE_LENGTH}"
+        finally:
+            pipe.text_encoder.to("cpu")
+            self._backend._free()

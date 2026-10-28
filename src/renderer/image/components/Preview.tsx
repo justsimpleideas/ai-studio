@@ -84,7 +84,7 @@ export function Progress({ job, modelMessage, onCancel }: { job: Job; modelMessa
     }
   }, [key, job.stage, job.step]);
 
-  const kind = job.kind ?? "image";
+  const kind = job.kind === "video" ? "video" : "image"; // this card shows image and video jobs only
   const perImage = job.steps > 0 ? job.step / job.steps : 0;
   const stageWeight = job.stage === "decoding" || job.stage === "encoding video" ? 1 : job.stage === "sampling" ? perImage : 0;
   const fraction = Math.min(1, (job.index + stageWeight) / Math.max(1, job.count));
@@ -110,7 +110,7 @@ export function Progress({ job, modelMessage, onCancel }: { job: Job; modelMessa
         <div style={{ width: indeterminate ? undefined : `${fraction * 100}%` }} />
       </div>
       <div className="progress-foot">
-        <span className="muted small truncate">{job.request.prompt}</span>
+        <span className="muted small truncate">{"prompt" in job.request ? job.request.prompt : ""}</span>
         <button className="ghost small" onClick={onCancel}>Cancel</button>
       </div>
     </div>

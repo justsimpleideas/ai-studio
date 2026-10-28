@@ -172,6 +172,25 @@ file system means a rename is instant, nothing can be lost by a failed move, and
 image files (which carry their settings) are never rewritten. A folder deletion that
 deleted its contents would be a way to lose work by tidying up, so it does not.
 
+**Hidden and locked folders.** A folder can be hidden, locked with a six-digit PIN, or
+both (`hidden` and `pin` columns of `folders`). The engine keeps, in memory only, whether
+this session shows hidden folders and which folders it has unlocked, and leaves the items
+of every other hidden or locked folder out of everything it answers: listings, search,
+favourites, an item's details, its files, and making a start picture from it. Asked for
+directly, a hidden folder answers as if it did not exist (404) and a locked one 423, so the
+window cannot reach their contents by a URL either. The studio resets both whenever its
+window closes or goes to the background, and an engine restart starts reset. The PIN is
+stored as salted scrypt; it is needed to change or remove it even while unlocked, and to
+rename or delete the folder (deleting would put its items in plain view). Five wrong PINs
+in a row make the next try wait 30 seconds, doubling up to 15 minutes. A locked folder
+takes new items without its PIN. A name is refused only for a clash with a folder this
+session sees, so creating a folder cannot reveal a hidden one.
+
+**What it is not.** It keeps the studio's own views private from someone using the
+studio. It does not encrypt anything: the files and `gallery.db` stay readable on disk,
+and six digits fall quickly to a guesser who has copied `gallery.db`. Encrypting the
+gallery would be a separate, much larger feature.
+
 ## D13 — GIF export: made on request from the stored video, never kept
 
 **Decision.** "Save as GIF…" in a video's details asks for a width (320, 480, 640 or
@@ -224,3 +243,194 @@ runs, so the class is fixed in the engine, as it is for the original.
 the tiny random-weight model of D11 labelled as the distilled one. Picture quality, and
 how much faster a clip really is on a 12 GB card, need the real model and are recorded
 separately once measured.
+
+## D15 — A second image model, imported from a single transformer file
+
+**Decision.** The image engine also runs a 12B single-stream model (`image_models.py`,
+family `large`). The configured folder's `model_index.json` picks the family, among a
+fixed list of pipeline names, and the engine's image slot (`backends/image.py`) loads
+that family's backend, unloading the other first. Each backend builds its pipeline from
+its own imports, never from a name in the folder.
+
+The model's transformer is published as one safetensors file, not a diffusers folder, so
+the folder is put together locally by `scripts/import_model.py`: the transformer file,
+the studio's captioning model as its text encoder (the same 4B vision-language model at
+the same pinned commit, of which only the language part runs), and its VAE, downloaded by
+`fetch_model.py --model large-vae` from the pinned commit of another model's repository
+that ships the same VAE. Files are hard-linked where possible, and the manifest records
+every file's hash: the published ones for the two downloads, the computed SHA-256 for
+the transformer, checked against the hash on its download page when one is given. The
+load-time check (`model_check.py`) is the same as for every other model folder.
+
+Nothing in the transformer file is trusted before it is read: its header alone
+(`single_file.py`, pure Python) names the layout (the authors' tensor names, behind a
+loader prefix or not, or diffusers'), the model's dimensions (read off the tensor
+shapes), and the quantization. Every tensor the model has must be there with the right
+shape, nothing else may be, fp8 is allowed only for linear weights and only with a scale
+of one value per tensor or per output row, and the per-layer quantization tags must be
+short JSON objects naming a known format with no unknown settings. The renaming rules
+are the same as diffusers' own single-file converter for this model, which a test checks.
+
+The linear weights stay in fp8 (`fp8.ScaledFP8Linear`) and are widened to bf16 right
+before each matmul, so the arithmetic is a bf16 model's; a bf16 file is quantized per
+output row as it loads, so both files need the same memory. On a 12 GB card the
+transformer (about 13 GB) is streamed: its blocks wait in pinned RAM and visit the GPU
+one at a time through diffusers' group offloading, each copied on a side stream while the
+one before computes. The text encoder moves to the GPU only to read a new prompt
+(`memory.py`, `LARGE_PLANS`).
+
+Pinned RAM is handed out as slices of 256 MiB blocks (`transformer_file.PinnedArena`), up
+to half of the machine's RAM; what does not fit stays pageable and is pinned only while it
+is copied. PyTorch rounds each page-locked allocation up to a power of two, so pinning
+tensor by tensor locked about 1.6 times the weights, and on a 32 GB Windows machine the
+system refused partway. That refusal is raised as "CUDA error: out of memory", the same
+words as a full GPU, and CUDA keeps it as its last error, so the next GPU operation,
+wherever it is, fails with it too: the load stopped with that message even though the
+loader had caught the refusal. A refusal is now followed by one small GPU operation that
+takes the stale report (`clear_refused_lock`), and one that still escapes says that RAM,
+not the GPU, ran out.
+
+The model takes no LoRAs and cannot be trained yet. The server refuses a LoRA request for
+it before queueing it, training says so before loading anything, and the window hides the
+LoRA picker and fits steps and guidance to the model's own defaults unless the user
+changed them.
+
+**Why.** The model's quality per step is what makes it worth 13 GB, and its fp8 file is
+how it fits a 12 GB card at all: a bf16 transformer would need 25 GB of RAM to stream,
+and with the text encoder that exceeds a 32 GB machine. Weight-only fp8 keeps the
+arithmetic in bf16, so it needs no fp8 matmul kernels and runs on any CUDA GPU that
+diffusers supports. Streaming costs little because, at 1024², one block's matmuls take
+longer than copying its 0.43 GB over PCIe. Reusing the captioning model as the text
+encoder avoids a second 9 GB download of the same weights.
+
+**What is not verified.** The loading code is tested on the CPU against diffusers'
+converter and a tiny random-weight model (the fp8 layers reproduce the float model's
+output), and the whole backend, every memory plan, streaming included, on that tiny model
+on the GPU. Picture quality, speed, real VRAM and RAM use, and whether pinning 13 GB of
+RAM works on every Windows machine (the loader falls back to pageable memory if not)
+need the real model and are recorded separately once measured.
+
+## D16 — Single-file models of either family, imported from the window
+
+**Decision.** *Settings → Image model → Import a model file…* takes a single transformer
+file of either image model. `import_model.py --probe` reads its header and says which
+model it is (`single_file.detect_family`); the window then asks whether it is a distilled
+or a base model (that only sets the default steps and guidance), optionally for the hash
+on its download page, and for a folder name. The main process (`src/main/image/importer.ts`)
+finds the parts that model needs among folders already verified at the pinned commits
+(the configured folders first, then the models folder, then every verified folder it has
+seen before and the folders next to the configured ones, so a download kept elsewhere is
+still found after the image model folder has moved to an imported model), downloads the missing ones with
+the same verified downloads as the model cards once the user has accepted their licenses
+(`image-parts`, `large-vae`, `caption`; parts are never offered on their own and never
+selected), runs the import, and points the engine at the new folder. A folder that holds
+only a model file is refused at load with a pointer to the import.
+
+For the 6B model the import links in everything but the transformer's weights from the
+6B download (or from `fetch_model.py --model image-parts`, the same files without the
+transformer, 8.2 GB), and its `model_index.json` gains `transformer_file` and
+`is_distilled`. Its file is read in the authors' layout (q/k/v fused into one weight per
+block, split here into three equal row blocks, with their fp8 scale cut alongside) or in
+diffusers'; the model's dimensions are read off the shapes and checked against the
+`config.json` it is assembled with. The 6B backend builds that transformer itself
+(`transformer_file.build_six_b`) and hands it to the pipeline, so the rest of the folder
+loads as for the download. fp8 weights stay in fp8 (layerwise casting is skipped for them),
+and LoRAs wrap the fp8 layers as they wrap linear ones, so LoRAs work on such a model and
+training works on a distilled one.
+
+**Why.** Fine-tunes of both models are mostly shared this way, often only in fp8. Making
+the user assemble a folder by hand, or download a second 32 GB copy of a model they have,
+would put both out of reach; linking the parts costs no disk, and every file in the result
+is still one the engine verified.
+
+**Fixed along the way.** In the 6B model's Low VRAM mode the latents were moved to where the
+VAE was waiting (RAM) rather than to the GPU it runs on, so decoding failed. Found by the
+tiny-model test this change added.
+
+**What is not verified.** As in D15: the loaders, the backend through its memory plans and
+the import are tested on tiny random-weight models and synthetic files; real files, picture
+quality and speed are the user's to check.
+
+## D17 — The video model, imported from a single transformer file
+
+**Decision.** *Settings → Video model → Import a model file…* takes a single transformer
+file of the 5B video model, the same way D16 takes the image models'. The two cards share
+one importer: an import shows in the card it was started from, and a file of the other
+kind is sent to the other card by name rather than imported. `single_file` reads the
+authors' layout with the same renaming rules, in the same order, as diffusers' own
+converter for this model family (the last three swap `norm2` and `norm3`; a test checks
+the two agree name by name and value by value), or diffusers' layout as it is. The
+model's dimensions come from the shapes, except how its width splits into heads, which the
+shapes do not show (q and k are normalized across all heads) and the folder's
+`config.json` supplies; every shape-decided key, the head split, and the absence of an
+image encoder or extra projections are checked against it. The expected tensors derived
+for the published dimensions are exactly the 825 of the downloaded transformer, and their
+size in fp32 is exactly the byte count its index states.
+
+The parts are the original video download's files without the transformer's weights
+(`fetch_model.py --model video-parts`, 14.2 GB; the full download is accepted too, the
+distilled download is not, since it comes from another repository). Its `model_index.json`
+gains `transformer_file`; a file the user says is distilled gets the distilled pipeline
+label, so it runs the fixed 3-step schedule. The video backend builds the transformer
+itself (`transformer_file.build_video`) and hands it to the pipeline. fp8 weights stay in
+fp8 in every plan, including the streamed one, and layerwise casting is skipped for them.
+
+`fetch_model.py`'s listed downloads now accept a SentencePiece vocabulary inside
+`tokenizer/`, as its pipeline downloads already did; the video model's tokenizer has one.
+
+**Why.** Video fine-tunes and fp8 copies are shared as single files like image ones, and
+an fp8 transformer halves what the GPU holds, which matters most on the 8-12 GB cards this
+studio is built for. The larger (14B) video models, shared as two files (one per noise
+range), need a second transformer and a new memory plan; they are the next step, not
+part of this one.
+
+**What is not verified.** As in D15 and D16: tiny random-weight models and synthetic files
+only. Real files, video quality and speed are the user's to check.
+
+## D18 — The 14B video models: two experts, one at a time
+
+**Decision.** The 14B text-to-video and image-to-video models load from imported single
+files only (two per model, one per expert), with the parts of their pinned download
+(`video-14b-text-parts`, `video-14b-image-parts`: everything but the experts). Their text
+encoder and tokenizer are the 5B model's byte for byte (checked against the published
+hashes), so the parts download links them from a 5B folder and fetches only the 0.5 GB VAE
+and configurations. The expected tensors for the published 14B dimensions are exactly the
+1,095 of the downloaded expert's index, and their fp32 size its stated byte count; the
+header of a widely shared fp8 file (read over an HTTP range request, no weights) matched
+them name for name and shape for shape.
+
+That file uses an older fp8 layout than the image models' files: a `scale_weight` per
+weight, a `scale_input` (used only by loaders that multiply in fp8, so it is checked and
+left out), and an empty `scaled_fp8` marker. It also stores the timestep embedding's
+linear layers in fp8; diffusers casts that layer's input to the layer's own dtype, so an
+fp8 layer there would turn the timestep into fp8. Outside the blocks an fp8 weight is
+therefore widened as it loads (`transformer_file.fill(widen=...)`); in the blocks it stays
+fp8. The same applies to 5B files.
+
+Sampling uses diffusers' own two-expert pipelines (`boundary_ratio`, `transformer_2`,
+`guidance_scale_2`), built in place from the loaded parts. The second expert is only read
+when needed: at the end of the step before the boundary, a step callback calls
+`Experts.ensure("low")`, which drops the first expert first unless both fit in RAM
+(`memory.keep_both_experts`), and sets it as the pipeline's `transformer_2`. On a 12 GB
+card each expert is streamed block by block (`TwoExpertPlan`, *Balanced*); on 22 GB and up
+the running expert is resident and the other waits in RAM. Steps, guidance (4/3 for text,
+3.5/3.5 for image) and boundaries (0.875/0.9) are the models' own. A few-step distillation
+records the steps and shift the user enters (from its download page) in model_index.json
+and runs plain Euler steps on that shifted schedule without guidance. Requests are checked
+against the configured model: 16 fps, sides in 16s up to 1280x720, 480p by default, and
+the start the model takes (never a picture for text to video, always one for image to
+video); the window's video form follows the model.
+
+Found along the way: diffusers' image-to-video pipeline calls an optional text-fixing
+package without checking it is installed, so its prompts are encoded through the
+text-to-video pipeline, whose code for that is otherwise the same.
+
+**Why.** The 14B models are the largest open video models of the family and the ones most
+fine-tunes and distillations are shared for; a 12 GB card can run them only streamed and
+one expert at a time, which is this studio's case. Keeping both experts when RAM allows
+avoids reading 28 GB per clip on machines that can afford it.
+
+**What is not verified.** Tiny random-weight models on the GPU (every plan, one or both
+experts kept, few-step, image to video, the older fp8 layout) and synthetic files. Real
+files, video quality, speed, and whether a given few-step file's shift suits plain Euler
+steps are the user's to check.

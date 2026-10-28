@@ -35,12 +35,18 @@ describe('model catalog', () => {
     const script = {
       image: [pyConstant('DEFAULT_REPO'), pyConstant('DEFAULT_REVISION')],
       video: [pyConstant('VIDEO_REPO'), pyConstant('VIDEO_REVISION')],
-      'video-fast': [pyConstant('FAST_VIDEO_REPO'), pyConstant('FAST_VIDEO_REVISION')]
+      'video-fast': [pyConstant('FAST_VIDEO_REPO'), pyConstant('FAST_VIDEO_REVISION')],
+      caption: [pyConstant('CAPTION_REPO'), pyConstant('CAPTION_REVISION')],
+      'image-parts': [pyConstant('DEFAULT_REPO'), pyConstant('DEFAULT_REVISION')],
+      'large-vae': [pyConstant('LARGE_VAE_REPO'), pyConstant('LARGE_VAE_REVISION')],
+      'video-parts': [pyConstant('VIDEO_REPO'), pyConstant('VIDEO_REVISION')],
+      'video-14b-text-parts': [pyConstant('VIDEO_14B_TEXT_REPO'), pyConstant('VIDEO_14B_TEXT_REVISION')],
+      'video-14b-image-parts': [pyConstant('VIDEO_14B_IMAGE_REPO'), pyConstant('VIDEO_14B_IMAGE_REVISION')]
     }
     for (const model of MODEL_CATALOG) {
       expect([model.repo, model.revision], model.id).toEqual(script[model.id])
       expect(model.revision).toMatch(/^[0-9a-f]{40}$/)
-      expect(model.bytes).toBeGreaterThan(1e9)
+      expect(model.bytes).toBeGreaterThan(model.part ? 1e8 : 1e9)
     }
     expect(new Set(MODEL_CATALOG.map((m) => m.folder)).size).toBe(MODEL_CATALOG.length)
   })
@@ -90,12 +96,12 @@ describe('checking Python and the GPU', () => {
 })
 
 describe('pip commands', () => {
-  it('takes only PyTorch from the PyTorch index, without its dependencies', () => {
+  it('takes only PyTorch and torchvision from the PyTorch index, without their dependencies', () => {
     const args = torchInstallArgs('c.txt')
     expect(args).toContain('--only-binary=:all:')
     expect(args.slice(args.indexOf('--index-url'), args.indexOf('--index-url') + 2)).toEqual(['--index-url', PYTORCH_INDEX])
     expect(args).toContain('--no-deps')
-    expect(args.slice(-3)).toEqual(['-c', 'c.txt', 'torch'])
+    expect(args.slice(-4)).toEqual(['-c', 'c.txt', 'torch', 'torchvision'])
     expect(args).not.toContain('--extra-index-url')
   })
 
@@ -104,7 +110,7 @@ describe('pip commands', () => {
     expect(args).not.toContain('--index-url')
     expect(args).not.toContain('--extra-index-url')
     expect(args).toContain('--only-binary=:all:')
-    expect(args.join(' ')).toContain('-c c.txt -r r.txt torch')
+    expect(args.join(' ')).toContain('-c c.txt -r r.txt torch torchvision')
   })
 
   it('can install from a folder of wheels with no index at all', () => {

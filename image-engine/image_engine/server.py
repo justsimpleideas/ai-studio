@@ -38,13 +38,15 @@ from . import __version__, video_io
 from .backends import Backend
 from .config import SettingsStore
 from .events import EventHub
-from .gallery import MEDIA, FolderError, Gallery, valid_id
-from .jobs import JobQueue
-from .params import (DEFAULTS, MAX_COUNT, MAX_SIDE, MAX_STEPS, MIN_SIDE, SIDE_MULTIPLE, VIDEO_DEFAULTS, VIDEO_FPS,
-                     VIDEO_FRAME_STEP, VIDEO_MAX_COUNT, VIDEO_MAX_FRAMES, VIDEO_MAX_PIXELS, VIDEO_MAX_SIDE,
-                     VIDEO_MIN_FRAMES, VIDEO_MIN_SIDE, VIDEO_SIDE_MULTIPLE, GenerationRequest, RequestError,
-                     VideoRequest, parse_job)
-from .video_models import VideoProfile, try_profile_of
+from .gallery import MEDIA, FolderError, FolderLocked, Gallery, TooManyTries, valid_id
+from .jobs import JobQueue, TaskRequest
+from .lora_library import LoraLibrary, LoraLibraryError
+from .params import (DEFAULTS, MAX_COUNT, MAX_SIDE, MAX_STEPS, MIN_SIDE, SIDE_MULTIPLE, VIDEO_FRAME_STEP,
+                     VIDEO_MAX_COUNT, VIDEO_MAX_FRAMES, VIDEO_MAX_SIDE, VIDEO_MIN_FRAMES, VIDEO_MIN_SIDE,
+                     GenerationRequest, RequestError, VideoRequest, parse_job, video_defaults)
+from .training.service import TrainingError, TrainingService, subject_presets
+from .image_models import ImageProfile
+from .video_models import STANDARD, VideoProfile, try_profile_of
 
 MAX_BODY = 64 * 1024
 # A start picture for image-to-video: a photo straight off a phone fits comfortably.
@@ -53,7 +55,9 @@ MAX_INPUT_PIXELS = 64_000_000
 INPUT_TYPES = {"image/png": "PNG", "image/jpeg": "JPEG", "image/webp": "WEBP"}
 VIDEO_TYPES = ("video/mp4", "image/webp")
 FILE_CHUNK = 256 * 1024
-MEDIA_PREFIXES = ("/images/", "/videos/", "/frames/", "/inputs/")
+MEDIA_PREFIXES = ("/images/", "/videos/", "/frames/", "/inputs/", "/training/")
+TRAINING_PHOTO = re.compile(r"^/training/([0-9a-f]{16})/([0-9a-f]{16})\.webp$")
+TRAINING_THUMB_SIDE = 320
 # Files the gallery serves: path pattern -> (Gallery.path_of kind, content type; None = from the index).
 MEDIA_ROUTES = (
     (re.compile(r"^/images/([0-9a-f]{16})\.png$"), "image", "image/png"),
@@ -78,13 +82,27 @@ class HttpError(Exception):
         self.status = status
 
 
+def folder_http_error(exc: FolderError) -> HttpError:
+    """423 for a locked folder or a wrong PIN, 429 after too many wrong ones, 404 for a folder
+    this session cannot see (as if it did not exist), 400 for anything else."""
+    if isinstance(exc, TooManyTries):
+        return HttpError(HTTPStatus.TOO_MANY_REQUESTS, str(exc))
+    if isinstance(exc, FolderLocked):
+        return HttpError(HTTPStatus.LOCKED, str(exc))
+    if str(exc) == "No such folder.":
+        return HttpError(HTTPStatus.NOT_FOUND, "no such folder")
+    return HttpError(HTTPStatus.BAD_REQUEST, str(exc))
+
+
 class App:
     """Everything a request handler needs, wired together once at startup."""
 
     def __init__(self, *, settings: SettingsStore, backend: Backend, gallery: Gallery,
-                 events: EventHub, jobs: JobQueue, port: int, token: str | None) -> None:
+                 events: EventHub, jobs: JobQueue, port: int, token: str | None,
+                 training: TrainingService | None = None, loras: LoraLibrary | None = None) -> None:
         self.settings, self.backend, self.gallery = settings, backend, gallery
         self.events, self.jobs = events, jobs
+        self.training, self.loras = training, loras
         self.token = token
         self.stopping = threading.Event()
         self.set_port(port)
@@ -99,6 +117,7 @@ class App:
                   for kind, backend in self.jobs.backends.items()}
         # Device numbers come from whichever backend is loaded, so the memory plan shown is the live one.
         loaded = next((b for b in self.jobs.backends.values() if b.loaded), self.backend)
+        profile = self.image_profile()
         status = {
             "version": __version__,
             "model": models.get("image", {"id": self.backend.model_id, "state": "unloaded", "message": ""}),
@@ -107,18 +126,26 @@ class App:
             "queue": self.jobs.queue_summary(),
             "limits": {"min_side": MIN_SIDE, "max_side": MAX_SIDE, "side_multiple": SIDE_MULTIPLE,
                        "max_steps": MAX_STEPS, "max_count": MAX_COUNT},
-            "defaults": DEFAULTS,
+            "defaults": {**DEFAULTS, **({"steps": profile.steps, "guidance": profile.guidance} if profile else {})},
+            "training": self.training is not None,
+            # Whether photos can be described: a verified captioning model folder is there.
+            "captioning": "caption" in self.jobs.backends and self.jobs.backends["caption"].available(),
         }
+        if hasattr(self.backend, "profile"):
+            # Which image model the folder holds (None: none the engine supports), with what it can do.
+            status["image"] = {"profile": profile.to_dict() if profile else None}
         if "video" in self.jobs.backends:
             ffmpeg = video_io.find_ffmpeg(self.settings.get().ffmpeg_path)
             profile = self.video_profile()
+            # Sizes, frame rate and defaults are the configured model's (the 5B model's when there is none).
+            model = profile or STANDARD
             status["video"] = {
                 "limits": {"min_side": VIDEO_MIN_SIDE, "max_side": VIDEO_MAX_SIDE,
-                           "side_multiple": VIDEO_SIDE_MULTIPLE, "max_pixels": VIDEO_MAX_PIXELS,
+                           "side_multiple": model.side_multiple, "max_pixels": model.max_pixels,
                            "min_frames": VIDEO_MIN_FRAMES, "max_frames": VIDEO_MAX_FRAMES,
-                           "frame_step": VIDEO_FRAME_STEP, "fps": VIDEO_FPS,
+                           "frame_step": VIDEO_FRAME_STEP, "fps": model.fps,
                            "max_steps": MAX_STEPS, "max_count": VIDEO_MAX_COUNT},
-                "defaults": {**VIDEO_DEFAULTS, **({"steps": profile.steps, "guidance": profile.guidance} if profile else {})},
+                "defaults": video_defaults(profile),
                 # Which model the video folder holds (None until a supported one is chosen).
                 "profile": profile.to_dict() if profile else None,
                 # Without ffmpeg, videos are saved as animated WebP instead of MP4.
@@ -129,6 +156,11 @@ class App:
 
     def video_profile(self) -> VideoProfile | None:
         return try_profile_of(self.settings.get().video_model_dir)
+
+    def image_profile(self) -> ImageProfile | None:
+        """The image model's profile: the loaded one's, else the configured folder's.
+        None for an unsupported folder, or a backend that does not say (test doubles)."""
+        return getattr(self.backend, "profile", None)
 
     def fit_to_model(self, request: GenerationRequest | VideoRequest) -> GenerationRequest | VideoRequest:
         """A video request as the configured model will run it: a distilled model has fixed
@@ -203,14 +235,184 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
     @route("POST", r"/api/jobs")
     def post_job(h, m):
         try:
-            request = parse_job(h.json_body())
+            request = parse_job(h.json_body(), app.video_profile())
         except RequestError as exc:
             raise HttpError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
         if request.kind not in app.jobs.backends:
             raise HttpError(HTTPStatus.BAD_REQUEST, f"this engine cannot make {request.kind}s")
         if isinstance(request, VideoRequest) and request.start_image and app.gallery.input_path(request.start_image) is None:
             raise HttpError(HTTPStatus.BAD_REQUEST, "the start picture is not in the engine's inputs")
+        for use in getattr(request, "loras", ()):
+            if app.loras is None or app.loras.get(use.id) is None:
+                raise HttpError(HTTPStatus.BAD_REQUEST, "a LoRA in this request is not in the library")
+        profile = app.image_profile() if isinstance(request, GenerationRequest) else None
+        if getattr(request, "loras", ()) and profile is not None and not profile.loras:
+            raise HttpError(HTTPStatus.BAD_REQUEST, "this image model does not take LoRAs; they work with the 6B model")
         return app.jobs.submit(app.fit_to_model(request)).to_dict()
+
+    # ---------------------------------------------------------------- LoRA library
+
+    def library() -> LoraLibrary:
+        if app.loras is None:
+            raise HttpError(HTTPStatus.NOT_FOUND, "this engine has no LoRA library")
+        return app.loras
+
+    @route("GET", r"/api/loras")
+    def list_loras(h, m):
+        return {"items": library().list()}
+
+    @route("PATCH", r"/api/loras/(?P<id>[0-9a-f]{16})")
+    def rename_lora(h, m):
+        body = h.json_body()
+        try:
+            item = library().rename(m["id"], body.get("name") if isinstance(body, dict) else None)
+        except LoraLibraryError as exc:
+            raise HttpError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        if item is None:
+            raise HttpError(HTTPStatus.NOT_FOUND, "no such LoRA")
+        return item
+
+    @route("DELETE", r"/api/loras/(?P<id>[0-9a-f]{16})")
+    def delete_lora(h, m):
+        if not library().delete(m["id"]):
+            raise HttpError(HTTPStatus.NOT_FOUND, "no such LoRA")
+        return {"deleted": m["id"]}
+
+    # ---------------------------------------------------------------- training
+
+    def training() -> TrainingService:
+        if app.training is None:
+            raise HttpError(HTTPStatus.NOT_FOUND, "this engine cannot train")
+        return app.training
+
+    def trained(fn):
+        """Turn the service's user-facing errors into 400s (404 for things that do not exist)."""
+        def wrapper(h, m):
+            try:
+                return fn(h, m)
+            except TrainingError as exc:
+                missing = str(exc).startswith("No such")
+                raise HttpError(HTTPStatus.NOT_FOUND if missing else HTTPStatus.BAD_REQUEST, str(exc)) from exc
+            except LoraLibraryError as exc:
+                raise HttpError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        return wrapper
+
+    def busy(project_id: str) -> bool:
+        return any(j["kind"] == "task" and j["request"]["project"] == project_id
+                   and j["status"] in ("queued", "running") for j in app.jobs.list())
+
+    def submit_task(task: str, project_id: str, params: dict, label: str) -> dict:
+        if busy(project_id):
+            raise HttpError(HTTPStatus.CONFLICT, "this project already has a task queued or running")
+        return app.jobs.submit(TaskRequest(task=task, project=project_id, params=params, label=label)).to_dict()
+
+    @route("GET", r"/api/training/projects")
+    @trained
+    def list_projects(h, m):
+        return {"items": training().list()}
+
+    @route("POST", r"/api/training/projects")
+    @trained
+    def create_project(h, m):
+        body = h.json_body()
+        if not isinstance(body, dict):
+            raise HttpError(HTTPStatus.BAD_REQUEST, "expected {\"name\", \"photo_root\", \"subject\"?}")
+        return training().create(body.get("name"), body.get("photo_root"), body.get("subject"))
+
+    @route("GET", r"/api/training/subjects")
+    @trained
+    def list_subject_presets(h, m):
+        training()
+        return {"items": subject_presets()}
+
+    @route("GET", r"/api/training/projects/(?P<id>[0-9a-f]{16})")
+    @trained
+    def get_project(h, m):
+        return training().summary(m["id"])
+
+    @route("PUT", r"/api/training/projects/(?P<id>[0-9a-f]{16})/subject")
+    @trained
+    def set_subject(h, m):
+        body = h.json_body()
+        training().summary(m["id"])
+        if busy(m["id"]):
+            raise HttpError(HTTPStatus.CONFLICT, "stop this project's task first")
+        return training().set_subject(m["id"], body)
+
+    @route("DELETE", r"/api/training/projects/(?P<id>[0-9a-f]{16})")
+    @trained
+    def delete_project(h, m):
+        if busy(m["id"]):
+            raise HttpError(HTTPStatus.CONFLICT, "stop this project's task first")
+        training().delete(m["id"])
+        return {"deleted": m["id"]}
+
+    @route("POST", r"/api/training/projects/(?P<id>[0-9a-f]{16})/scan")
+    @trained
+    def scan_project(h, m):
+        h.json_body()
+        training().summary(m["id"])
+        return submit_task("training.scan", m["id"], {}, "Scanning photos")
+
+    @route("GET", r"/api/training/projects/(?P<id>[0-9a-f]{16})/captions")
+    @trained
+    def list_captions(h, m):
+        q = h.query()
+        try:
+            offset = max(0, int(q.get("offset", "0")))
+            limit = min(200, max(1, int(q.get("limit", "60"))))
+        except ValueError as exc:
+            raise HttpError(HTTPStatus.BAD_REQUEST, "offset and limit must be integers") from exc
+        return training().captions(m["id"], offset, limit, q.get("view", "all"))
+
+    @route("POST", r"/api/training/projects/(?P<id>[0-9a-f]{16})/captions/(?P<item>[0-9a-f]{16})")
+    @trained
+    def review_caption(h, m):
+        body = h.json_body()
+        if not isinstance(body, dict) or body.get("action") not in ("accept", "edit", "exclude"):
+            raise HttpError(HTTPStatus.BAD_REQUEST, "expected {\"action\": accept|edit|exclude, \"edits\"?}")
+        edits = body.get("edits")
+        if edits is not None and (not isinstance(edits, dict) or not all(isinstance(v, str) for v in edits.values())):
+            raise HttpError(HTTPStatus.BAD_REQUEST, "edits must map fields to text")
+        return training().review(m["id"], m["item"], body["action"], edits)
+
+    @route("POST", r"/api/training/projects/(?P<id>[0-9a-f]{16})/caption")
+    @trained
+    def caption_project(h, m):
+        h.json_body()
+        training().summary(m["id"])
+        captioner = app.jobs.backends.get("caption")
+        if captioner is None or not captioner.available():
+            raise HttpError(HTTPStatus.CONFLICT, "the captioning model is not installed")
+        return submit_task("training.caption", m["id"], {}, "Describing photos")
+
+    @route("POST", r"/api/training/projects/(?P<id>[0-9a-f]{16})/train")
+    @trained
+    def train_project(h, m):
+        params = training().train_params(h.json_body())
+        training().summary(m["id"])
+        return submit_task("training.train", m["id"], params, "Training")
+
+    @route("POST", r"/api/training/projects/(?P<id>[0-9a-f]{16})/compare")
+    @trained
+    def compare_project(h, m):
+        params = training().compare_params(m["id"], h.json_body())
+        return submit_task("training.compare", m["id"], params, "Comparing checkpoints")
+
+    @route("GET", r"/api/training/projects/(?P<id>[0-9a-f]{16})/runs/(?P<run>[0-9a-f]{12})/log")
+    @trained
+    def run_log(h, m):
+        return {"items": training().run_log(m["id"], m["run"])}
+
+    @route("POST", r"/api/training/projects/(?P<id>[0-9a-f]{16})/runs/(?P<run>[0-9a-f]{12})/use")
+    @trained
+    def use_checkpoint(h, m):
+        body = h.json_body()
+        if not isinstance(body, dict):
+            raise HttpError(HTTPStatus.BAD_REQUEST, "expected {\"step\", \"name\"}")
+        if app.loras is None:
+            raise HttpError(HTTPStatus.NOT_FOUND, "this engine has no LoRA library")
+        return training().use_checkpoint(m["id"], m["run"], body.get("step"), body.get("name"))
 
     @route("POST", r"/api/inputs")
     def post_input(h, m):
@@ -264,12 +466,71 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         folder = q.get("folder", "")
         if folder and not valid_id(folder):
             raise HttpError(HTTPStatus.BAD_REQUEST, "folder must be a folder id")
-        return app.gallery.list(offset=offset, limit=limit, query=q.get("q", "")[:200],
-                                favorites_only=q.get("favorites") == "1", media=media, folder=folder)
+        try:
+            return app.gallery.list(offset=offset, limit=limit, query=q.get("q", "")[:200],
+                                    favorites_only=q.get("favorites") == "1", media=media, folder=folder)
+        except FolderError as exc:
+            raise folder_http_error(exc) from exc
 
     @route("GET", r"/api/folders")
     def list_folders(h, m):
-        return {"items": app.gallery.list_folders()}
+        return {"items": app.gallery.list_folders(), "show_hidden": app.gallery.show_hidden}
+
+    def privacy_changed() -> None:
+        """Tell the window which folders' items just went out of (or came into) view."""
+        app.events.publish("privacy", {"show_hidden": app.gallery.show_hidden,
+                                       "blocked": app.gallery.blocked_folders()})
+
+    @route("PUT", r"/api/gallery/privacy")
+    def set_privacy(h, m):
+        body = h.json_body()
+        if not isinstance(body, dict) or set(body) != {"show_hidden"} or not isinstance(body["show_hidden"], bool):
+            raise HttpError(HTTPStatus.BAD_REQUEST, "expected {\"show_hidden\": true|false}")
+        app.gallery.set_show_hidden(body["show_hidden"])
+        privacy_changed()
+        return {"show_hidden": app.gallery.show_hidden}
+
+    @route("POST", r"/api/gallery/privacy/reset")
+    def reset_privacy(h, m):
+        h.json_body()
+        app.gallery.reset_privacy()
+        privacy_changed()
+        return {"show_hidden": False}
+
+    def folder_or_404(folder: dict[str, Any] | None) -> dict[str, Any]:
+        if folder is None:
+            raise HttpError(HTTPStatus.NOT_FOUND, "no such folder")
+        return folder
+
+    @route("POST", r"/api/folders/(?P<id>[0-9a-f]{16})/unlock")
+    def unlock_folder(h, m):
+        body = h.json_body()
+        try:
+            folder = app.gallery.unlock(m["id"], body.get("pin") if isinstance(body, dict) else None)
+        except FolderError as exc:
+            raise folder_http_error(exc) from exc
+        privacy_changed()
+        return folder_or_404(folder)
+
+    @route("POST", r"/api/folders/(?P<id>[0-9a-f]{16})/lock")
+    def lock_folder(h, m):
+        h.json_body()
+        folder = folder_or_404(app.gallery.lock_again(m["id"]))
+        privacy_changed()
+        return folder
+
+    @route("PUT", r"/api/folders/(?P<id>[0-9a-f]{16})/pin")
+    def set_folder_pin(h, m):
+        """{"pin": "123456"|null, "current": "654321"} sets, changes or (null) removes the PIN."""
+        body = h.json_body()
+        if not isinstance(body, dict) or "pin" not in body or set(body) - {"pin", "current"}:
+            raise HttpError(HTTPStatus.BAD_REQUEST, "expected {\"pin\": <six digits>|null, \"current\": <six digits>}")
+        try:
+            folder = app.gallery.set_pin(m["id"], body["pin"], body.get("current"))
+        except FolderError as exc:
+            raise folder_http_error(exc) from exc
+        privacy_changed()
+        return folder_or_404(folder)
 
     @route("POST", r"/api/folders")
     def create_folder(h, m):
@@ -280,19 +541,25 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             raise HttpError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
 
     @route("PATCH", r"/api/folders/(?P<id>[0-9a-f]{16})")
-    def rename_folder(h, m):
+    def patch_folder(h, m):
+        """{"name": ...} renames; {"hidden": true|false} hides or shows."""
         body = h.json_body()
+        if isinstance(body, dict) and set(body) == {"hidden"} and isinstance(body["hidden"], bool):
+            folder = folder_or_404(app.gallery.set_hidden(m["id"], body["hidden"]))
+            privacy_changed()
+            return folder
         try:
             folder = app.gallery.rename_folder(m["id"], body.get("name") if isinstance(body, dict) else None)
         except FolderError as exc:
-            raise HttpError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
-        if folder is None:
-            raise HttpError(HTTPStatus.NOT_FOUND, "no such folder")
-        return folder
+            raise folder_http_error(exc) from exc
+        return folder_or_404(folder)
 
     @route("DELETE", r"/api/folders/(?P<id>[0-9a-f]{16})")
     def delete_folder(h, m):
-        moved = app.gallery.delete_folder(m["id"])
+        try:
+            moved = app.gallery.delete_folder(m["id"])
+        except FolderError as exc:
+            raise folder_http_error(exc) from exc
         if moved is None:
             raise HttpError(HTTPStatus.NOT_FOUND, "no such folder")
         return {"deleted": m["id"], "moved": moved}
@@ -527,6 +794,31 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _training_photo(self, project_id: str, item_id: str) -> None:
+            """A small WebP of one indexed training photo, made once and kept with the project."""
+            if app.training is None:
+                raise HttpError(HTTPStatus.NOT_FOUND, "not found")
+            try:
+                source = app.training.photo_path(project_id, item_id)
+            except TrainingError:
+                source = None
+            if source is None or not source.is_file():
+                raise HttpError(HTTPStatus.NOT_FOUND, "not found")
+            thumb = app.training.root / project_id / "thumbs" / f"{item_id}.webp"
+            if not thumb.is_file():
+                try:
+                    with Image.open(source) as img:
+                        img.draft("RGB", (TRAINING_THUMB_SIDE * 2, TRAINING_THUMB_SIDE * 2))
+                        small = ImageOps.exif_transpose(img).convert("RGB")
+                        small.thumbnail((TRAINING_THUMB_SIDE, TRAINING_THUMB_SIDE), Image.Resampling.LANCZOS)
+                except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
+                    raise HttpError(HTTPStatus.NOT_FOUND, "not found") from exc
+                thumb.parent.mkdir(exist_ok=True)
+                tmp = thumb.with_suffix(".tmp")
+                small.save(tmp, "WEBP", quality=80)
+                tmp.replace(thumb)
+            return self._send_file(thumb, "image/webp", "private, max-age=3600")
+
         def _send_file(self, path: Path, content_type: str, cache: str) -> None:
             """Send a file, or the one byte range asked for: a video player seeks with ranges."""
             size = path.stat().st_size
@@ -569,6 +861,9 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
 
         def _media(self, path: str) -> None:
             immutable = "private, max-age=31536000, immutable"
+            match = TRAINING_PHOTO.match(path)
+            if match:
+                return self._training_photo(match[1], match[2])
             match = re.match(r"^/inputs/([0-9a-f]{16})\.png$", path)
             if match:
                 file = app.gallery.input_path(match[1])

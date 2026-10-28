@@ -5,6 +5,7 @@ import type { RiskClass } from './tools.js'
 import type { EngineToMain } from './engine-protocol.js'
 import type { ApprovalRequest, ApprovalResponse, AuditEntry, ToolOutcome } from './broker-types.js'
 import type { ImageApi } from './image.js'
+import type { TrainingApi } from './training.js'
 import type { WorkspaceSnapshot, WorkspaceState } from './workspace.js'
 import type { InternetLevel, NetworkLogEntry } from './network.js'
 
@@ -93,6 +94,9 @@ export interface RendererApi {
 
   /** The image side. Every operation goes through the main process (decisions S3). */
   image: ImageApi
+
+  /** Training LoRAs on the image engine, and the LoRA library (docs/training.md). */
+  training: TrainingApi
 }
 
 declare global {
