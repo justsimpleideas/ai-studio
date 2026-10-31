@@ -9,6 +9,8 @@ interface Props {
   videos: ImageRecord[];
   onOpen: (video: ImageRecord, list: ImageRecord[]) => void;
   onCancel: (job: Job) => void;
+  onQueue: () => void;
+  waiting: number;
   modelMessage: string;
   starting: boolean;
   display: ResultDisplay;
@@ -36,7 +38,7 @@ export function VideoPlayer({ video, controls = true }: { video: ImageRecord; co
   );
 }
 
-export function VideoPreview({ job, videos, onOpen, onCancel, modelMessage, starting, display }: Props) {
+export function VideoPreview({ job, videos, onOpen, onCancel, onQueue, waiting, modelMessage, starting, display }: Props) {
   const latest = videos[0] ?? null;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // With results off, the stage shows only what is picked from the strip.
@@ -79,7 +81,7 @@ export function VideoPreview({ job, videos, onOpen, onCancel, modelMessage, star
             </p>
           </div>
         )}
-        {job && <Progress job={job} modelMessage={modelMessage} onCancel={() => onCancel(job)} />}
+        {job && <Progress job={job} modelMessage={modelMessage} onCancel={() => onCancel(job)} onQueue={onQueue} waiting={waiting} />}
       </div>
       {display.showStrip && videos.length > 0 && (
         <div className="filmstrip" aria-label="Videos this session">

@@ -1,4 +1,4 @@
-import type { EngineModelKind, GalleryQuery, GenerationRequest, GifOptions, ImageSettings, MediaKind, VideoRequest } from '@shared/image.js'
+import type { EngineModelKind, GalleryQuery, GenerationRequest, GifOptions, ImageSettings, MediaKind, SaveManyOptions, VideoRequest } from '@shared/image.js'
 import type { ImportOptions, ImportTarget } from '@shared/importing.js'
 import type { ModelId } from '@shared/setup.js'
 import type { Subject } from '@shared/subject.js'
@@ -37,6 +37,7 @@ export const api = {
   uploadStartImage: (data: Uint8Array) => call(() => image().uploadStartImage(data)),
   startImageFrom: (id: string, frame: 'image' | 'last') => call(() => image().startImageFrom(id, frame)),
   cancel: (id: string) => call(() => image().cancel(id)),
+  updateJob: (id: string, request: GenerationRequest | VideoRequest) => call(() => image().updateJob(id, request)),
   jobs: () => call(() => image().jobs()),
   gallery: (query: GalleryQuery) => call(() => image().gallery(query)),
   setFavorite: (id: string, favorite: boolean) => call(() => image().setFavorite(id, favorite)),
@@ -46,6 +47,8 @@ export const api = {
   renameFolder: (id: string, name: string) => call(() => image().renameFolder(id, name)),
   deleteFolder: (id: string) => call(() => image().deleteFolder(id)),
   moveToFolder: (id: string, folderId: string | null) => call(() => image().moveToFolder(id, folderId)),
+  moveManyToFolder: (ids: string[], folderId: string | null) => call(() => image().moveManyToFolder(ids, folderId)),
+  reorderFolder: (id: string, before: string | null) => call(() => image().reorderFolder(id, before)),
   setFolderHidden: (id: string, hidden: boolean) => call(() => image().setFolderHidden(id, hidden)),
   setFolderPin: (id: string, pin: string | null, current: string | null) =>
     call(() => image().setFolderPin(id, pin, current)),
@@ -59,6 +62,7 @@ export const api = {
   showHiddenFolders: () => call(() => image().showHiddenFolders()),
   setShowHiddenFolders: (show: boolean) => call(() => image().setShowHiddenFolders(show)),
   saveImageAs: (id: string) => call(() => image().saveImageAs(id)),
+  saveManyTo: (ids: string[], options: SaveManyOptions) => call(() => image().saveManyTo(ids, options)),
   saveAsGif: (id: string, options: GifOptions) => call(() => image().saveAsGif(id, options)),
   includeSettingsInExports: () => call(() => image().includeSettingsInExports()),
   setIncludeSettingsInExports: (value: boolean) => call(() => image().setIncludeSettingsInExports(value)),
@@ -68,6 +72,7 @@ export const api = {
   start: () => call(() => image().start()),
   installEngine: () => call(() => image().installEngine()),
   cancelInstall: () => call(() => image().cancelInstall()),
+  hardware: () => call(() => image().hardware()),
   modelsFolder: () => call(() => image().modelsFolder()),
   chooseModelsFolder: () => call(() => image().chooseModelsFolder()),
   downloadModel: (id: ModelId) => call(() => image().downloadModel(id)),

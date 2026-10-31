@@ -13,6 +13,13 @@ export interface Folders {
   rename(id: string, name: string): Promise<GalleryFolder>
   remove(id: string): Promise<void>
   move(itemId: string, folderId: string | null): Promise<ImageRecord>
+  /** Several items at once (the gallery's multi-select); resolves to the ones moved. */
+  moveMany(itemIds: string[], folderId: string | null): Promise<ImageRecord[]>
+  /**
+   * Put a folder just before `before` in the list (last with null). The list is
+   * shown in its new order at once, and the engine keeps it (gallery.py).
+   */
+  reorder(id: string, before: string | null): Promise<void>
   setHidden(id: string, hidden: boolean): Promise<GalleryFolder>
   /** Set, change or (pin null) remove a PIN; `current` is needed once the folder has one. */
   setPin(id: string, pin: string | null, current: string | null): Promise<GalleryFolder>
@@ -31,7 +38,6 @@ export function useFolders(enabled: boolean, privacyVersion = 0): Folders {
   const [list, setList] = useState<GalleryFolder[]>([])
   const [loaded, setLoaded] = useState(false)
   const [version, setVersion] = useState(0)
-
   const refresh = useCallback(async () => {
     try {
       setList(await api.folders())
@@ -65,6 +71,14 @@ export function useFolders(enabled: boolean, privacyVersion = 0): Folders {
       await after(() => api.deleteFolder(id))()
     },
     move: (itemId, folderId) => after(() => api.moveToFolder(itemId, folderId))(),
+    moveMany: (itemIds, folderId) => after(() => api.moveManyToFolder(itemIds, folderId))(),
+    // The answer is the list in its new order, so the move is on screen at once;
+    // then a read, as every other action ends in, has the last word. `version` is
+    // left alone: no item changed folder, so no gallery view needs reloading.
+    reorder: async (id, before) => {
+      setList(await api.reorderFolder(id, before))
+      await refresh()
+    },
     setHidden: (id, hidden) => after(() => api.setFolderHidden(id, hidden))(),
     setPin: (id, pin, current) => after(() => api.setFolderPin(id, pin, current))(),
     unlock: (id, pin) => after(() => api.unlockFolder(id, pin))(),

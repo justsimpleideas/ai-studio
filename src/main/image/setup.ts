@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
+import type { HardwareInfo } from '@shared/hardware.js'
 import {
   PYTHON_PROBE,
   VERIFY_SCRIPT,
@@ -13,6 +15,7 @@ import {
   pythonProblem,
   torchInstallArgs,
   type EngineSetupState,
+  type GpuInfo,
   type PipSource,
   type PythonProbe
 } from '@shared/setup.js'
@@ -70,6 +73,38 @@ export const runProcess: Runner = (command, args, options = {}) =>
       resolve({ code, stdout })
     })
   })
+
+/** The GPU the engine would use, as nvidia-smi reports it; null if it did not answer. */
+export async function detectGpu(run: Runner, signal?: AbortSignal): Promise<GpuInfo | null> {
+  const result = await run(
+    'nvidia-smi',
+    ['--query-gpu=name,memory.total,driver_version', '--format=csv,noheader,nounits'],
+    signal ? { signal } : {}
+  )
+  if (result.code !== 0) return null
+  const gpus = parseNvidiaSmi(result.stdout)
+  // The engine uses the first CUDA device; with several, the largest is the likeliest one meant.
+  return gpus.sort((a, b) => b.memoryMiB - a.memoryMiB)[0] ?? null
+}
+
+/**
+ * The GPU and RAM, for the download list's recommendations (shared/hardware.ts). A
+ * GPU once found is kept; not finding one is asked again next time, in case a
+ * driver was installed meanwhile.
+ */
+export class HardwareProbe {
+  private gpu: GpuInfo | null = null
+
+  constructor(
+    private readonly run: Runner = runProcess,
+    private readonly totalRam: () => number = os.totalmem
+  ) {}
+
+  async info(): Promise<HardwareInfo> {
+    if (!this.gpu) this.gpu = await detectGpu(this.run)
+    return { gpu: this.gpu, ramBytes: this.totalRam() }
+  }
+}
 
 export interface EngineSetupOptions {
   /** Where the environment is created. */
@@ -201,17 +236,10 @@ export class EngineSetup {
     )
   }
 
-  private async findGpu(signal: AbortSignal) {
-    const result = await this.run(
-      'nvidia-smi',
-      ['--query-gpu=name,memory.total,driver_version', '--format=csv,noheader,nounits'],
-      { signal }
-    )
+  private async findGpu(signal: AbortSignal): Promise<GpuInfo | null> {
+    const gpu = await detectGpu(this.run, signal)
     if (signal.aborted) throw new SetupStopped()
-    if (result.code !== 0) return null
-    const gpus = parseNvidiaSmi(result.stdout)
-    // The engine uses the first CUDA device; with several, the largest is the likeliest one meant.
-    return gpus.sort((a, b) => b.memoryMiB - a.memoryMiB)[0] ?? null
+    return gpu
   }
 
   private async works(python: string, signal: AbortSignal): Promise<boolean> {

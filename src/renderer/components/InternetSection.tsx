@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
-import { INTERNET_LEVELS, SEARCH_HOST, type InternetLevel, type NetworkLogEntry } from '@shared/network.js'
+import { INTERNET_LEVELS, type InternetLevel, type NetworkLogEntry } from '@shared/network.js'
+import { DEFAULT_SEARCH, SEARCH_PROVIDERS, searchProvider, type SearchPreferences, type SearchProviderId } from '@shared/search.js'
 import { cleanError } from '../image/api.js'
 
 /**
@@ -46,15 +47,25 @@ export function InternetSection({
   const [hasKey, setHasKey] = useState<boolean | null>(null)
   const [keyDraft, setKeyDraft] = useState('')
   const [keyError, setKeyError] = useState<string | null>(null)
+  const [search, setSearch] = useState<SearchPreferences>(DEFAULT_SEARCH)
+  const [urlDraft, setUrlDraft] = useState('')
+  const [searchError, setSearchError] = useState<string | null>(null)
   const [log, setLog] = useState<NetworkLogEntry[]>([])
 
   const refreshLog = useCallback(() => void window.api.internet.log().then(setLog), [])
+  const refreshKey = useCallback(() => void window.api.internet.keyStatus().then((s) => setHasKey(s.hasKey)), [])
 
   useEffect(() => {
-    void window.api.internet.keyStatus().then((s) => setHasKey(s.hasKey))
+    void window.api.getConfig().then((c) => {
+      setSearch(c.search)
+      setUrlDraft(c.search.searxngUrl ?? '')
+    })
+    refreshKey()
     refreshLog()
     return window.api.internet.onLogChanged(refreshLog)
-  }, [refreshLog])
+  }, [refreshKey, refreshLog])
+
+  useEffect(() => window.api.onConfigChanged((c) => setSearch(c.search)), [])
 
   const choose = (next: InternetLevel): void => {
     if (next === level) return
@@ -72,6 +83,33 @@ export function InternetSection({
       setKeyError(cleanError(err).message)
     }
   }
+
+  // Each service keeps its own key, so the status is re-read after a switch.
+  const saveSearch = async (prefs: SearchPreferences): Promise<void> => {
+    setSearchError(null)
+    setKeyError(null)
+    try {
+      const config = await window.api.internet.setSearch(prefs)
+      setSearch(config.search)
+      setKeyDraft('')
+      refreshKey()
+    } catch (err) {
+      setSearchError(cleanError(err).message)
+    }
+  }
+
+  const chooseProvider = (provider: SearchProviderId): void => {
+    if (provider === search.provider) return
+    // SearXNG is only switched to once its address is known; the choice waits on Save.
+    if (provider === 'searxng' && !search.searxngUrl) {
+      setSearch({ ...search, provider })
+      return
+    }
+    void saveSearch({ ...search, provider })
+  }
+
+  const provider = searchProvider(search.provider)
+  const searxngPending = search.provider === 'searxng' && urlDraft.trim() !== (search.searxngUrl ?? '')
 
   return (
     <section className="internet">
@@ -99,28 +137,84 @@ export function InternetSection({
       </div>
 
       {level !== 'offline' ? (
-        <div className="row key-row">
-          <div className="grow">
-            <strong>Search key</strong>
-            <div className="help" style={{ margin: 0 }}>
-              Web search sends queries to the search API at {SEARCH_HOST}, which needs a key of your own.
-              It is stored encrypted by the operating system and never shown again.{' '}
-              {hasKey ? <span className="ok-text">A key is set.</span> : <span className="warn-text">No key set: searches will fail.</span>}
+        <div className="search-setup">
+          <div className="row key-row">
+            <div className="grow">
+              <strong>Search service</strong>
+              <div className="help" style={{ margin: 0 }}>
+                Where web_search queries go. Only the query is sent, whichever service is chosen; every query is still checked,
+                shown to you first and logged. {provider.about}
+              </div>
+              {searchError ? <div className="error-text">{searchError}</div> : null}
             </div>
-            {keyError ? <div className="error-text">{keyError}</div> : null}
+            <select
+              aria-label="Search service"
+              value={search.provider}
+              onChange={(e) => chooseProvider(e.target.value as SearchProviderId)}
+            >
+              {SEARCH_PROVIDERS.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
           </div>
-          <input
-            type="password"
-            value={keyDraft}
-            placeholder={hasKey ? 'Replace key' : 'Paste key'}
-            aria-label="Search API key"
-            autoComplete="off"
-            onChange={(e) => setKeyDraft(e.target.value)}
-          />
-          <button className="primary" disabled={!keyDraft.trim()} onClick={() => void saveKey(keyDraft)}>
-            Save
-          </button>
-          {hasKey ? <button onClick={() => void saveKey(null)}>Remove</button> : null}
+
+          {search.provider === 'searxng' ? (
+            <div className="row key-row">
+              <div className="grow">
+                <strong>SearXNG address</strong>
+                <div className="help" style={{ margin: 0 }}>
+                  The base address of your instance, for example http://localhost:8080.{' '}
+                  {search.searxngUrl ? (
+                    <span className="ok-text">Using {search.searxngUrl}</span>
+                  ) : (
+                    <span className="warn-text">No address set: searches will fail.</span>
+                  )}
+                </div>
+              </div>
+              <input
+                type="url"
+                value={urlDraft}
+                placeholder="http://localhost:8080"
+                aria-label="SearXNG address"
+                autoComplete="off"
+                onChange={(e) => setUrlDraft(e.target.value)}
+              />
+              <button
+                className="primary"
+                disabled={!urlDraft.trim() || !searxngPending}
+                onClick={() => void saveSearch({ provider: 'searxng', searxngUrl: urlDraft.trim() })}
+              >
+                Save
+              </button>
+            </div>
+          ) : null}
+
+          {provider.needsKey ? (
+            <div className="row key-row">
+              <div className="grow">
+                <strong>{provider.name} key</strong>
+                <div className="help" style={{ margin: 0 }}>
+                  Stored encrypted by the operating system and never shown again.{' '}
+                  {hasKey ? <span className="ok-text">A key is set.</span> : <span className="warn-text">No key set: searches will fail.</span>}
+                </div>
+                {keyError ? <div className="error-text">{keyError}</div> : null}
+              </div>
+              <input
+                type="password"
+                value={keyDraft}
+                placeholder={hasKey ? 'Replace key' : 'Paste key'}
+                aria-label="Search API key"
+                autoComplete="off"
+                onChange={(e) => setKeyDraft(e.target.value)}
+              />
+              <button className="primary" disabled={!keyDraft.trim()} onClick={() => void saveKey(keyDraft)}>
+                Save
+              </button>
+              {hasKey ? <button onClick={() => void saveKey(null)}>Remove</button> : null}
+            </div>
+          ) : null}
         </div>
       ) : null}
 

@@ -88,6 +88,22 @@ describe('Broker', () => {
     expect(audit.at(-1)?.decision).toBe('refused')
   })
 
+  it('refuses to read a file that is a hard link, since its other name may be outside', async () => {
+    // Resolving follows junctions, not hard links: the shared name resolves
+    // to itself, inside the root, while the contents are the private file's.
+    fs.linkSync(path.join(outside, 'secret.txt'), path.join(shared, 'innocent.txt'))
+    const outcome = await broker.execute(
+      call({ name: 'read_file', args: { path: path.join(shared, 'innocent.txt') } })
+    )
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.refused).toBe(true)
+      expect(outcome.error).toContain('hard link')
+    }
+    expect(prompt).not.toHaveBeenCalled()
+    expect(audit.at(-1)?.decision).toBe('refused')
+  })
+
   it('asks before reading, and reads once approved', async () => {
     const outcome = await broker.execute(
       call({ name: 'read_file', args: { path: path.join(shared, 'notes.txt') } })

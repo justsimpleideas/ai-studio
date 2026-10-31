@@ -139,6 +139,28 @@ class ServerTests(unittest.TestCase):
         status, _, _ = self.request("POST", "/api/jobs/0123456789abcdef/cancel", {})
         self.assertEqual(status, 404)
 
+    def test_change_a_queued_job(self):
+        self.backend.step_gate = threading.Event()
+        try:
+            _, busy, _ = self.request("POST", "/api/jobs", {"prompt": "a cat", "width": 256, "height": 256, "steps": 3})
+            _, queued, _ = self.request("POST", "/api/jobs", {"prompt": "a dog", "width": 256, "height": 256})
+            status, body, _ = self.request("PUT", f"/api/jobs/{queued['id']}", {"prompt": "x", "width": 1000})
+            self.assertEqual(status, 400)
+            self.assertIn("multiple of 16", body["error"])
+            status, body, _ = self.request("PUT", f"/api/jobs/{queued['id']}", {"prompt": "a horse", "width": 512, "height": 256})
+            self.assertEqual(status, 200, body)
+            self.assertEqual((body["id"], body["request"]["prompt"], body["request"]["width"]), (queued["id"], "a horse", 512))
+            status, _, _ = self.request("PUT", "/api/jobs/0123456789abcdef", {"prompt": "x"})
+            self.assertEqual(status, 404)
+        finally:
+            self.backend.step_gate.set()
+            self.backend.step_gate = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and self.request("GET", f"/api/jobs/{queued['id']}")[1]["status"] != "done":
+            time.sleep(0.02)
+        status, body, _ = self.request("PUT", f"/api/jobs/{queued['id']}", {"prompt": "too late"})
+        self.assertEqual(status, 409)
+
     def test_settings_roundtrip_and_validation(self):
         status, body, _ = self.request("PUT", "/api/settings", {"memory_mode": "balanced"})
         self.assertEqual(status, 200)

@@ -57,11 +57,11 @@ export function ModelInspectPanel({ enabled }: { enabled: boolean }): React.JSX.
         computer only. Scanning the file for malware, for example with Microsoft Defender, is up to you.
       </p>
       <div className="row-gap">
-        <button disabled={!enabled || busy} onClick={() => void inspect()}>
+        <button disabled={busy} onClick={() => void inspect()}>
           Choose a file…
         </button>
         {busy && <button onClick={() => void api.cancelInspect()}>Stop</button>}
-        {!enabled && <span className="hint">Available once the engine is running: the check uses its Python.</span>}
+        {!enabled && <span className="hint">GGUF files are checked by the studio itself; other formats need the engine running, since that check uses its Python.</span>}
       </div>
       {error && <div className="error-text small">{error}</div>}
       {busy && <Progress state={state} />}
@@ -91,7 +91,7 @@ function Progress({ state }: { state: ModelInspectState }): React.JSX.Element {
   )
 }
 
-function Report({ report }: { report: InspectReport }): React.JSX.Element {
+export function Report({ report }: { report: InspectReport }): React.JSX.Element {
   const [pasted, setPasted] = useState('')
   const [copied, setCopied] = useState(false)
   const comparison = compareSha256(report.sha256, pasted)
@@ -116,6 +116,41 @@ function Report({ report }: { report: InspectReport }): React.JSX.Element {
         </div>
       </div>
       <div className={`strong ${verdict.className}`}>{verdict.text}</div>
+
+      {report.gguf ? (
+        <dl className="gguf-facts">
+          <dt>Model</dt>
+          <dd>
+            {report.gguf.name ?? '(no name)'}
+            {report.gguf.architecture ? ` · ${report.gguf.architecture}` : ''}
+            {report.gguf.layers ? ` · ${report.gguf.layers} layers` : ''}
+            {report.gguf.experts ? ` · ${report.gguf.experts.total} experts, ${report.gguf.experts.active} per token` : ''}
+          </dd>
+          <dt>Weights</dt>
+          <dd>
+            {report.gguf.fileType ?? 'unknown format'}
+            {report.gguf.quantizedBy ? `, quantized by ${report.gguf.quantizedBy}` : ''} · GGUF v{report.gguf.version}
+          </dd>
+          <dt>Context</dt>
+          <dd>{report.gguf.contextLength ? `${report.gguf.contextLength.toLocaleString()} tokens` : 'not recorded'}</dd>
+          <dt>Vocabulary</dt>
+          <dd>{report.gguf.tokens ? `${report.gguf.tokens.toLocaleString()} tokens` : 'none'}</dd>
+          <dt>Origin</dt>
+          <dd>
+            {[report.gguf.license ? `license ${report.gguf.license}` : null, report.gguf.sourceUrl].filter(Boolean).join(' · ') ||
+              'not recorded'}
+          </dd>
+          <dt>Chat template</dt>
+          <dd>
+            {report.gguf.template
+              ? (() => {
+                  const notable = report.gguf.template.flags.filter((f) => f.level !== 'info').length
+                  return `${report.gguf.template.chars.toLocaleString()} characters${notable ? `, ${notable} thing${notable > 1 ? 's' : ''} worth a look (below)` : ', nothing odd'}`
+                })()
+              : 'none in the file'}
+          </dd>
+        </dl>
+      ) : null}
 
       <div className="field">
         <span className="field-label">
@@ -164,6 +199,13 @@ function Report({ report }: { report: InspectReport }): React.JSX.Element {
           </li>
         ))}
       </ul>
+
+      {report.gguf?.template ? (
+        <details>
+          <summary className="small">Chat template ({report.gguf.template.chars.toLocaleString()} characters)</summary>
+          <pre className="template-source">{report.gguf.template.text}</pre>
+        </details>
+      ) : null}
 
       {report.metadata.length > 0 && (
         <details>

@@ -27,6 +27,11 @@ export interface ImageEngineOptions {
   /** Folder containing the `image_engine` package. */
   engineDir: string
   dataDir: string
+  /**
+   * The gallery folder, when the user has moved it off `dataDir/outputs`.
+   * Read at every start, so changing it takes effect on the next one.
+   */
+  outputsDir: () => string | null
   port: number
   /** `image_engine`, or `tests.ui_harness` for end-to-end tests. */
   module: string
@@ -137,10 +142,13 @@ export class ImageEngine {
     this.stderrTail = ''
     this.setState({ state: 'starting' })
 
-    const { python, engineDir, dataDir, port, module, appVersion } = this.options
+    const { python, engineDir, dataDir, outputsDir, port, module, appVersion } = this.options
+    const outputs = outputsDir()
+    const args = ['-m', module, '--data-dir', dataDir, '--port', String(port), '--watch-stdin']
+    if (outputs) args.push('--outputs-dir', outputs)
     let child: ChildProcess
     try {
-      child = spawn(python(), ['-m', module, '--data-dir', dataDir, '--port', String(port), '--watch-stdin'], {
+      child = spawn(python(), args, {
         cwd: engineDir,
         env: {
           ...process.env,

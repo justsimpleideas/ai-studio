@@ -18,3 +18,27 @@ export function kvCacheOptions(kv: KvCacheType): {
   }
   return {}
 }
+
+/**
+ * The same choice, given to the model load.
+ *
+ * How many layers go on the GPU is decided when the weights are loaded, by
+ * fitting the context next to them, and that fit sizes the context with the
+ * model's defaults. Given only to the context, an 8-bit cache would still be
+ * planned for as 16-bit: half its room on the GPU left unused instead of
+ * holding more layers.
+ */
+export function kvModelOptions(kv: KvCacheType): {
+  defaultContextFlashAttention?: true
+  experimentalDefaultContextKvCacheKeyType?: 'Q8_0'
+  experimentalDefaultContextKvCacheValueType?: 'Q8_0'
+} {
+  if (kv === 'q8_0') {
+    return {
+      defaultContextFlashAttention: true,
+      experimentalDefaultContextKvCacheKeyType: 'Q8_0',
+      experimentalDefaultContextKvCacheValueType: 'Q8_0'
+    }
+  }
+  return {}
+}

@@ -32,7 +32,8 @@ import type { ModelImporter } from './importer.js'
 import type { ModelInspector } from './inspect.js'
 import type { ImageEngine } from './engine.js'
 import { withoutPngMetadata } from './png-metadata.js'
-import type { EngineSetup } from './setup.js'
+import { parseSaveManyOptions, promptText, requireIds, safeFileName, writeUnique } from './export-many.js'
+import type { EngineSetup, HardwareProbe } from './setup.js'
 
 /**
  * The window's image and video operations, each a named handler.
@@ -52,6 +53,8 @@ interface Deps {
   gpu: GpuArbiter
   getWindow: () => BrowserWindow | null
   setup: EngineSetup
+  /** The GPU and RAM, for recommending downloads that fit them. */
+  hardware: HardwareProbe
   downloads: ModelDownloads
   inspector: ModelInspector
   importer: ModelImporter
@@ -100,6 +103,7 @@ export function registerImageHandlers({
   gpu,
   getWindow,
   setup,
+  hardware,
   downloads,
   inspector,
   importer,
@@ -177,6 +181,12 @@ export function registerImageHandlers({
 
   ipcMain.handle('image:cancel', (_e, id: unknown) => api('POST', `/api/jobs/${requireId(id)}/cancel`, {}))
 
+  // The engine checks the request as it checks a new one, and that it is the job's kind.
+  ipcMain.handle('image:updateJob', (_e, id: unknown, request: unknown) => {
+    if (!request || typeof request !== 'object') throw new Error('Invalid request.')
+    return api('PUT', `/api/jobs/${requireId(id)}`, request)
+  })
+
   ipcMain.handle('image:jobs', async () => ((await api('GET', '/api/jobs')) as { items: ImageJob[] }).items)
 
   ipcMain.handle('image:gallery', async (_e, query: GalleryQuery) => {
@@ -220,9 +230,25 @@ export function registerImageHandlers({
 
   ipcMain.handle('image:deleteFolder', (_e, id: unknown) => api('DELETE', `/api/folders/${requireId(id)}`))
 
+  // Dragging a folder into a new place in the list. Only the order changes: no item
+  // changes folder, so this is not the same as moveToFolder below.
+  ipcMain.handle('image:reorderFolder', async (_e, id: unknown, before: unknown) => {
+    const target = before === null ? null : requireId(before)
+    const answer = (await api('POST', `/api/folders/${requireId(id)}/order`, { before: target })) as {
+      items: GalleryFolder[]
+    }
+    return answer.items
+  })
+
   ipcMain.handle('image:moveToFolder', async (_e, id: unknown, folderId: unknown) => {
     const folder = folderId === null ? null : requireId(folderId)
     return rewriteRecord((await api('PATCH', `/api/gallery/${requireId(id)}`, { folder })) as ImageRecord)
+  })
+
+  ipcMain.handle('image:moveManyToFolder', async (_e, ids: unknown, folderId: unknown) => {
+    const folder = folderId === null ? null : requireId(folderId)
+    const answer = (await api('POST', '/api/gallery/folder', { ids: requireIds(ids), folder })) as { items: ImageRecord[] }
+    return answer.items.map(rewriteRecord)
   })
 
   // Hidden and locked folders. The engine keeps what this session has shown or unlocked in
@@ -334,6 +360,39 @@ export function registerImageHandlers({
     const out = store.get().image.includeSettingsInExports ? png : withoutPngMetadata(png)
     await fsp.writeFile(target, out)
     return target
+  })
+
+  // The gallery's multi-select: copies of several items into one folder, as "Save as" makes
+  // them (prompt and settings left out of PNGs unless asked for), never over an existing file.
+  ipcMain.handle('image:saveManyTo', async (_e, ids: unknown, options: unknown) => {
+    const list = requireIds(ids)
+    const opts = parseSaveManyOptions(options)
+    const folder = await pickOpenPath('STUDIO_PICK_EXPORT_FOLDER', {
+      title: list.length === 1 ? 'Choose a folder to save it in' : `Choose a folder to save ${list.length} items in`,
+      properties: ['openDirectory', 'createDirectory']
+    })
+    if (!folder) return null
+    let saved = 0
+    let failed = 0
+    for (const imageId of list) {
+      try {
+        const record = (await api('GET', `/api/gallery/${imageId}`)) as ImageRecord
+        const video = isVideo(record)
+        const response = await imageEngine.raw('GET', video ? `/videos/${imageId}` : `/images/${imageId}.png`)
+        if (!response.ok) throw new Error('unreadable')
+        const bytes = Buffer.from(await response.arrayBuffer())
+        const name = safeFileName(record.file_name, `${imageId}.${video ? (record.mime === 'video/mp4' ? 'mp4' : 'webp') : 'png'}`)
+        const written = await writeUnique(folder, name, video || opts.includeSettings ? bytes : withoutPngMetadata(bytes))
+        if (opts.promptFiles) {
+          const file = path.basename(written)
+          await writeUnique(folder, `${file.slice(0, file.length - path.extname(file).length)}.txt`, promptText(record))
+        }
+        saved++
+      } catch {
+        failed++
+      }
+    }
+    return { folder, saved, failed }
   })
 
   ipcMain.handle('image:saveAsGif', async (_e, id: unknown, options: unknown) => {
@@ -458,6 +517,8 @@ export function registerImageHandlers({
   ipcMain.handle('image:cancelInstall', () => setup.cancel())
 
   ipcMain.handle('image:downloadState', () => downloads.state)
+
+  ipcMain.handle('image:hardware', () => hardware.info())
 
   const modelsFolder = (): string => store.get().image.modelsFolder ?? defaultModelsFolder
 

@@ -77,8 +77,8 @@ describe('checking Python and the GPU', () => {
   })
 
   it('reads every GPU nvidia-smi lists', () => {
-    expect(parseNvidiaSmi('NVIDIA GeForce RTX 5070 Ti Laptop GPU, 12227, 580.97\r\nNVIDIA RTX A2000, 6138, 580.97\r\n')).toEqual([
-      { name: 'NVIDIA GeForce RTX 5070 Ti Laptop GPU', memoryMiB: 12227, driver: '580.97' },
+    expect(parseNvidiaSmi('NVIDIA GeForce RTX 4070, 12282, 580.97\r\nNVIDIA RTX A2000, 6138, 580.97\r\n')).toEqual([
+      { name: 'NVIDIA GeForce RTX 4070', memoryMiB: 12282, driver: '580.97' },
       { name: 'NVIDIA RTX A2000', memoryMiB: 6138, driver: '580.97' }
     ])
     expect(parseNvidiaSmi('NVIDIA-SMI has failed because it could not communicate with the NVIDIA driver.')).toEqual([])
@@ -425,6 +425,7 @@ describe('the engine while its environment is installed', () => {
       python: () => 'no-such-python-for-this-test',
       engineDir: dir,
       dataDir: dir,
+      outputsDir: () => null,
       port: 1,
       module: 'image_engine',
       appVersion: '0',

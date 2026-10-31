@@ -1,8 +1,8 @@
 # Local AI Studio
 
 A local-first desktop studio for running AI models on your own computer: an agent that
-works inside your project folders using GGUF language models, and an image and video
-generator.
+works inside your project folders using GGUF language models (llama.cpp, built in or as
+llama-server), and an image and video generator. Made to run well on a 12 GB GPU.
 No cloud model, no account, no telemetry.
 
 - **Agent per folder.** Open a folder and it becomes a workspace: the agent's working
@@ -13,10 +13,22 @@ No cloud model, no account, no telemetry.
   reach or change, no edits to files it has not read, a brake on runaway deletes, and a
   change history that can put back any reply's changes. All enforced by the one component
   that touches the disk, whatever the model says.
+- **Big models on a small GPU.** A mixture-of-experts model bigger than the GPU runs with
+  only its experts in system memory and everything else on the GPU: 34 tokens/s for a 35B
+  model with 3B active on a consumer GPU, through llama-server. Sampling follows what
+  the model's publisher recommends for its family, read from the file's header, and each
+  reply shows how long the model thought and how fast it wrote.
+- **Know what you load.** *Model check* reads a GGUF file with the studio's own strict
+  parser before llama.cpp is allowed near it, shows the chat template the model will
+  actually read, and points out instructions in it worth a look. *Strict mode* makes a
+  workspace conversation only, with no tools at all.
+- **Chats stay yours.** Conversations are encrypted on disk with a key Windows keeps for
+  your user account.
 - **Close means quit, or keep working in the background.** By default closing the window
   stops everything and frees the GPU. In Settings it can instead hide to the tray, with
   long work carrying on and each model (chat, image, video) kept on the GPU or unloaded
-  once idle, as you choose.
+  once idle, as you choose. A notice from the tray says when a chat reply, an image or a
+  video is done (each can be turned off).
 - **Offline unless you say otherwise.** The agent has no internet access by default. Web
   search, or search plus downloads, can be switched on per workspace; every request is
   shown before it is sent and written to a log, and text from your files is never put in
@@ -28,8 +40,8 @@ No cloud model, no account, no telemetry.
 
 ![A video in the gallery: a red paper boat on a rainy street at night, with its prompt, settings and model revision beside it](docs/screenshots/video.webp)
 
-*A 5-second 720p clip from the 3-step video model, made in about 4½ minutes on a 12 GB
-laptop GPU. Every image and video in the gallery keeps its prompt, settings and the
+*A 5-second 720p clip from the 3-step video model, made in about 4½ minutes on a consumer
+GPU. Every image and video in the gallery keeps its prompt, settings and the
 model revision it came from. All pictures in this README are real output of the
 studio.*
 
@@ -60,8 +72,9 @@ Local-model tools today each cover part of the job:
         │ messages              │ HTTP on 127.0.0.1, per-launch token
 ┌───────▼─────────────┐ ┌───────▼─────────────────────┐
 │ Chat engine         │ │ Image engine (Python)       │
-│ node-llama-cpp +    │ │ PyTorch + diffusers +       │
-│ your GGUF           │ │ image and video models      │
+│ node-llama-cpp, or  │ │ PyTorch + diffusers +       │
+│ llama-server on     │ │ image and video models      │
+│ 127.0.0.1 + GGUF    │ │                             │
 │ No file authority.  │ │ Gallery on disk, no files   │
 │                     │ │ outside its own data folder │
 └─────────────────────┘ └─────────────────────────────┘
@@ -89,7 +102,21 @@ bridge to the main process attached.
 other side is busy (a reply streaming, an image generating), the switch is refused with
 a reason instead of interrupting it.
 
+**Closing the window** quits by default, which frees the GPU. Settings can keep the
+studio running in the tray instead, choosing per model whether it stays loaded, whether
+a notice pops up when a reply, an image or a video is done, and when open gallery
+folders lock again; the keyboard shortcuts are there too.
+
+![Studio settings: when open gallery folders lock again, background notices for chat replies and finished images or videos, and the keyboard shortcuts](docs/screenshots/settings.webp)
+
 ## Chat
+
+![A chat in a demo project: the agent read the README and the to-do list, answered, then added a line to the list after approval; every file it touched is in the activity log, and the change can be reverted](docs/screenshots/chat.webp)
+
+*A 35B model with 3B active through llama-server on a consumer GPU, in a demo
+folder. The first read failed (the model asked for `README` without its extension) and
+it tried again; the reply shows its speed, and the change it made can be put back with
+one click.*
 
 **Tool calls are constrained at the token level.** The JSON schema for each tool is
 compiled into a GBNF grammar, so the model is structurally incapable of emitting a call
@@ -140,6 +167,12 @@ installed dependencies (`.git`, `node_modules`, `.venv`) are read-only. Add your
 the Permissions tab (`data/raw`, `*.sqlite`). These are enforced by the broker on every
 call, before any rule, mode or approval; the rules on the Rules tab are advice to the
 model, these are not.
+
+**No reading through hard links.** Resolving a path follows junctions and symbolic links,
+but a hard link is a second name for the same contents, and the other name can be
+anywhere on the drive. A file with more than one name is not read. (Writes and deletes
+need no such guard: a write is a temp file renamed over the name, so the other name keeps
+the old contents, and a delete moves the name to the recycle bin.)
 
 **No blind changes.** An existing file can only be replaced or edited after the agent has
 read it in this conversation, and only while it is unchanged since. A model that guesses
@@ -201,6 +234,43 @@ stored encrypted by the operating system; its address is shown next to the key a
 every approval. The chat engine only runs its prebuilt binaries
 and never builds or downloads anything.
 
+### Strict mode
+
+A folder can be put in **strict mode** (Permissions tab): conversation only. The model is
+given no tools of any kind — no reading, listing or changing files, no internet, whatever
+the other settings say. It is not told any tool exists, the grammar that shapes its output
+has no function calls in it to make, and a call that arrives anyway is refused before any
+broker sees it. For talking with a model you do not yet trust, or when nothing should be
+touched. The badge in the sidebar and the chat header says when it is on.
+
+### Model check
+
+The **Model check** tab answers what can be answered about a model file, and says what
+cannot.
+
+- **The file.** A GGUF file is read by the studio's own strict reader, independent of
+  the inference library: every count, length and offset in the header is checked against
+  the file, tensors must be of known types, fit, align and not overlap, and anything the
+  loader would not understand is a reason to refuse rather than guess. The same check
+  runs at load, so a file that fails it is never handed to the native loader. The report
+  adds what the metadata says (architecture, weights, context, vocabulary, publisher,
+  license, source), reads the chat template for text the model would see and you would
+  not (invisible characters, "do not tell the user", web addresses, the studio's own tool
+  names, code-like escapes), lists every metadata key, and hashes the file to compare
+  with the publisher's SHA-256. Other formats go through the Python inspector described
+  under Images.
+- **What the model reads.** Whether the file's own chat template is run or a built-in
+  one for the family, and a sample conversation rendered exactly as the model receives
+  it. Templates are rendered by a template engine with no access to files, the network or
+  the system.
+- **What no model can do here.** Whether a model misbehaves cannot be read from its
+  weights, so the tab ends with what holds for every model — it can only ask; files only
+  inside the shared folders; internet only through the gate; nothing at all in strict mode
+  — together with this folder's current settings, and the one residual the structure
+  cannot catch (a reworded leak through an automatic search).
+
+![The lower half of the Model check tab: what the model reads, and what no model can do here, with this folder's internet and approval settings](docs/screenshots/model-check.webp)
+
 ### Rules and token usage
 
 Standing instructions are prepended to every conversation: global rules everywhere, then
@@ -215,11 +285,30 @@ each tool's description, messages, replies, tool results, per turn, with plain-l
 findings such as "Most of it is tool results (62%)" and "Room for about 2 more turns like
 the last few".
 
-**Context memory.** The model menu (click the model's name) can store the context in
-8-bit instead of 16-bit, which fits about twice as many tokens in the same GPU memory at
-a small cost in precision. The underlying option is experimental in the inference
-library, so 16-bit stays the default and an 8-bit load that fails is retried at 16-bit
-automatically.
+**The model menu** (click the model's name) shows what the file's header says about the
+model — architecture, whether it is a mixture of experts, its weight format, whether it
+can think before replying — and holds the settings that follow from it. Nothing here is
+tied to one model: the header decides the defaults, and each can be changed.
+
+![The model menu: where the model runs and how many layers are on the GPU, its context and architecture, the engine (llama-server, experts on the CPU, 8 threads), context size, thinking, sampling and context memory](docs/screenshots/model-menu.webp)
+
+- **Context.** How much of the conversation the model can see at once. The default is
+  32k tokens, or the size the model was trained for if that is smaller: a model trained
+  for 262k would otherwise claim memory for all of it and push its weights off the GPU. Smaller is
+  faster, larger holds a longer conversation; a change takes effect at the next load.
+- **Thinking.** For a model whose chat template has a thinking segment: on, only when
+  the model starts one itself, or off (the default, for the quickest answers), with a cap
+  on how long a thought may run. The
+  thought streams into a folded block above the reply, open while the model is still
+  thinking so the wait is visibly work.
+- **Sampling.** The temperature and top-p / top-k / min-p the model's publisher
+  recommends for its family, applied automatically, or numbers of your own. Without
+  these the inference library samples greedily, and a thinking model run that way tends
+  to repeat itself.
+- **Context memory.** The context can be stored in 8-bit instead of 16-bit, which fits
+  about twice as many tokens in the same GPU memory at a small cost in precision. 8-bit
+  is the default; the underlying option is experimental in the inference library, so an
+  8-bit load that fails is retried at 16-bit automatically.
 
 ## Image
 
@@ -227,13 +316,38 @@ automatically.
 
 - **Prompt to image** with aspect-ratio presets, Draft / Standard / Large resolutions,
   batches of up to 8 images, and fixed or random seeds.
-- **Live progress** for every sampling step, a queue you can keep adding to, and a Cancel
-  button that stops between steps.
+- **Live progress** for every sampling step, and a queue you can keep adding to. The
+  progress card's *Cancel this one* stops the job it shows, between steps; everything
+  else waiting is in the **queue window**, which opens after Generate (that can be
+  switched off) or from the card's *Queue* button. There each job waiting can be edited
+  — prompt, aspect ratio and resolution, count, steps, guidance, negative prompt, seed —
+  or removed, and keeps its place in line. The one being made can be cancelled, or
+  edited too: saving stops it and starts it again with the changes, first in line, and
+  whatever it already finished stays in the gallery.
 - **Gallery**: search by prompt, full-size view with keyboard navigation, one click to
-  reuse an image's exact settings, "Save as…" to put a copy anywhere.
+  reuse an image's exact settings, "Save as…" to put a copy anywhere. Thumbnails come
+  in three sizes — Large, Medium and Small, as a file manager's views — and the choice
+  is remembered.
+- **A mosaic over the thumbnails**, weak or strong, for a screen other people can see.
+  Each thumbnail is drawn a few blocks wide and blown back up, so the grid says nothing
+  at a glance. It covers the grid only: opening an item shows it as it is, its prompt is
+  still its tooltip and still searchable, and no file is changed. To keep things out of
+  view altogether, use a hidden or locked folder.
 - **Folders and favorites.** Make, rename and delete your own folders and drag images
-  and videos onto them; deleting a folder never deletes what was in it. Favorites are
-  their own view, showing every starred item wherever it is filed.
+  and videos onto them; deleting a folder never deletes what was in it. Drag the folders
+  themselves to put them in the order you want (a deliberate pull, so clicking one never
+  reorders the list; Alt with an arrow key does the same without a mouse), or leave them
+  alphabetical. Favorites are their own view, showing every starred item wherever it is
+  filed.
+- **Several at once.** *Select* (or Ctrl+click, Shift+click for a run, Ctrl+A for every
+  item shown) chooses several items to move to a folder, save, or delete together, and
+  dragging a chosen tile takes all of them. *Save copies…* writes them into a folder you
+  pick, never over a file already there, with two choices: keep the prompt and settings
+  inside the images or not, and write each prompt and its settings to a `.txt` beside it.
+- **Filing by keyboard.** **Ctrl+M** (changeable in Settings) opens the folder list
+  numbered: 1 to 9 for the first nine folders in list order, 0 for no folder. It works
+  in an item's details and on a gallery selection. In the details the left and right
+  arrows always go to the previous and next item, even from the folder list.
 - **Hidden and locked folders.** A folder can be hidden (it leaves the folder list, and
   what it holds leaves every view and search until *Settings → Show hidden folders*) or
   locked with a six-digit PIN. Both reset whenever the window closes: hidden folders hide
@@ -423,8 +537,11 @@ weights. What you add depends on what you use and on your hardware:
 
 ### Chat
 
-Choose *Load a GGUF model…*, open a folder as a workspace, and ask for something.
-Every action appears in the activity log, marked if it ran without asking.
+The chat engine starts set to **llama-server**, the faster of the two for a
+mixture-of-experts model bigger than the GPU: choose your llama-server program once (model
+menu → *Engine* → *Choose llama-server…*), or switch *Engine* to **Built-in**, which needs
+nothing installed. Then choose *Load a GGUF model…*, open a folder as a workspace, and ask
+for something. Every action appears in the activity log, marked if it ran without asking.
 
 ### Images and videos
 
@@ -460,6 +577,20 @@ The two video models share 14 GB of files (text encoder and decoder); with one a
 downloaded, the other links them instead of downloading them again. The distilled one is
 about ten times faster (measured below) and is the one to start with.
 
+The list is judged for the computer it runs on. It reads the GPU (through `nvidia-smi`)
+and the RAM, and each model says which memory mode *Automatic* will pick there, using the
+engine's own thresholds, or that it does not fit. *Recommended* only appears on a model
+that runs well on that computer. A model that only fits in Low VRAM mode, or wants more
+RAM than there is, is marked *Slow here*; one the GPU cannot hold is marked *Too big
+here*. Nothing is hidden or blocked: you can still download any of them, for example
+for another computer.
+
+| Model                    | Smallest GPU          | Runs well from                    |
+| ------------------------ | --------------------- | --------------------------------- |
+| Image · 6B               | 6 GB (Low VRAM)       | 10 GB (Balanced), 16 GB of RAM    |
+| Video · 5B (either)      | 8 GB (Low VRAM)       | 10 GB (Balanced), 24 GB of RAM    |
+| Captioning · 4B          | 10 GB                 | 10 GB                             |
+
 Weights are never part of this repository or the installer. They are downloaded from
 each publisher's own repository, under its license. Folders you already have (from
 `image-engine/scripts/fetch_model.py`, or another copy of the studio) can be chosen with
@@ -468,9 +599,13 @@ each publisher's own repository, under its license. Folders you already have (fr
 For MP4 videos, install ffmpeg (for example `winget install Gyan.FFmpeg`); without it
 videos are saved as animated WebP.
 
-**Web search** (optional) needs an API key for the search service at
-`api.search.brave.com`. Paste it under **Permissions → Internet**; it is used only when a
-workspace is set above Offline.
+**Web search** (optional) goes to one search service, chosen under **Permissions →
+Internet**: Tavily (the default; a hosted API with a free monthly allowance), Brave Search
+(hosted, billed per request), or a SearXNG instance you run yourself (no key, no account;
+enable its JSON output). Hosted services need a key of your own, pasted in the same
+place and stored encrypted by the operating system. Whichever service is chosen, only the
+query is sent, and every query is checked, shown first and logged as described above. The
+search is used only when a workspace is set above Offline.
 
 ### Where things live
 
@@ -487,6 +622,30 @@ It all stays in your own data folder, `%APPDATA%\local-ai-studio`:
 Uninstalling removes the program and leaves the data folder; delete it to remove the
 environment, the models and the gallery too.
 
+**Two of those folders can be moved**, in Settings → Where things are kept: the chats and
+settings folder, and the gallery. Choosing a folder says where new data goes from then on
+— nothing is moved, copied or deleted. The folder you leave keeps its chats, or its media
+and gallery list, so a fresh folder starts out empty and choosing the old one again brings
+everything in it back. The chats folder is opened once at startup, so the studio offers to
+restart; the gallery takes effect as soon as the image engine restarts, which it does by
+itself. The folder that is chosen is remembered in `data-location.json`, which sits in
+`%APPDATA%\local-ai-studio` rather than in the folders it names. Downloaded models have
+their own folder, chosen where a download starts, and the Python environment stays where
+it is installed.
+
+**Chats are encrypted.** Each conversation, and the chat list (whose titles are the first
+words of each chat), is sealed with AES-256-GCM under a random key made on first use. That
+key is kept in `userData\chat-key.json`, itself encrypted through Windows for your user
+account (Electron's safeStorage, whose own key DPAPI protects in the data folder's
+`Local State` file), so the chat files open only for that account on that machine. Chats
+saved before encryption are sealed when the studio starts. On the very first run they stay
+as they are until Windows' part of the key is safely on disk (a minute, or the first quit). The trade-off is deliberate: a copy of the
+data folder restored to another computer or another Windows account, or after Windows is
+reinstalled, cannot open its chats, and if `chat-key.json` or `Local State` is deleted they
+are lost. Files
+the agent changed (their backups and the change history), workspace settings and the
+internet log stay readable.
+
 ### Build from source
 
 Requires Node 20+.
@@ -496,6 +655,12 @@ npm ci
 npx install-electron      # downloads the Electron runtime
 npm run dev               # renderer dev server on port 5197
 ```
+
+On Windows, `npm run addon` builds the studio's version of the llama.cpp addon and puts it
+in `node_modules` (it needs the MSVC compiler from Visual Studio Build Tools, and git; it
+downloads nothing). Without it everything works except keeping a mixture-of-experts
+model's experts in system memory with the built-in engine. `npm ci` puts the stock addon
+back, so run it again after one.
 
 ```bash
 npm test                  # chat broker, policy, usage, setup and downloads, image UI logic, repository hygiene
@@ -525,9 +690,55 @@ then choose that environment's Python with *Use another Python…* in **Image �
 ## Hardware notes
 
 `node-llama-cpp` ships prebuilt binaries per platform, including CUDA, Vulkan and Metal
-variants. On a card whose compute capability is newer than the shipped CUDA prebuilt
-(Blackwell, at the time of writing) it silently falls back to Vulkan, which works. That
-is why the backend is a visible setting rather than something inferred.
+variants. On Windows there are two CUDA builds: the main one targets CUDA 13 and carries
+native code for current cards (Blackwell included); a fallback targets CUDA 12 and covers
+newer cards only through the driver compiling its kernels at load time. Neither ships the
+CUDA runtime libraries (`cudart`, `cuBLAS`), which come from a CUDA installation found
+through `CUDA_PATH` and `PATH`: for the main build that means CUDA 13. Without one, CUDA is
+skipped and Vulkan, which works, is used instead. That is why the backend is a visible
+setting rather than something inferred. The image engine is unaffected: PyTorch's wheels
+bring their own CUDA runtime.
+
+On a laptop, Vulkan also sees the integrated GPU, and would count its share of system
+memory as VRAM and spread the model across both — planning, for a model bigger than the
+discrete card, as if there were twice the memory, and failing partway through the load.
+When a discrete GPU is present the engine starts with only that one visible
+(`GGML_VK_VISIBLE_DEVICES`) and says so; the model menu names the GPU in use.
+
+### Mixture-of-experts models bigger than the GPU
+
+A mixture-of-experts model reads only a few of its experts for each token. Split by layer,
+most of it runs on the CPU, attention included. Kept with only the experts in system
+memory and everything else on the GPU, it runs several times faster on the same card.
+
+The built-in engine does this on CUDA. The library inside the studio (node-llama-cpp) has
+no option for it, so the studio rebuilds that library's small native addon with one added
+load option, which passes llama.cpp's tensor placement through
+([scripts/native/](scripts/native/)). llama.cpp itself and its CUDA backend stay the
+prebuilt files the library ships. In the model menu:
+
+- *Experts on CPU* sets how many layers keep their experts in system memory: all of them
+  is the safe start; fewer puts more on the GPU when it has room; *None* splits the model
+  by layer, as for any other. On Vulkan, or with the stock addon, the menu says why it is
+  not available and the model is split by layer.
+- *CPU threads* is there because a CPU with efficiency cores can be slower using all of
+  them.
+
+The same placement is available through the other **Engine**, **llama-server**, which is
+the default: measured on a 35B model with 3B active on a consumer GPU, it ran at
+34 tokens/s against the built-in engine's 5.3 with its experts on the CPU.
+
+- You install llama.cpp's `llama-server` yourself (its official release for your GPU) and
+  choose the program once with *Choose llama-server…*. The studio does not download it.
+- The studio starts it for the model you load and stops it on unload and on quit. It
+  listens on `127.0.0.1` only, on a port picked as free at that moment, behind a key made
+  for that one start and passed in its environment rather than on its command line. Its
+  web page is off, and the variables llama.cpp would read as settings (`LLAMA_ARG_*`,
+  including the ones that make it download a model) are removed from its environment.
+- Everything else is the same as with the built-in engine: the same tools through the
+  same broker, the same thinking and sampling settings, the same token usage view
+  (measured with the server's own tokenizer and chat template). A chat begun on one
+  engine continues on the other.
 
 Roughly: 12 GB of VRAM fits a 9B chat model at Q6_K, or a 14B at Q4_K_M, with room for
 context, and the image model or the video model in their Balanced modes. One at a time;
@@ -539,7 +750,9 @@ RAM, for the text encoder that runs on the CPU.
 | Area                                     | State                                                  |
 | ---------------------------------------- | ------------------------------------------------------ |
 | Path resolution, policy, broker          | Tested, including real junction escapes                |
-| Chat with a real GGUF, grammar tool calls| Verified with a 9B GGUF (by script, before the merge)  |
+| Chat with a real GGUF, grammar tool calls| Verified with a 9B GGUF (by script, before the merge), and in the studio with a 35B-A3B model on both engines |
+| llama-server engine                      | Verified with a real 35B-A3B model on a consumer GPU: 34 tokens/s with every layer's experts on the CPU |
+| Built-in engine, experts on the CPU (rebuilt addon) | Tested on a tiny made-up model (same placement and output as the stock addon without the option); 5.3 tokens/s with the real 35B-A3B model |
 | Token usage analysis                     | Tested against four real chat templates                |
 | Image engine API, queue, gallery, guards | Tested                                                 |
 | Studio end to end (real app, real IPC, real engine process, fake model) | Tested |
@@ -547,14 +760,18 @@ RAM, for the text encoder that runs on the CPU.
 | Close to quit or to the background, per-model unloading, single instance | Tested end to end through the real close button (fake image model) |
 | Protected paths, read-before-change, reverting a reply | Tested, and verified with a real GGUF model |
 | Internet gate (levels, checks, log)      | Tested against a fake network; page reading verified live |
+| Strict mode, GGUF strict reader and Model check | Tested (files built byte by byte, malformed shapes refused), and run in the app on a real 35B model file |
+| Encrypted chats                          | Tested, and checked in the packaged app on Windows: old chats sealed at startup, still readable after a crash, nothing lost on a first run killed at once |
+| Background notices                       | The settings tested end to end; the tray pop-up itself **not yet checked by eye** |
 | Web search                               | **Not yet verified live**: needs a search key          |
-| Image generation with the real model     | Verified: 1360×768, 8 steps, Balanced on a 12 GB laptop GPU, about 16 s per image |
+| Image generation with the real model     | Verified: 1360×768, 8 steps, Balanced on a consumer GPU, about 16 s per image |
 | Video engine, every memory plan, picture to video | Tested on a tiny random-weight model through the real pipelines (no download) |
 | Video in the studio end to end (MP4 playback and seeking, WebP fallback) | Tested, with a fake video model |
-| Video generation with the real model     | Verified: 5 s at 1280×704, 50 steps, Balanced on a 12 GB laptop GPU, 44 minutes, 10.0 GiB peak VRAM |
+| Video generation with the real model     | Verified: 5 s at 1280×704, 50 steps, Balanced on a consumer GPU, 44 minutes, 10.0 GiB peak VRAM |
 | Distilled 3-step video model             | Verified: the same clip in 4.3 to 4.5 minutes (seven runs), 832×480 in under 2 minutes, 9.9 GiB peak VRAM |
 | Installing the engine from the studio    | Tested against a fake machine (every step and failure); the real install verified offline from the audited wheels: environment, pip, GPU check, repair |
 | Downloading a model from the studio      | Tested against fake output; `fetch_model.py --json` tested against a fake network. All three models were downloaded and verified with the same script |
+| Download marks for this computer         | Tested against fake GPUs and RAM sizes (4 to 24 GB cards), with a test that keeps the thresholds equal to the engine's; read from the real GPU in the end-to-end run |
 | Packaged app (`npm run package:dir`)     | Tested: on a fresh profile it asks for the one-time setup, installs the engine through the UI (offline, from the audited wheels), and starts it on the GPU. The installer itself is built by the Build workflow |
 | Repository holds code only               | Checked by a test: no weights, environments, databases, large files or machine paths, and no media but the README's screenshots |
 | Multi-step chat tasks, several tools     | **Not yet measured**                                   |

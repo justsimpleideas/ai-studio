@@ -15,6 +15,8 @@ export type {
   MediaKind,
   MemoryMode,
   ModelInfo,
+  SaveManyOptions,
+  SaveManyResult,
   StartImage,
   VideoInfo,
   VideoProfile,

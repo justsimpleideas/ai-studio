@@ -12,7 +12,9 @@ export default defineConfig({
       rollupOptions: {
         input: {
           index: resolve('src/main/index.ts'),
-          engineHost: resolve('src/engine/host.ts')
+          engineHost: resolve('src/engine/host.ts'),
+          // The same role, served by a llama-server program the user installed.
+          serverHost: resolve('src/engine/server/host.ts')
         }
       }
     },

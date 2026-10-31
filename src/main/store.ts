@@ -1,7 +1,19 @@
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
-import { DEFAULT_CONFIG, isKvCacheType, isTheme, parseBackground, parseFolderPrivacy, type AppConfig } from '@shared/config.js'
+import {
+  DEFAULT_CONFIG,
+  isChatEngine,
+  isKvCacheType,
+  isTheme,
+  parseBackground,
+  parseFolderPrivacy,
+  parseNotifications,
+  parseServer,
+  type AppConfig
+} from '@shared/config.js'
+import { parseContextSize, parseGeneration } from '@shared/generation.js'
+import { parseSearch } from '@shared/search.js'
 import { parseShortcuts } from '@shared/shortcuts.js'
 import { DEFAULT_PERMISSION_SETTINGS } from '@shared/permissions.js'
 
@@ -41,7 +53,15 @@ export class ConfigStore {
           ...DEFAULT_CONFIG.model,
           ...(parsed.model ?? {}),
           // An unknown value would reach the engine as a cache type it cannot build.
-          kvCache: isKvCacheType(parsed.model?.kvCache) ? parsed.model.kvCache : DEFAULT_CONFIG.model.kvCache
+          kvCache: isKvCacheType(parsed.model?.kvCache) ? parsed.model.kvCache : DEFAULT_CONFIG.model.kvCache,
+          engine: isChatEngine(parsed.model?.engine) ? parsed.model.engine : DEFAULT_CONFIG.model.engine,
+          server: parseServer(parsed.model?.server),
+          // Never saved means the default (32k); saved as null means the model's own, capped.
+          contextSize:
+            parsed.model && 'contextSize' in parsed.model
+              ? parseContextSize(parsed.model.contextSize)
+              : DEFAULT_CONFIG.model.contextSize,
+          generation: parseGeneration(parsed.model?.generation)
         },
         image: {
           ...DEFAULT_CONFIG.image,
@@ -53,9 +73,11 @@ export class ConfigStore {
           // Anything but an explicit yes keeps prompts out of exported files.
           includeSettingsInExports: parsed.image?.includeSettingsInExports === true
         },
+        search: parseSearch(parsed.search),
         // Anything unrecognised means the default: closing the window quits.
         background: parseBackground(parsed.background),
         folderPrivacy: parseFolderPrivacy(parsed.folderPrivacy),
+        notifications: parseNotifications(parsed.notifications),
         shortcuts: parseShortcuts(parsed.shortcuts),
         theme: isTheme(parsed.theme) ? parsed.theme : 'dark',
         lastWorkspaceId: typeof parsed.lastWorkspaceId === 'string' ? parsed.lastWorkspaceId : null

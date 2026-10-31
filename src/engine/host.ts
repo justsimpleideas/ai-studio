@@ -1,22 +1,47 @@
 import { randomUUID } from 'node:crypto'
 import {
   type ChatHistoryItem,
+  type ChatWrapper,
   defineChatSessionFunction,
   getLlama,
+  Llama,
   LlamaChatSession,
+  LlamaLogLevel,
+  readGgufFileInfo,
+  resolveChatWrapper,
   type ChatSessionModelFunctions,
-  type Llama,
   type LlamaContext,
   type LlamaContextSequence,
   type LlamaModel,
   type TokenMeterState
 } from 'node-llama-cpp'
-import { modelDisplayName, type ChatTarget, type EngineToMain, type MainToEngine, type ModelInfo } from '@shared/engine-protocol.js'
+import {
+  modelDisplayName,
+  type ChatTarget,
+  type EngineToMain,
+  type MainToEngine,
+  type ModelInfo,
+  type ModelTemplate
+} from '@shared/engine-protocol.js'
 import { joinSystemSections, type GpuBackend, type SystemSection } from '@shared/config.js'
+import {
+  DEFAULT_CONTEXT_CAP,
+  DEFAULT_GENERATION,
+  recommendedSampling,
+  resolveSampling,
+  type GenerationPreferences,
+  type ModelTraits,
+  type ThinkingMode
+} from '@shared/generation.js'
 import { TOOL_DESCRIPTIONS, TOOL_NAMES, TOOL_SCHEMAS, type ToolName } from '@shared/tools.js'
 import type { TurnMeter } from '@shared/usage.js'
-import { kvCacheOptions } from './kv-cache.js'
+import { ReplyClock } from '@shared/reply-stats.js'
+import { kvCacheOptions, kvModelOptions } from './kv-cache.js'
 import { measureConversation } from './measure.js'
+import { discreteDeviceIndices } from '@shared/gpu-devices.js'
+import { addonPlacesTensors, planExperts } from './expert-placement.js'
+import { describeModel, loadPlan } from './model-traits.js'
+import { thoughtBudget, wrapperSettingsFor } from './thinking.js'
 
 /**
  * The model host.
@@ -47,10 +72,16 @@ let context: LlamaContext | null = null
  */
 let sequence: LlamaContextSequence | null = null
 let session: LlamaChatSession | null = null
+/** What the loaded model's header says about it; null until a model is loaded. */
+let traits: ModelTraits | null = null
+/** How replies are generated, as last asked for by the application. */
+let generation: GenerationPreferences = DEFAULT_GENERATION
 /** Which of the application's chats the session holds. */
 let activeChatId: string | null = null
 let activeSystemPrompt = ''
 let activeSystem: SystemSection[] = []
+/** The thinking mode the session's chat wrapper was built for. */
+let activeThinking: ThinkingMode | null = null
 /** The tools the current conversation's model is given; the file tools unless the workspace allows more. */
 let activeTools: ToolName[] = [...TOOL_NAMES]
 /** Per-prompt work for the current chat, from llama.cpp's own token meter. */
@@ -73,8 +104,13 @@ interface PendingCall {
 
 const pendingCalls = new Map<string, PendingCall>()
 
+/** Per prompt in flight, the timestamps its speed and thinking time are read from. */
+const clocks = new Map<string, ReplyClock>()
+
 function requestTool(promptId: string, name: ToolName, args: unknown): Promise<unknown> {
   const callId = randomUUID()
+  // Waiting on approval or a file is not the model writing slowly.
+  clocks.get(promptId)?.pause()
   return new Promise((resolve) => {
     pendingCalls.set(callId, {
       promptId,
@@ -82,7 +118,10 @@ function requestTool(promptId: string, name: ToolName, args: unknown): Promise<u
       // thrown. The model needs to learn that this door is closed so it can try
       // something else; killing the turn would just leave the user staring at a
       // half-finished answer.
-      settle: ({ ok, payload }) => resolve(ok ? payload : { error: payload })
+      settle: ({ ok, payload }) => {
+        clocks.get(promptId)?.resume()
+        resolve(ok ? payload : { error: payload })
+      }
     })
     send({ type: 'toolCall', callId, promptId, call: { name, args } })
   })
@@ -105,12 +144,16 @@ function buildFunctions(promptId: string, tools: readonly ToolName[]): ChatSessi
 
 async function disposeModel(): Promise<void> {
   endSession()
+  traits = null
   sequence = null
   await context?.dispose().catch(() => undefined)
   context = null
   await model?.dispose().catch(() => undefined)
   model = null
 }
+
+/** llama.cpp's lines about memory placement: "CUDA0 model buffer size = …", "offloaded 41/41 layers to GPU", KV and compute buffers. */
+const PLACEMENT_LOG = /(model|KV|compute) buffer size =|offloaded \d+\/\d+ layers to GPU/
 
 async function load(request: MainToEngine & { type: 'load' }): Promise<void> {
   await disposeModel()
@@ -128,15 +171,83 @@ async function load(request: MainToEngine & { type: 'load' }): Promise<void> {
     llama = await getLlama({
       build: 'never',
       skipDownload: true,
-      ...(wanted === 'auto' ? {} : { gpu: wanted === 'cpu' ? false : wanted })
+      ...(wanted === 'auto' ? {} : { gpu: wanted === 'cpu' ? false : wanted }),
+      // Warnings and errors as before, plus the few information lines that say
+      // where the weights, the context and the scratch memory went, for the
+      // engine log. The rest of the information level is a metadata dump.
+      logLevel: LlamaLogLevel.info,
+      logger(level, message) {
+        if (level === LlamaLogLevel.fatal || level === LlamaLogLevel.error || level === LlamaLogLevel.warn) {
+          Llama.defaultConsoleLogger(level, message)
+        } else if (PLACEMENT_LOG.test(message)) {
+          console.log(`[llama] ${message.trim()}`)
+        }
+      }
     })
     activeBackend = wanted
   }
 
+  // Vulkan on a laptop sees the integrated GPU too, counts its share of system
+  // memory as VRAM and spreads the model across both. Which devices Vulkan uses
+  // is fixed when the process starts, so the engine asks to be started again
+  // with the integrated GPU left out, and loads nothing in this process.
+  const devices = llama.gpu === false ? [] : await llama.getGpuDeviceNames()
+  // After such a restart, the devices now visible must be the ones asked for.
+  // Vulkan numbers devices in the order it enumerates them, which has been seen
+  // to change between processes in some setups; a mismatch is refused rather
+  // than loading the model onto a GPU nobody chose.
+  const expected = process.env['STUDIO_VK_EXPECTED']
+  if (llama.gpu === 'vulkan' && expected !== undefined && JSON.stringify(devices) !== expected) {
+    throw new Error(
+      `The GPU picked for the chat model (${devices.join(', ') || 'none'}) is not the one intended (${(JSON.parse(expected) as string[]).join(', ')}). Restart the studio and load the model again.`
+    )
+  }
+  if (llama.gpu === 'vulkan' && process.env['GGML_VK_VISIBLE_DEVICES'] === undefined) {
+    const keep = discreteDeviceIndices(devices)
+    if (keep) {
+      const left = devices.filter((_, i) => !keep.includes(i))
+      console.log(`[engine] vulkan devices ${JSON.stringify(devices)}; restarting with only ${JSON.stringify(keep.map((i) => devices[i]))}`)
+      send({
+        type: 'restartEngine',
+        env: { GGML_VK_VISIBLE_DEVICES: keep.join(','), STUDIO_VK_EXPECTED: JSON.stringify(keep.map((i) => devices[i])) },
+        reason: `Using ${keep.map((i) => devices[i]).join(', ')} for the chat model; ${left.join(', ')} shares system memory and was left out.`
+      })
+      return
+    }
+  }
+
+  // The header is read first, on its own: the layer plan needs the trained
+  // context size before the weights are placed (model-traits.ts, loadPlan).
+  const header = await readGgufFileInfo(request.request.modelPath, { readTensorInfo: false })
+  const trained = header.architectureMetadata.context_length ?? DEFAULT_CONTEXT_CAP
+  const plan = loadPlan(trained, { contextSize: request.request.contextSize, gpuLayers: request.request.gpuLayers })
+  const shape = header.architectureMetadata as { expert_count?: number; block_count?: number }
+  const experts = planExperts({
+    experts: shape.expert_count,
+    layers: shape.block_count,
+    expertsOnCpu: request.request.server.expertsOnCpu,
+    backend: llama.gpu,
+    addonPlaces: addonPlacesTensors(llama)
+  })
+  const threads = request.request.server.threads
+  // For the engine log (no path): what was asked of the library, so a failed load can be read back.
+  console.log(
+    `[engine] load: backend ${llama.gpu === false ? 'cpu' : llama.gpu} ${JSON.stringify(devices)}, architecture ${header.metadata.general.architecture}, trained context ${trained}, context ${plan.contextSize}, gpu layers ${JSON.stringify(experts.kind === 'place' ? (request.request.gpuLayers ?? 'max') : plan.gpuLayers)}, kv ${request.request.kvCache}, experts on CPU ${experts.kind === 'place' ? experts.label : experts.kind}, threads ${threads ?? 'default'}`
+  )
+  if (experts.kind === 'unavailable') console.log(`[engine] ${experts.reason}`)
+
   let lastReported = -1
   model = await llama.loadModel({
     modelPath: request.request.modelPath,
-    gpuLayers: request.request.gpuLayers ?? 'auto',
+    // With the experts kept in system memory, what is left for the GPU is every
+    // layer's attention and shared weights. The library's fit cannot plan for
+    // that (it sizes whole layers), so its memory checks are skipped and every
+    // layer goes to the GPU; if even that does not fit, llama.cpp's own
+    // allocation fails the load with an error rather than a guess.
+    ...(experts.kind === 'place'
+      ? { gpuLayers: request.request.gpuLayers ?? 'max', ignoreMemorySafetyChecks: true, tensorBufferOverrides: experts.overrides }
+      : { gpuLayers: plan.gpuLayers }),
+    ...kvModelOptions(request.request.kvCache),
     onLoadProgress(fraction) {
       // Loading a 9 GB file is slow enough that silence reads as a hang. Only
       // whole percents are forwarded so the channel is not flooded.
@@ -148,13 +259,27 @@ async function load(request: MainToEngine & { type: 'load' }): Promise<void> {
     }
   })
 
-  // The automatic context size accounts for the cache type, so 8-bit gets the
-  // larger window by itself.
+  console.log(`[engine] weights loaded: ${model.gpuLayers} layers on the GPU, mmap ${model.useMmap}`)
   context = await model.createContext({
-    ...(request.request.contextSize === null ? {} : { contextSize: request.request.contextSize }),
-    ...kvCacheOptions(request.request.kvCache)
+    contextSize: plan.contextSize,
+    ...kvCacheOptions(request.request.kvCache),
+    ...(experts.kind === 'place' ? { ignoreMemorySafetyChecks: true } : {}),
+    ...(threads === null ? {} : { threads })
   })
+  console.log(`[engine] context ready: ${context.contextSize} tokens`)
   sequence = context.getSequence()
+
+  // The chat template, resolved the way a session will resolve it, is what says
+  // whether the model can think; the thinking mode does not change that.
+  traits = describeModel(
+    {
+      architecture: model.fileInfo.metadata.general.architecture,
+      architectureMetadata: model.fileInfo.architectureMetadata,
+      dominantTensorType: model.fileInsights.dominantTensorType,
+      totalParameters: model.fileInsights.totalParameters
+    },
+    wrapperFor(generation.thinking).settings
+  )
 
   const info: ModelInfo = {
     path: request.request.modelPath,
@@ -163,10 +288,47 @@ async function load(request: MainToEngine & { type: 'load' }): Promise<void> {
     contextSize: context.contextSize,
     gpuLayers: model.gpuLayers,
     backend: llama.gpu === false ? 'cpu' : llama.gpu,
+    devices,
     fileSizeBytes: model.size,
-    kvCache: request.request.kvCache
+    kvCache: request.request.kvCache,
+    engine: 'builtin',
+    ...(experts.kind === 'place' ? { expertsOnCpu: experts.label } : {}),
+    ...(experts.kind === 'unavailable' ? { expertsOnCpuUnavailable: experts.reason } : {}),
+    threads,
+    traits,
+    recommendedSampling: recommendedSampling(traits),
+    template: describeTemplate(wrapperFor(generation.thinking), model.fileInfo.metadata.tokenizer?.chat_template ?? null)
   }
   send({ type: 'loaded', info })
+}
+
+/** A fixed little conversation, rendered so the user can see the exact text the model is given. */
+const SAMPLE_HISTORY: ChatHistoryItem[] = [
+  { type: 'system', text: 'You are a careful assistant.' },
+  { type: 'user', text: 'What is the capital of France?' },
+  { type: 'model', response: ['Paris.'] },
+  { type: 'user', text: 'And of Italy?' }
+]
+
+function describeTemplate(wrapper: ChatWrapper, source: string | null): ModelTemplate {
+  let rendered: string
+  try {
+    rendered = wrapper.generateContextState({ chatHistory: SAMPLE_HISTORY }).contextText.toString()
+  } catch (err) {
+    rendered = `(could not render: ${(err as Error).message})`
+  }
+  return {
+    wrapper: wrapper.wrapperName,
+    usesFileTemplate: wrapper.wrapperName === 'JinjaTemplate',
+    source,
+    rendered: rendered.length > 6000 ? `${rendered.slice(0, 6000)}\n…` : rendered
+  }
+}
+
+/** The model's chat wrapper, with the thinking switch set where the wrapper has one. */
+function wrapperFor(mode: ThinkingMode): ChatWrapper {
+  if (!model) throw new Error('No model is loaded.')
+  return resolveChatWrapper(model, { customWrapperSettings: wrapperSettingsFor(mode), warningLogs: false })
 }
 
 function endSession(): void {
@@ -175,6 +337,7 @@ function endSession(): void {
   activeChatId = null
   activeSystemPrompt = ''
   activeSystem = []
+  activeThinking = null
   turnMeters = []
 }
 
@@ -191,12 +354,14 @@ function withSystemPrompt(history: ChatHistoryItem[], systemPrompt: string): Cha
  * reads it again on the next prompt, which is why the first reply after a
  * switch is slower. A changed system prompt (rules edited, folders shared) keeps
  * the conversation and only swaps the instructions at its head, so editing a
- * rule no longer costs the chat it was written for.
+ * rule no longer costs the chat it was written for. The thinking mode lives in
+ * the chat wrapper, so changing it is handled the same way.
  */
 async function buildSession(system: SystemSection[], target: ChatTarget): Promise<LlamaChatSession> {
   const systemPrompt = joinSystemSections(system)
+  const thinking = generation.thinking
   const sameChat = session !== null && activeChatId === target.chatId
-  if (sameChat && systemPrompt === activeSystemPrompt) return session as LlamaChatSession
+  if (sameChat && systemPrompt === activeSystemPrompt && thinking === activeThinking) return session as LlamaChatSession
   if (!sequence) throw new Error('No model is loaded.')
 
   const carried: ChatHistoryItem[] | null = sameChat
@@ -209,11 +374,12 @@ async function buildSession(system: SystemSection[], target: ChatTarget): Promis
   const replacing = session !== null
   endSession()
   if (replacing) await sequence.clearHistory()
-  session = new LlamaChatSession({ contextSequence: sequence, systemPrompt })
+  session = new LlamaChatSession({ contextSequence: sequence, systemPrompt, chatWrapper: wrapperFor(thinking) })
   if (carried && carried.length > 1) session.setChatHistory(withSystemPrompt(carried, systemPrompt))
   activeChatId = target.chatId
   activeSystemPrompt = systemPrompt
   activeSystem = system
+  activeThinking = thinking
   turnMeters = keepMeters
   return session
 }
@@ -246,33 +412,65 @@ function reportUsage(): void {
   }
 }
 
+/** Sent just before the reply's end, so the window and the saved chat have it when the reply settles. */
+function sendStats(id: string, clock: ReplyClock, meterStart: TokenMeterState | null): void {
+  if (!meterStart || !sequence) return
+  const outputTokens = sequence.tokenMeter.diff(meterStart).usedOutputTokens
+  send({ type: 'stats', id, stats: clock.stats(outputTokens) })
+}
+
 async function runPrompt(message: MainToEngine & { type: 'prompt' }): Promise<void> {
   const controller = new AbortController()
   running.set(message.id, controller)
+  const clock = new ReplyClock()
+  clocks.set(message.id, clock)
   let meterStart: TokenMeterState | null = null
   let turn = 0
   try {
     activeTools = message.tools
+    generation = message.generation
     const chat = await ensureSession(message.system, message)
     turn = chat.getChatHistory().filter((item) => item.type === 'user').length + 1
     meterStart = chat.sequence.tokenMeter.getState()
+    // Without these the library samples greedily, and a thinking model run
+    // that way tends to repeat itself; the numbers are the model card's.
+    const sampling = resolveSampling(generation.sampling, traits ?? { architecture: '', thinking: false })
+    const budget = thoughtBudget(generation.thinking, generation.thinkingBudget)
     const text = await chat.prompt(message.text, {
-      functions: buildFunctions(message.id, activeTools),
+      // No tools (strict mode) means no functions at all: nothing documented
+      // in the prompt, nothing in the grammar for the model to call.
+      ...(activeTools.length === 0 ? {} : { functions: buildFunctions(message.id, activeTools) }),
       signal: controller.signal,
       stopOnAbortSignal: true,
-      onTextChunk(chunk) {
-        send({ type: 'chunk', id: message.id, text: chunk })
+      temperature: sampling.temperature,
+      topP: sampling.topP,
+      topK: sampling.topK,
+      minP: sampling.minP,
+      ...(budget === undefined ? {} : { budgets: { thoughtTokens: budget } }),
+      // The thought goes to the window apart from the reply, so it can be shown
+      // folded while it is written and the reply is not left looking stalled.
+      onResponseChunk(chunk) {
+        if (chunk.type === 'segment') {
+          clock.thought()
+          send({ type: 'thought', id: message.id, text: chunk.text })
+        } else {
+          clock.text()
+          send({ type: 'chunk', id: message.id, text: chunk.text })
+        }
       }
     })
+    sendStats(message.id, clock, meterStart)
     send({ type: 'complete', id: message.id, text })
   } catch (err) {
     if (controller.signal.aborted) {
+      sendStats(message.id, clock, meterStart)
       send({ type: 'aborted', id: message.id })
     } else {
       send({ type: 'error', id: message.id, message: (err as Error).message, fatal: false })
     }
   } finally {
     running.delete(message.id)
+    clocks.delete(message.id)
     if (meterStart && sequence) {
       const used = sequence.tokenMeter.diff(meterStart)
       turnMeters.push({ turn, inputTokens: used.usedInputTokens, outputTokens: used.usedOutputTokens })
@@ -328,6 +526,9 @@ parentPort.on('message', (event) => {
       }
     } catch (err) {
       const id = 'id' in message ? (message.id as string) : null
+      // Also to stderr, which the supervisor keeps in the engine log with the
+      // library's own output around it.
+      console.error(`[engine] ${message.type} failed:`, (err as Error).stack ?? (err as Error).message)
       send({ type: 'error', id, message: (err as Error).message, fatal: message.type === 'load' })
     }
   })()

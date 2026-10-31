@@ -56,7 +56,9 @@ export function App(): React.JSX.Element {
     const off = window.api.onNotice((message) => {
       setNotice(message)
       window.clearTimeout(timer)
-      timer = window.setTimeout(() => setNotice(null), 7000)
+      // A failure stays until it is dismissed: reading why a model did not load
+      // should not be a race against a timer.
+      if (!/could not be loaded|stopped unexpectedly/.test(message)) timer = window.setTimeout(() => setNotice(null), 7000)
     })
     return () => {
       off()

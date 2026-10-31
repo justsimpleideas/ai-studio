@@ -1,10 +1,14 @@
+import type { GgufDetails } from './gguf.js'
+
 /**
- * Inspecting a downloaded model file (Settings → Inspect a model file).
+ * Inspecting a downloaded model file (Settings → Inspect a model file, and the
+ * chat side's Model check).
  *
- * The work is done by image-engine/scripts/inspect_model.py on this machine: it reads
- * the file's header and hashes it, and never loads or runs any of it. The studio only
- * starts it, reads its JSON lines, and shows the report. Scanning the file for malware
- * is left to the user's own antivirus.
+ * A GGUF file is read by the studio's own strict reader (shared/gguf.ts) in the
+ * main process. Anything else is handed to image-engine/scripts/inspect_model.py,
+ * run with the engine's Python on this machine. Either way the file's header is
+ * read and the file hashed, and none of it is loaded or run. Scanning the file
+ * for malware is left to the user's own antivirus.
  */
 
 export type FindingLevel = 'ok' | 'info' | 'warn' | 'danger'
@@ -33,6 +37,8 @@ export interface InspectReport {
     metadata_keys: number
     structure: string
   } | null
+  /** For a GGUF file whose header could be read: what it says about the model, and its chat template. */
+  gguf?: GgufDetails
 }
 
 export type InspectPhase = 'idle' | 'header' | 'hashing' | 'done' | 'failed' | 'cancelled'

@@ -28,6 +28,7 @@ export type EngineAction =
   | { type: 'jobs'; jobs: Job[] }
   | { type: 'forget-image'; id: string }
   | { type: 'replace-image'; image: ImageRecord }
+  | { type: 'gallery-moved' }
 
 export const initialEngineState: EngineState = {
   engine: { state: 'stopped' },
@@ -57,11 +58,21 @@ export function engineReducer(state: EngineState, action: EngineAction): EngineS
       return { ...state, session: state.session.filter((i) => i.id !== action.id), galleryVersion: state.galleryVersion + 1 }
     case 'replace-image':
       return { ...state, session: state.session.map((i) => (i.id === action.image.id ? action.image : i)) }
+    // A different gallery folder: this window's images belong to the old one.
+    case 'gallery-moved':
+      return { ...state, session: [], galleryVersion: state.galleryVersion + 1 }
     case 'event': {
       const e = action.event
       switch (e.type) {
         case 'hello':
-          return { ...state, status: e.status, jobs: Object.fromEntries(e.jobs.map((j) => [j.id, j])) }
+          // A fresh engine: whatever gallery it has now is what the window must read,
+          // which is not necessarily the one it read before (a restart, a new folder).
+          return {
+            ...state,
+            status: e.status,
+            jobs: Object.fromEntries(e.jobs.map((j) => [j.id, j])),
+            galleryVersion: state.galleryVersion + 1
+          }
         case 'job':
           return { ...state, jobs: { ...state.jobs, [e.job.id]: e.job } }
         case 'image':
@@ -132,10 +143,12 @@ export function useEngine(active: boolean): [EngineState, React.Dispatch<EngineA
   useEffect(() => {
     const offEvent = window.api.image.onEvent((event) => dispatch({ type: 'event', event }))
     const offState = window.api.image.onEngineState((engine) => dispatch({ type: 'engine', engine }))
+    const offMoved = window.api.image.onGalleryMoved(() => dispatch({ type: 'gallery-moved' }))
     void window.api.image.engineState().then((engine) => dispatch({ type: 'engine', engine }))
     return () => {
       offEvent()
       offState()
+      offMoved()
     }
   }, [])
 

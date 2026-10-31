@@ -11,6 +11,9 @@ files:
   # only runs the prebuilt binaries and never builds at run time, so it is left out.
   - "!**/node_modules/node-llama-cpp/llama/gitRelease.bundle"
   - "!**/node_modules/node-llama-cpp/llama/localBuilds/**"
+  # The stock addon, kept beside the studio's build of it so `addon.mjs restore`
+  # can put it back (scripts/native/addon.mjs). Only the one in use ships.
+  - "!**/node_modules/@node-llama-cpp/*/bins/*/llama-addon.stock.node"
 
 # The Python image engine ships as plain source next to the app. It runs in the
 # user's own Python environment (PyTorch is far too large to bundle), and its

@@ -24,7 +24,7 @@ class MemoryPlanTests(unittest.TestCase):
 
 class VideoMemoryPlanTests(unittest.TestCase):
     def test_auto_picks_by_vram(self):
-        # 11.94 GiB is what a 12 GB laptop card reports.
+        # 11.94 GiB is about what a 12 GB card reports.
         cases = [(48, "full"), (32, "full"), (24, "quality"), (16, "balanced"), (11.94, "balanced"),
                  (8, "low"), (6, "low")]
         for gib, expected in cases:

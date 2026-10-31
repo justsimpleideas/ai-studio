@@ -151,6 +151,7 @@ export function WorkspaceSidebar({
           {active.rules.filter((r) => r.enabled).length === 1 ? '' : 's'} ·{' '}
           {1 + active.extraRoots.filter((r) => r.enabled).length} shared folder
           {active.extraRoots.filter((r) => r.enabled).length === 0 ? '' : 's'}
+          {active.strict ? <div className="ws-strict">Strict mode: chat only</div> : null}
           <div className={`ws-net ws-net-${active.internet}`}>{internetLabel(active.internet)}</div>
         </div>
       ) : null}

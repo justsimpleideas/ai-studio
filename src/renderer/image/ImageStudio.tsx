@@ -5,6 +5,7 @@ import { GalleryView } from './components/GalleryView.js'
 import { GeneratePanel } from './components/GeneratePanel.js'
 import { ImageDetail } from './components/ImageDetail.js'
 import { Preview } from './components/Preview.js'
+import { QueueWindow } from './components/QueueWindow.js'
 import { SettingsView } from './components/SettingsView.js'
 import { TrainView } from './training/TrainView.js'
 import { useLoras } from './useLoras.js'
@@ -29,6 +30,7 @@ import { MAX_PNG_BYTES, settingsFromPng } from './png-settings.js'
 import type { ImageRecord, StartImage } from './types.js'
 import { activeJob, jobKind, queuedCount, useEngine } from './useEngine.js'
 import { useFolders } from './useFolders.js'
+import { loadOpenOnGenerate, queueOrder, saveOpenOnGenerate } from './queue.js'
 import {
   fitVideoToModel,
   fromVideo,
@@ -56,6 +58,9 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
   const [submitError, setSubmitError] = useState<string | null>(null)
   const [videoError, setVideoError] = useState<string | null>(null)
   const [detail, setDetail] = useState<{ image: ImageRecord; list: ImageRecord[] } | null>(null)
+  const [queueOpen, setQueueOpen] = useState(false)
+  const [openOnGenerate, setOpenOnGenerate] = useState(loadOpenOnGenerate)
+  useEffect(() => saveOpenOnGenerate(openOnGenerate), [openOnGenerate])
 
   // A shortcut (Ctrl+Shift+L by default), anywhere in the studio: lock every open PIN folder at
   // once. A gallery view of one goes to Favorites, and an item from a PIN folder open in detail closes.
@@ -128,6 +133,7 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
   const job = activeJob(engine.jobs, 'image')
   const videoJob = activeJob(engine.jobs, 'video')
   const pending = queuedCount(engine.jobs)
+  const inLine = queueOrder(engine.jobs).length
   const lastFailed = (kind: 'image' | 'video') =>
     Object.values(engine.jobs)
       .filter((j) => j.status === 'failed' && jobKind(j) === kind)
@@ -141,6 +147,7 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
     setSubmitError(null)
     try {
       await api.submit(toRequest(form, useLoraLibrary ? new Set(loras.list.map((l) => l.id)) : new Set()))
+      if (openOnGenerate) setQueueOpen(true)
     } catch (e) {
       setSubmitError((e as Error).message)
     }
@@ -150,6 +157,7 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
     setVideoError(null)
     try {
       await api.submitVideo(toVideoRequest(videoForm))
+      if (openOnGenerate) setQueueOpen(true)
     } catch (e) {
       setVideoError((e as Error).message)
     }
@@ -174,6 +182,24 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
       setDetail((d) => d && { image: updated, list: d.list.map((i) => (i.id === updated.id ? updated : i)) })
     } catch (e) {
       setNote({ ok: false, text: (e as Error).message })
+    }
+  }
+
+  const moveManyToFolder = async (ids: string[], folderId: string | null): Promise<number> => {
+    const moved = await folders.moveMany(ids, folderId)
+    for (const image of moved) dispatch({ type: 'replace-image', image })
+    return moved.length
+  }
+
+  /** Several deletions, one after another; whatever went before a failure stays gone. */
+  const removeMany = async (images: ImageRecord[]): Promise<void> => {
+    try {
+      for (const image of images) {
+        await api.deleteImage(image.id)
+        updateEverywhere({ id: image.id, deleted: true })
+      }
+    } finally {
+      if (images.some((i) => i.folder_id)) void folders.refresh()
     }
   }
 
@@ -274,6 +300,8 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
     e.dataTransfer.dropEffect = 'copy'
     setDragging(true)
   }
+
+  const closeQueue = useCallback(() => setQueueOpen(false), [])
 
   const registerUpdater = useCallback((fn: (u: GalleryUpdate) => void) => {
     galleryUpdater.current = fn
@@ -377,6 +405,8 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
               modelMessage={engine.status?.model.message ?? ''}
               onOpen={(image, list) => setDetail({ image, list })}
               onCancel={(j) => void api.cancel(j.id).catch(() => undefined)}
+              onQueue={() => setQueueOpen(true)}
+              waiting={Math.max(0, inLine - 1)}
               display={display.image}
             />
           </>
@@ -400,6 +430,8 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
               modelMessage={engine.status?.models?.video?.message ?? ''}
               onOpen={(video, list) => setDetail({ image: video, list })}
               onCancel={(j) => void api.cancel(j.id).catch(() => undefined)}
+              onQueue={() => setQueueOpen(true)}
+              waiting={Math.max(0, inLine - 1)}
               display={display.video}
             />
           </>
@@ -417,7 +449,11 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
               registerUpdater={registerUpdater}
               onError={(text) => setNote({ ok: false, text })}
               onMove={moveToFolder}
+              onMoveMany={moveManyToFolder}
               onDelete={remove}
+              onDeleteMany={removeMany}
+              onNotice={(text) => setNote({ ok: true, text })}
+              covered={detail !== null || queueOpen}
             />
           ))}
         {tab === 'train' && (
@@ -435,6 +471,23 @@ export function ImageStudio({ active }: { active: boolean }): React.JSX.Element 
           />
         )}
       </main>
+
+      {queueOpen && (
+        <QueueWindow
+          jobs={engine.jobs}
+          imageProfile={imageProfile}
+          video={engine.status?.video}
+          openOnGenerate={openOnGenerate}
+          onOpenOnGenerate={setOpenOnGenerate}
+          onCancel={async (j) => {
+            await api.cancel(j.id)
+          }}
+          onUpdate={async (j, request) => {
+            await api.updateJob(j.id, request)
+          }}
+          onClose={closeQueue}
+        />
+      )}
 
       {detail && (
         <ImageDetail

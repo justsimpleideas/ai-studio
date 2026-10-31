@@ -181,6 +181,24 @@ export class Broker {
     return null
   }
 
+  /**
+   * A file whose contents are shared with another name is not read.
+   *
+   * Resolving a path follows junctions and symbolic links, but a hard link is
+   * not a pointer to be followed: it is a second name for the same contents,
+   * and the other name can be anywhere on the volume, including outside every
+   * shared folder. Reading through it would hand the model a file the root
+   * check never saw. Writes and deletes need no such guard: a write lands in a
+   * temp file renamed over the name (the other name keeps the old contents),
+   * and a delete moves the name to the recycle bin.
+   */
+  private async sharedContents(call: FileToolCall, resolved: string): Promise<string | null> {
+    if (call.name !== 'read_file') return null
+    const stat = await fsp.stat(resolved).catch(() => null)
+    if (!stat?.isFile() || stat.nlink <= 1) return null
+    return `${path.basename(resolved)} shares its contents with ${stat.nlink - 1} other file name${stat.nlink > 2 ? 's' : ''} (a hard link), which may lie outside the shared folders, so it is not read.`
+  }
+
   private overLimit(call: FileToolCall, ctx: CallContext): string | null {
     if (!ctx.promptId) return null
     const count = this.counts.get(ctx.promptId) ?? { deletes: 0, writes: 0 }
@@ -220,8 +238,11 @@ export class Broker {
       return this.refuse(call, verdict.resolved, humanizeReason(verdict.reason), false)
     }
 
-    // Refused before anyone is asked: there is nothing for the user to approve
-    // until the agent has looked at the file.
+    // Both refused before anyone is asked: a boundary is not something to
+    // approve, and there is nothing to approve until the agent has looked at
+    // the file.
+    const linked = await this.sharedContents(call, verdict.resolved as string)
+    if (linked) return this.refuse(call, verdict.resolved, linked, false)
     const unseen = await this.unseenChange(call, verdict.resolved as string)
     if (unseen) return this.refuse(call, verdict.resolved, unseen, false)
 

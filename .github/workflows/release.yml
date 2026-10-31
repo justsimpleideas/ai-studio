@@ -27,6 +27,10 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      # The studio's build of the llama.cpp addon (scripts/native/addon.mjs): built
+      # here too, so a node-llama-cpp update that moved the patched code fails the
+      # test job rather than the release. The runner has MSVC and git.
+      - run: node scripts/native/addon.mjs build
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -47,6 +51,8 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      # Experts on the CPU with the built-in engine needs the studio's addon build in place.
+      - run: npm run addon
       - run: npm run package
         env:
           # Unsigned: there is no code-signing certificate.

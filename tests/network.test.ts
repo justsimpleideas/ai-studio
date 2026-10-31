@@ -9,7 +9,8 @@ import { NetworkLog } from '../src/main/net/log.js'
 import { Journal } from '../src/main/tools/journal.js'
 import type { ApprovalRequest, ApprovalResponse } from '../src/shared/broker-types.js'
 import { composeSystemPrompt } from '../src/shared/config.js'
-import { SEARCH_HOST, toolsFor, type InternetLevel } from '../src/shared/network.js'
+import { toolsFor, type InternetLevel } from '../src/shared/network.js'
+import { DEFAULT_SEARCH, type SearchPreferences } from '../src/shared/search.js'
 import { DEFAULT_PERMISSION_SETTINGS, DEFAULT_PROTECTED_PATHS, type ClassMode } from '../src/shared/permissions.js'
 import type { FileToolCall, WebToolCall } from '../src/shared/tools.js'
 
@@ -41,6 +42,7 @@ interface Setup {
   network?: ClassMode
   write?: ClassMode
   key?: string | null
+  search?: SearchPreferences
   respond?: (url: string) => Response
   addresses?: Record<string, string[]>
   allow?: boolean
@@ -71,6 +73,7 @@ function setup(opts: Setup = {}) {
   const gate = new WebGate({
     level: () => opts.level ?? 'search',
     askFirst: () => settings.modes.network !== 'auto',
+    search: () => opts.search ?? DEFAULT_SEARCH,
     searchKey: () => (opts.key === undefined ? 'test-key-1234' : opts.key),
     prompt,
     log,
@@ -124,23 +127,69 @@ describe('internet levels', () => {
 })
 
 describe('searching', () => {
-  it('shows the exact query first, then sends only it, with the key, to the search service', async () => {
+  it('shows the exact query first, then sends only it, with the key, to the default service', async () => {
     const { gate, prompt, fetchMock, log } = setup({
-      respond: () =>
-        Response.json({ web: { results: [{ title: 'A <b>result</b>', url: 'https://a.example/', description: 'Some &amp; text' }] } })
+      respond: () => Response.json({ results: [{ title: 'A <b>result</b>', url: 'https://a.example/', content: 'Some &amp; text' }] })
     })
     const outcome = await gate.execute(search('how to parse dates in typescript'), { promptId: 'p1', chatId: 'c1' })
     expect(prompt).toHaveBeenCalledTimes(1)
     const request = prompt.mock.calls[0]?.[0] as ApprovalRequest
-    expect(request.preview).toMatchObject({ kind: 'network', sends: 'how to parse dates in typescript' })
-    const [url, init] = fetchMock.mock.calls[0] as [URL, RequestInit]
-    expect(String(url)).toMatch(new RegExp(`^https://${SEARCH_HOST.replace(/\./g, '\\.')}/res/v1/web/search\\?q=how\\+to\\+parse`))
-    expect((init.headers as Record<string, string>)['X-Subscription-Token']).toBe('test-key-1234')
-    expect(init.method ?? 'GET').toBe('GET')
-    expect(init.body).toBeUndefined()
+    expect(request.preview).toMatchObject({ kind: 'network', sends: 'how to parse dates in typescript', to: 'Tavily (api.tavily.com)' })
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('https://api.tavily.com/search')
+    expect(init.method).toBe('POST')
+    expect((init.headers as Record<string, string>)['Authorization']).toBe('Bearer test-key-1234')
+    // The body is the query and a count, nothing else.
+    expect(JSON.parse(init.body as string)).toEqual({ query: 'how to parse dates in typescript', max_results: 8 })
     expect(outcome.ok).toBe(true)
     if (outcome.ok) expect(outcome.result).toEqual({ results: [{ title: 'A result', url: 'https://a.example/', snippet: 'Some & text' }] })
-    expect(log.recent()[0]).toMatchObject({ outcome: 'sent', sent: 'how to parse dates in typescript', chatId: 'c1', promptId: 'p1' })
+    expect(log.recent()[0]).toMatchObject({
+      outcome: 'sent',
+      sent: 'how to parse dates in typescript',
+      host: 'api.tavily.com',
+      chatId: 'c1',
+      promptId: 'p1'
+    })
+  })
+
+  it('sends a GET with the key in a header to the other hosted service', async () => {
+    const { gate, fetchMock, prompt } = setup({
+      search: { provider: 'brave', searxngUrl: null },
+      respond: () => Response.json({ web: { results: [{ title: 'B', url: 'https://b.example/', description: 'desc' }] } })
+    })
+    const outcome = await gate.execute(search('how to parse dates'))
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toMatch(/^https:\/\/api\.search\.brave\.com\/res\/v1\/web\/search\?q=how\+to\+parse\+dates&count=8$/)
+    expect(init.method).toBe('GET')
+    expect(init.body).toBeUndefined()
+    expect((init.headers as Record<string, string>)['X-Subscription-Token']).toBe('test-key-1234')
+    expect((prompt.mock.calls[0]?.[0] as ApprovalRequest).preview).toMatchObject({ to: 'Brave Search (api.search.brave.com)' })
+    expect(outcome.ok).toBe(true)
+    if (outcome.ok) expect(outcome.result).toEqual({ results: [{ title: 'B', url: 'https://b.example/', snippet: 'desc' }] })
+  })
+
+  it('asks a self-hosted instance for JSON, with no key, at the address the user gave', async () => {
+    const { gate, fetchMock, prompt, log } = setup({
+      key: null,
+      search: { provider: 'searxng', searxngUrl: 'http://localhost:8080/' },
+      respond: () => Response.json({ results: [{ title: 'S', url: 'https://s.example/', content: 'snippet' }] })
+    })
+    const outcome = await gate.execute(search('weather'))
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('http://localhost:8080/search?q=weather&format=json')
+    expect(init.method).toBe('GET')
+    expect(init.headers).not.toHaveProperty('Authorization')
+    expect((prompt.mock.calls[0]?.[0] as ApprovalRequest).preview).toMatchObject({ to: 'SearXNG (self-hosted) at localhost:8080' })
+    expect(outcome.ok).toBe(true)
+    expect(log.recent()[0]?.host).toBe('localhost:8080')
+  })
+
+  it('refuses to search when the self-hosted service has no address yet', async () => {
+    const { gate, fetchMock } = setup({ key: null, search: { provider: 'searxng', searxngUrl: null } })
+    const outcome = await gate.execute(search('weather'))
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) expect(outcome.error).toMatch(/No SearXNG address/)
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it('refuses queries that are too long or more than one line', async () => {

@@ -126,6 +126,8 @@ class Job:
             "count": self.request.count, "step": self.step, "steps": self.steps,
             "images": list(self.images), "error": self.error,
             "started": self.started, "finished": self.finished,
+            # A running job told to stop, which it does at its next step.
+            "cancelling": self.cancel_requested and self.status == RUNNING,
             **({"detail": dict(self.detail), "result": self.result} if self.kind == "task" else {}),
         }
 
@@ -205,7 +207,36 @@ class JobQueue:
             if job.status == QUEUED:
                 self._pending.remove(job.id)
                 self._finish(job, CANCELLED)
+                return job
+        self._publish(job)  # running: "cancelling" until it stops
         return job
+
+    def replace(self, job_id: str, request: GenerationRequest | VideoRequest) -> Job | None:
+        """Change what a job will make. A queued job keeps its id and its place in line. The
+        running job is cancelled and its changed copy goes first in line, so it starts again
+        as soon as the GPU is free; images it already finished stay in the gallery. The copy
+        keeps the original's `created`, which is what the UI orders the queue by.
+        None for an unknown job; a finished one, or a task, is returned unchanged."""
+        with self._cv:
+            job = self._jobs.get(job_id)
+            if job is None or job.status in FINISHED or job.kind == "task" or job.cancel_requested:
+                return job
+            if request.kind != job.kind:
+                raise ValueError(f"a {job.kind} job cannot become a {request.kind} job")
+            if job.status == QUEUED:
+                job.request = request
+                changed = job
+            else:
+                job.cancel_requested = True
+                changed = Job(id=secrets.token_hex(8), request=request, created=job.created)
+                self._jobs[changed.id] = changed
+                self._pending.insert(0, changed.id)
+                self._trim_history()
+                self._cv.notify_all()
+        if changed is not job:
+            self._publish(job)
+        self._publish(changed)
+        return changed
 
     def get(self, job_id: str) -> Job | None:
         with self._cv:

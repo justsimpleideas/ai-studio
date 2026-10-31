@@ -5,13 +5,17 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, protocol, safeS
 import {
   MODEL_SLOTS,
   composeSystemSections,
+  isChatEngine,
   isCloseBehavior,
   isKvCacheType,
   isTheme,
   parseBackground,
   parseFolderPrivacy,
+  parseNotifications,
+  parseServer,
   type Theme,
   type BackgroundPreferences,
+  type NotificationPreferences,
   type GlobalRule,
   type SystemSection
 } from '@shared/config.js'
@@ -22,15 +26,19 @@ import { isWebTool, type FileToolCall, type RiskClass, type WebToolCall } from '
 import { isInternetLevel, toolsFor } from '@shared/network.js'
 import type { ApprovalRequest, ApprovalResponse, AuditEntry, ToolOutcome } from '@shared/broker-types.js'
 import type { EngineToMain, LoadRequest } from '@shared/engine-protocol.js'
+import { isSamplingChoice, isThinkingMode, parseContextSize, parseGeneration } from '@shared/generation.js'
+import { checkSearxngUrl, isSearchProviderId, parseSearch } from '@shared/search.js'
 import { validateToolCall } from '@shared/validate.js'
 import { IMAGE_ENGINE_PORT, IMAGE_SCHEME } from '@shared/image.js'
 import { SHORTCUTS, normalizeShortcut, shortcutProblem, type ShortcutMap } from '@shared/shortcuts.js'
+import { CHAT_REPLY_NOTICE, JobWatcher } from '@shared/notifications.js'
 import { BackgroundUnloader, type UnloadTarget } from './background.js'
 import { dialogOpen, watchDialogs } from './dialog-watch.js'
 import { Broker } from './broker/index.js'
 import { canonicalize, comparablePath } from './broker/paths.js'
 import { EngineSupervisor } from './engine/supervisor.js'
-import { isGgufFile } from './gguf.js'
+import { checkGgufFile, isGgufFile } from './gguf.js'
+import { modelPickerStart } from './picker.js'
 import { GpuArbiter } from './gpu.js'
 import { MODEL_CATALOG } from '@shared/setup.js'
 import { ModelDownloads } from './image/downloads.js'
@@ -40,14 +48,17 @@ import { ImageEngine } from './image/engine.js'
 import { registerImageHandlers, serveImage } from './image/handlers.js'
 import { PhotoCollector } from './image/collect.js'
 import { registerTrainingHandlers } from './image/training-handlers.js'
-import { EngineSetup } from './image/setup.js'
+import { EngineSetup, HardwareProbe } from './image/setup.js'
 import { Journal } from './tools/fs-tools.js'
 import { ConfigStore } from './store.js'
+import { FileSealer } from './sealer.js'
 import { ChatRecorder } from './chat-recorder.js'
 import { isSafeId, WorkspaceStore } from './workspaces.js'
 import { WebGate } from './net/gate.js'
 import { NetworkLog } from './net/log.js'
-import { SecretStore } from './secrets.js'
+import { searchKeyName, SecretStore } from './secrets.js'
+import { DataLocationStore } from './locations.js'
+import type { DataLocationKey, DataLocationsView } from '@shared/locations.js'
 
 /**
  * Wiring.
@@ -75,11 +86,41 @@ protocol.registerSchemesAsPrivileged([
   { scheme: IMAGE_SCHEME, privileges: { standard: true, secure: true, stream: true } }
 ])
 
-const userDataRoot = path.join(app.getPath('userData'), 'userData')
+/**
+ * Where the studio's own folders are. The chats folder and the gallery folder
+ * can be moved from Settings; this is read before anything opens either, and
+ * the chats folder is then fixed for the life of the process (locations.ts).
+ */
+const locations = new DataLocationStore(app.getPath('userData'), [
+  path.dirname(app.getPath('exe')),
+  process.resourcesPath
+])
+const userDataRoot = locations.get('userData')
+
+/**
+ * Whether safeStorage's own key is on disk yet. On Windows it lives in the
+ * profile's "Local State" file, which Chromium writes some seconds after it is
+ * made; elsewhere the key is in the system keychain.
+ */
+function systemKeySaved(): boolean {
+  if (process.platform !== 'win32') return true
+  try {
+    const state = JSON.parse(fs.readFileSync(path.join(app.getPath('userData'), 'Local State'), 'utf8')) as {
+      os_crypt?: { encrypted_key?: unknown }
+    }
+    return typeof state.os_crypt?.encrypted_key === 'string'
+  } catch {
+    return false
+  }
+}
 const store = new ConfigStore(path.join(userDataRoot, 'config.json'))
 // Before any dialog can open: the folder lock on losing focus skips the studio's own dialogs.
 watchDialogs()
-const workspaces = new WorkspaceStore(path.join(userDataRoot, 'workspaces'))
+// Conversations are encrypted on disk with a key only this user account can open (sealer.ts).
+const workspaces = new WorkspaceStore(
+  path.join(userDataRoot, 'workspaces'),
+  new FileSealer(path.join(userDataRoot, 'chat-key.json'), safeStorage, systemKeySaved)
+)
 const secrets = new SecretStore(path.join(userDataRoot, 'secrets.json'), safeStorage)
 
 let window: BrowserWindow | null = null
@@ -184,7 +225,8 @@ function systemFor(ws: Workspace): SystemSection[] {
     extraFolders: ws.extraRoots.filter((r) => r.enabled).map((r) => r.path),
     projectRules: ws.rules,
     readOnly: ws.protectedPaths.filter((p) => p.enabled && p.level === 'read-only').map((p) => p.pattern),
-    internet: ws.internet
+    internet: ws.internet,
+    strict: ws.strict
   })
 }
 
@@ -213,7 +255,8 @@ function gateFor(ws: Workspace): WebGate {
       // Read fresh on every request: switching a folder back to offline takes effect at once.
       level: () => workspaces.get(id)?.internet ?? 'offline',
       askFirst: () => store.get().permissions.modes.network !== 'auto',
-      searchKey: () => secrets.get('searchKey'),
+      search: () => store.get().search,
+      searchKey: () => secrets.searchKey(store.get().search.provider),
       prompt: askUser,
       log: networkLogFor(id),
       leaks: () => brokerFor(ws).contents,
@@ -361,6 +404,23 @@ function unloadChat(): Promise<void> {
  */
 let pendingLoad: LoadRequest | null = null
 
+/**
+ * The llama-server process the server host started, by id. The host ends it on
+ * unload; this is the backstop for when the host itself is killed outright
+ * (quit, a wedge, a switch of engine) and cannot.
+ */
+let sidecarPid: number | null = null
+
+function killSidecar(): void {
+  if (sidecarPid === null) return
+  try {
+    process.kill(sidecarPid)
+  } catch {
+    // Already gone.
+  }
+  sidecarPid = null
+}
+
 function sendLoad(request: LoadRequest): void {
   pendingLoad = request
   chat.loading = true
@@ -385,21 +445,50 @@ function retryAt16Bit(): boolean {
   return true
 }
 
+/**
+ * The chat engine's log: its own output (where llama.cpp says why a load
+ * failed) and every fatal error, in the user's data folder. Kept to the last
+ * couple of megabytes. Nothing in it leaves the machine.
+ */
+const engineLogFile = path.join(userDataRoot, 'logs', 'engine.log')
+
+function engineLog(line: string): void {
+  try {
+    fs.mkdirSync(path.dirname(engineLogFile), { recursive: true })
+    const size = fs.existsSync(engineLogFile) ? fs.statSync(engineLogFile).size : 0
+    if (size > 2 * 1024 * 1024) fs.renameSync(engineLogFile, `${engineLogFile}.old`)
+    fs.appendFileSync(engineLogFile, `${new Date().toISOString()} ${line}\n`, 'utf8')
+  } catch {
+    // A log that cannot be written is not a reason to disturb anything else.
+  }
+}
+
+/**
+ * A failure the user must see wherever they are in the window: the chat
+ * transcript gets it (as before), and so does the studio-wide notice, which a
+ * load started from the Model check tab or the gallery would otherwise hide.
+ */
+function reportFatal(message: string): void {
+  engineLog(`FATAL ${message}`)
+  toRenderer('studio:notice', message)
+}
+
 const engine = new EngineSupervisor(
   (message) => void handleEngineMessage(message),
   (code) => {
+    killSidecar()
     chatSettled()
+    engineLog(`engine exited with code ${code}`)
     if (retryAt16Bit()) return
-    toRenderer('engine:event', {
-      type: 'error',
-      id: null,
-      message:
-        code === 0
-          ? 'The model process stopped.'
-          : `The model process stopped unexpectedly (exit code ${code}). The model is no longer loaded.`,
-      fatal: true
-    } satisfies EngineToMain)
-  }
+    const said = engine.lastOutput(3).join(' / ')
+    const message =
+      code === 0
+        ? 'The model process stopped.'
+        : `The model process stopped unexpectedly (exit code ${code}). The model is no longer loaded.${said ? ` Last output: ${said}` : ''}`
+    reportFatal(message)
+    toRenderer('engine:event', { type: 'error', id: null, message, fatal: true } satisfies EngineToMain)
+  },
+  (line) => engineLog(line)
 )
 
 /**
@@ -410,10 +499,28 @@ const engine = new EngineSupervisor(
  * turn.
  */
 async function handleEngineMessage(message: EngineToMain): Promise<void> {
+  if (message.type === 'restartEngine') {
+    // The engine loaded nothing; it starts again with the given environment and
+    // gets the same load request, which waits in the queue until it is ready.
+    engineLog(`restart requested: ${message.reason}`)
+    toRenderer('studio:notice', message.reason)
+    engine.restartWith(message.env)
+    if (pendingLoad) engine.send({ type: 'load', request: pendingLoad })
+    return
+  }
+  if (message.type === 'sidecar') {
+    sidecarPid = message.pid
+    return
+  }
   if (message.type === 'loaded') pendingLoad = null
   if (message.type === 'error' && message.fatal && retryAt16Bit()) return
+  if (message.type === 'error' && message.fatal) {
+    const said = engine.lastOutput(3).join(' / ')
+    reportFatal(`The model could not be loaded: ${message.message}${said ? ` (last output: ${said})` : ''}`)
+  }
   trackChat(message)
   record(message)
+  if (message.type === 'complete') noticeInBackground('chatReply', CHAT_REPLY_NOTICE)
   if (message.type === 'history') return
   if (message.type !== 'toolCall') {
     toRenderer('engine:event', message)
@@ -440,10 +547,14 @@ async function handleEngineMessage(message: EngineToMain): Promise<void> {
 
   // Folders cannot be switched while a reply is running, so the workspace open
   // now is the one the prompt was sent in. Web tools go to the internet gate,
-  // file tools to the broker; neither can reach the other's capability.
+  // file tools to the broker; neither can reach the other's capability. In
+  // strict mode the model was given no tools, so a call is refused here before
+  // either sees it, whatever the model made up.
   const call = validation.call
   const outcome: ToolOutcome = !activeWorkspace
     ? { ok: false, tool: call.name, resolved: null, error: 'No folder is open.', refused: true }
+    : activeWorkspace.strict
+      ? { ok: false, tool: call.name, resolved: null, error: 'This folder is in strict mode: the model has no tools.', refused: true }
     : isWebTool(call.name)
       ? await gateFor(activeWorkspace).execute(call as WebToolCall, {
           promptId: message.promptId,
@@ -472,6 +583,12 @@ function record(message: EngineToMain): void {
   switch (message.type) {
     case 'chunk':
       rec.chunk(message.id, message.text)
+      break
+    case 'thought':
+      rec.thought(message.id, message.text)
+      break
+    case 'stats':
+      rec.replyStats(message.id, message.stats)
       break
     case 'complete':
       rec.complete(message.id, message.text)
@@ -531,15 +648,26 @@ const imageEngineDir = app.isPackaged
 const imageDataDir = path.join(app.getPath('userData'), 'image')
 const imagePython = (): string => process.env['STUDIO_PYTHON'] ?? store.get().image.pythonPath ?? 'python'
 
+/** Which image and video jobs are done, so the tray announces each one once (config.notifications). */
+const jobWatcher = new JobWatcher()
+
 const imageEngine = new ImageEngine({
   python: imagePython,
   engineDir: imageEngineDir,
   dataDir: imageDataDir,
+  outputsDir: () => locations.choice('outputs'),
   port: IMAGE_ENGINE_PORT,
   // Only for end-to-end tests: run the engine with a fake model (see image-engine/tests/ui_harness.py).
   module: process.env['STUDIO_IMAGE_ENGINE_MODULE'] ?? 'image_engine',
   appVersion: app.getVersion(),
-  onEvent: (event) => toRenderer('image:event', event),
+  onEvent: (event) => {
+    if (event.type === 'hello') jobWatcher.reset(event.jobs)
+    else if (event.type === 'job') {
+      const notice = jobWatcher.update(event.job)
+      if (notice) noticeInBackground('mediaDone', notice)
+    }
+    toRenderer('image:event', event)
+  },
   onState: (state) => toRenderer('image:engineState', state)
 })
 
@@ -710,6 +838,13 @@ function trayMessage(content: string): void {
   tray.displayBalloon({ title: 'Local AI Studio', content, iconType: 'info' })
 }
 
+/** A tray notice that something is done, only while the window is hidden and only if chosen in Settings. */
+function noticeInBackground(kind: keyof NotificationPreferences, content: string): void {
+  if (window?.isVisible()) return
+  if (!store.get().notifications[kind]) return
+  trayMessage(content)
+}
+
 function ensureTray(): void {
   if (tray) return
   const icon = windowIcon().icon
@@ -723,6 +858,8 @@ function ensureTray(): void {
     ])
   )
   tray.on('click', showWindow)
+  // Clicking a notice opens the studio, as the icon does.
+  tray.on('balloon-click', showWindow)
 }
 
 /**
@@ -765,7 +902,7 @@ function measureUsage(): void {
   engine.send({
     type: 'measureUsage',
     system: systemFor(activeWorkspace),
-    tools: toolsFor(activeWorkspace.internet),
+    tools: toolsFor(activeWorkspace.internet, activeWorkspace.strict),
     ...chatTarget(recorder)
   })
 }
@@ -1060,9 +1197,12 @@ function registerHandlers(): void {
   })
 
   ipcMain.handle('model:pick', async () => {
+    const start = modelPickerStart(store.get().model.lastModelPath)
     const result = await dialog.showOpenDialog({
       title: 'Choose a GGUF model',
       properties: ['openFile'],
+      // Opens on the last model loaded, so it need not be looked for again.
+      ...(start ? { defaultPath: start } : {}),
       // Some model managers keep GGUF files named only by their hash, with no
       // extension (blobs/sha256-…), so "All files" is offered too; the file is
       // checked by content on load.
@@ -1077,19 +1217,65 @@ function registerHandlers(): void {
   ipcMain.handle('model:load', async (_e, modelPath: string) => {
     if (!fs.existsSync(modelPath)) throw new Error('That model file no longer exists.')
     if (!(await isGgufFile(modelPath))) throw new Error('That file is not a GGUF model.')
+    // The whole header, read and checked by the studio's own strict reader
+    // before the native loader is allowed anywhere near the file.
+    const checked = await checkGgufFile(modelPath)
+    if (!checked.ok) throw new Error(checked.reason)
+    const config = store.get()
+    if (config.model.engine === 'server') {
+      const program = config.model.server.path
+      if (!program || !fs.existsSync(program)) {
+        throw new Error('Choose the llama-server program first: model menu → Engine → Choose llama-server…')
+      }
+    }
     await gpu.claim('chat')
     chat.loading = true
-    const config = store.get()
     await store.update((c) => {
       c.model.lastModelPath = modelPath
     })
+    // Each engine is its own host process; switching ends the other, and any
+    // server the old one was running.
+    const entry = config.model.engine === 'server' ? 'serverHost.js' : 'engineHost.js'
+    if (engine.entry !== entry) killSidecar()
+    engine.useEntry(entry)
     sendLoad({
       modelPath,
       backend: config.model.backend,
       gpuLayers: config.model.gpuLayers,
       contextSize: config.model.contextSize,
-      kvCache: config.model.kvCache
+      kvCache: config.model.kvCache,
+      engine: config.model.engine,
+      server: config.model.server
     })
+  })
+
+  // The engine and how its server is started; both take effect at the next load.
+  ipcMain.handle('config:setEngine', async (_e, engine: unknown, server: unknown) => {
+    if (!isChatEngine(engine)) throw new Error('Unknown engine.')
+    const prefs = parseServer(server)
+    const config = await store.update((c) => {
+      c.model.engine = engine
+      // The program is chosen through the dialog below, never named by the window.
+      c.model.server = { ...prefs, path: c.model.server.path }
+    })
+    toRenderer('config:changed', config)
+    return config
+  })
+
+  ipcMain.handle('model:pickServer', async () => {
+    const picked = await dialog.showOpenDialog(window ?? (undefined as never), {
+      title: 'Choose the llama-server program',
+      properties: ['openFile'],
+      filters: process.platform === 'win32' ? [{ name: 'llama-server', extensions: ['exe'] }] : []
+    })
+    const program = picked.filePaths[0]
+    if (picked.canceled || !program) return null
+    if (!/llama-server/i.test(path.basename(program))) throw new Error('That is not llama-server.')
+    const config = await store.update((c) => {
+      c.model.server = { ...c.model.server, path: program }
+    })
+    toRenderer('config:changed', config)
+    return config
   })
 
   // Takes effect at the next load; the window offers to reload straight away.
@@ -1097,6 +1283,25 @@ function registerHandlers(): void {
     if (!isKvCacheType(kv)) throw new Error('Unknown context memory type.')
     return store.update((c) => {
       c.model.kvCache = kv
+    })
+  })
+
+  // Also at the next load. Null means the default: the trained size, capped.
+  ipcMain.handle('config:setContextSize', async (_e, size: unknown) => {
+    if (size !== null && parseContextSize(size) === null) throw new Error('Unknown context size.')
+    return store.update((c) => {
+      c.model.contextSize = size as number | null
+    })
+  })
+
+  // Sampling and thinking go with the next prompt; nothing is reloaded.
+  ipcMain.handle('config:setGeneration', async (_e, prefs: unknown) => {
+    const raw = prefs as Record<string, unknown> | null
+    if (!raw || typeof raw !== 'object' || !isThinkingMode(raw.thinking) || !isSamplingChoice(raw.sampling)) {
+      throw new Error('Invalid setting.')
+    }
+    return store.update((c) => {
+      c.model.generation = parseGeneration(raw)
     })
   })
 
@@ -1119,6 +1324,18 @@ function registerHandlers(): void {
     }
     const config = await store.update((c) => {
       c.folderPrivacy = parseFolderPrivacy(raw)
+    })
+    toRenderer('config:changed', config)
+    return config
+  })
+
+  ipcMain.handle('config:setNotifications', async (_e, prefs: unknown) => {
+    const raw = prefs as Record<string, unknown> | null
+    if (!raw || typeof raw !== 'object' || typeof raw['chatReply'] !== 'boolean' || typeof raw['mediaDone'] !== 'boolean') {
+      throw new Error('Invalid setting.')
+    }
+    const config = await store.update((c) => {
+      c.notifications = parseNotifications(raw)
     })
     toRenderer('config:changed', config)
     return config
@@ -1154,8 +1371,84 @@ function registerHandlers(): void {
     return config
   })
 
+  // ------------------------------------------------- where the data is kept
+
+  /**
+   * Moving the chats folder or the gallery folder (locations.ts). The window
+   * never names a path: it asks for the picker, and the main process keeps
+   * whatever came back. Nothing is copied or deleted, so the folder being left
+   * keeps everything in it.
+   */
+  async function pickLocation(key: DataLocationKey): Promise<DataLocationsView> {
+    if (key === 'userData') assertIdle()
+    // One preset per folder, so an end-to-end test choosing a workspace folder
+    // cannot move the studio's data by accident (STUDIO_PICK_FOLDER).
+    const preset = process.env[key === 'userData' ? 'STUDIO_PICK_CHATS_FOLDER' : 'STUDIO_PICK_GALLERY_FOLDER']
+    const picked =
+      preset ??
+      (await pickFolder(
+        key === 'userData' ? 'Choose where to keep chats and settings' : 'Choose where to keep the gallery',
+        key === 'userData' ? 'Keep chats here' : 'Keep the gallery here'
+      ))
+    if (!picked) return locations.view()
+    return applyLocation(key, picked)
+  }
+
+  async function applyLocation(key: DataLocationKey, folder: string | null): Promise<DataLocationsView> {
+    if (key === 'userData') assertIdle()
+    // The gallery is open in the engine (its database and the images it serves),
+    // so the engine has to let go before the folder under it changes.
+    if (key === 'outputs') {
+      const busy = imageEngine.busyReason
+      if (busy) throw new Error(`${busy} Wait for it to finish first.`)
+    }
+    const view = locations.set(key, folder)
+    if (key === 'outputs') {
+      const wasRunning = imageEngine.state.state === 'running'
+      await imageEngine.stop()
+      // Said before the engine is back, so nothing of the old gallery is left on
+      // screen while the new one loads.
+      toRenderer('image:galleryMoved', undefined)
+      if (wasRunning) void imageEngine.start().catch(() => undefined)
+    }
+    return view
+  }
+
+  ipcMain.handle('locations:get', () => locations.view())
+
+  ipcMain.handle('locations:choose', (_e, key: unknown) => {
+    if (key !== 'userData' && key !== 'outputs') throw new Error('Unknown folder.')
+    return pickLocation(key)
+  })
+
+  ipcMain.handle('locations:reset', (_e, key: unknown) => {
+    if (key !== 'userData' && key !== 'outputs') throw new Error('Unknown folder.')
+    return applyLocation(key, null)
+  })
+
+  /**
+   * Start again on the new chats folder. The stores are opened once, at
+   * startup, and a running studio holds the old folder's chat key, so there is
+   * nothing to switch over in place.
+   */
+  ipcMain.handle('locations:restart', () => {
+    assertIdle()
+    app.relaunch()
+    app.quit()
+  })
+
   ipcMain.handle('model:unload', () => {
     engine.send({ type: 'unload' })
+  })
+
+  // The chat model's own file, through the same inspector as Settings → Inspect.
+  // The path is the one the user picked to load, never one the window names.
+  ipcMain.handle('model:inspect', async () => {
+    const modelPath = store.get().model.lastModelPath
+    if (!modelPath || !fs.existsSync(modelPath)) return false
+    if (modelInspector.running) throw new Error('A file is already being inspected.')
+    await modelInspector.inspect(modelPath)
+    return true
   })
 
   ipcMain.handle('chat:send', (_e, text: unknown) => {
@@ -1173,7 +1466,15 @@ function registerHandlers(): void {
     journalFor(ws.id).label(id, chatTitle(text), rec.chat.meta.id)
     // Saved straight away, so the message survives even if the reply never comes.
     saveChat()
-    engine.send({ type: 'prompt', id, text, system: systemFor(ws), tools: toolsFor(ws.internet), ...chatTarget(rec) })
+    engine.send({
+      type: 'prompt',
+      id,
+      text,
+      system: systemFor(ws),
+      tools: toolsFor(ws.internet, ws.strict),
+      generation: store.get().model.generation,
+      ...chatTarget(rec)
+    })
     return id
   })
 
@@ -1210,6 +1511,18 @@ function registerHandlers(): void {
 
   // ---------------------------------------------------------- internet
 
+  ipcMain.handle('workspace:setStrict', async (_e, strict: unknown) => {
+    const ws = activeWorkspace
+    if (!ws) throw new Error('No folder is open.')
+    if (typeof strict !== 'boolean') throw new Error('Not a setting.')
+    assertIdle()
+    activeWorkspace = await workspaces.update(ws.id, (w) => {
+      w.strict = strict
+    })
+    measureUsage()
+    return workspaceState()
+  })
+
   ipcMain.handle('workspace:setInternet', async (_e, level: unknown) => {
     const ws = activeWorkspace
     if (!ws) throw new Error('No folder is open.')
@@ -1224,14 +1537,31 @@ function registerHandlers(): void {
 
   ipcMain.handle('network:log', () => (activeWorkspace ? networkLogFor(activeWorkspace.id).recent(200) : []))
 
-  ipcMain.handle('internet:keyStatus', () => ({ hasKey: secrets.has('searchKey') }))
+  // The key is the current search service's; each service has its own slot.
+  ipcMain.handle('internet:keyStatus', () => ({ hasKey: secrets.searchKey(store.get().search.provider) !== null }))
 
   ipcMain.handle('internet:setKey', async (_e, key: unknown) => {
     if (key !== null && (typeof key !== 'string' || !/^[!-~]{8,200}$/.test(key.trim()))) {
       throw new Error('That does not look like an API key.')
     }
-    await secrets.set('searchKey', key === null ? null : key.trim())
-    return { hasKey: secrets.has('searchKey') }
+    const provider = store.get().search.provider
+    await secrets.set(searchKeyName(provider), key === null ? null : key.trim())
+    if (key === null && provider === 'brave') await secrets.set('searchKey', null)
+    return { hasKey: secrets.searchKey(provider) !== null }
+  })
+
+  ipcMain.handle('internet:setSearch', async (_e, prefs: unknown) => {
+    const raw = prefs as Record<string, unknown> | null
+    if (!raw || typeof raw !== 'object' || !isSearchProviderId(raw.provider)) throw new Error('Unknown search service.')
+    if (raw.provider === 'searxng') {
+      const checked = checkSearxngUrl(raw.searxngUrl)
+      if (!checked.ok) throw new Error(checked.error)
+    }
+    const config = await store.update((c) => {
+      c.search = parseSearch(raw)
+    })
+    toRenderer('config:changed', config)
+    return config
   })
 
   ipcMain.handle('workspace:setProtected', async (_e, list: unknown) => {
@@ -1286,6 +1616,19 @@ app.whenReady().then(() => {
   // Groups the window on the Windows taskbar under this app rather than under
   // a generic Electron entry. Same id as appId in electron-builder.yml.
   if (process.platform === 'win32') app.setAppUserModelId('com.justsimpleideas.localaistudio')
+  // Chats saved before encryption existed are sealed now rather than whenever each is
+  // next opened. On a first run the system key may not be on disk yet (systemKeySaved),
+  // so this is tried again a minute later, by which time Chromium has written it.
+  const sealPlain = (): void =>
+    void workspaces
+      .sealPlainFiles()
+      .then((count) => {
+        if (count > 0) console.log(`Encrypted ${count} chat file(s) saved in plain text.`)
+      })
+      .catch((err: Error) => console.warn(`Saved chats could not be encrypted: ${err.message}`))
+  safeStorage.isEncryptionAvailable() // makes the system key now, so it is saved sooner
+  sealPlain()
+  setTimeout(sealPlain, 60_000).unref()
   restoreLastWorkspace()
   session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
     callback({ cancel: !isLocalRequest(details.url) })
@@ -1299,6 +1642,7 @@ app.whenReady().then(() => {
     gpu,
     getWindow: () => window,
     setup: engineSetup,
+    hardware: new HardwareProbe(),
     downloads: modelDownloads,
     inspector: modelInspector,
     importer: modelImporter,
@@ -1317,6 +1661,7 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   engine.stop()
+  killSidecar()
   imageEngine.stop()
   if (process.platform !== 'darwin') app.quit()
 })
@@ -1325,6 +1670,7 @@ app.on('before-quit', () => {
   quitting = true
   backgroundUnloader.stop()
   engine.stop()
+  killSidecar()
   imageEngine.stop()
   // pip and the downloader leave resumable state behind, so stopping them is safe.
   engineSetup.cancel()

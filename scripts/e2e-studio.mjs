@@ -71,6 +71,9 @@ mkdirSync(workspaceDir)
 writeFileSync(join(workspaceDir, 'readme.txt'), 'A demo project.')
 // Where "Save as…" writes, standing in for the native save dialog.
 const exportPath = join(dirname(workspaceDir), 'exported.png')
+// Where the gallery's multi-select saves copies, standing in for the folder picker.
+const exportFolder = join(dirname(workspaceDir), 'saved-copies')
+mkdirSync(exportFolder, { recursive: true })
 // Where downloaded models would go, standing in for the folder picker (nothing is downloaded).
 const modelsDir = join(dirname(workspaceDir), 'models')
 // Synthetic training photos, standing in for the photo-folder picker of the Train tab.
@@ -85,6 +88,10 @@ const TRAINS_FOR_REAL = spawnSync(PYTHON, ['-c', 'import torch, diffusers, safet
 const FAKE_SOURCES_PORT = 9362
 const fakeSources = spawn(PYTHON, ['-m', 'tests.fake_photo_sources', String(FAKE_SOURCES_PORT)], { cwd: join(ROOT, 'image-engine'), stdio: 'ignore' })
 const collectedPhotos = join(dirname(workspaceDir), 'collected')
+// Where the gallery and the chats are moved to, standing in for the folder pickers
+// of Settings → Where things are kept.
+const movedGallery = join(dirname(workspaceDir), 'moved-gallery')
+const movedChats = join(dirname(workspaceDir), 'moved-chats')
 const env = { ...process.env }
 delete env.ELECTRON_RUN_AS_NODE
 Object.assign(env, {
@@ -93,11 +100,14 @@ Object.assign(env, {
   STUDIO_PYTHON: process.env.STUDIO_PYTHON ?? 'python',
   STUDIO_PICK_FOLDER: workspaceDir,
   STUDIO_SAVE_AS: exportPath,
+  STUDIO_PICK_EXPORT_FOLDER: exportFolder,
   // The start-picture picker answers with the exported PNG, which exists by the time it is asked.
   STUDIO_PICK_START_IMAGE: exportPath,
   STUDIO_PICK_MODELS_FOLDER: modelsDir,
   STUDIO_PICK_TRAINING_FOLDER: trainingPhotos,
   STUDIO_PICK_COLLECT_FOLDER: collectedPhotos,
+  STUDIO_PICK_GALLERY_FOLDER: movedGallery,
+  STUDIO_PICK_CHATS_FOLDER: movedChats,
   STUDIO_PICK_MERGE_SOURCES: [join(mergeGalleries, 'pc1', 'outputs'), join(mergeGalleries, 'pc2')].join(delimiter),
   STUDIO_COLLECT_COMMONS_API: `http://127.0.0.1:${FAKE_SOURCES_PORT}/commons/api.php`,
   STUDIO_COLLECT_OPENVERSE_API: `http://127.0.0.1:${FAKE_SOURCES_PORT}/openverse/v1/images/`,
@@ -398,6 +408,10 @@ try {
   await setValue(inImage('textarea.prompt'), 'A lighthouse on a rocky coast at dusk')
   await setValue(inImage('input[type="range"]'), 2)
   await click(inImage('.generate-button'))
+  check('Generate opens the queue window', await waitFor(`!!document.querySelector(${q(inImage('.queue-window'))})`))
+  check('with the new job in it', await waitFor(`document.querySelectorAll(${q(inImage('.queue-row'))}).length === 1 && document.querySelector(${q(inImage('.queue-prompt'))}).textContent === "A lighthouse on a rocky coast at dusk"`))
+  await clickText(inImage('.queue-window button'), 'Close')
+  check('and it closes', await waitFor(`!document.querySelector(${q(inImage('.queue-window'))})`))
   check('progress card appears', await waitFor(`!!document.querySelector(${q(inImage('.progress-card'))})`))
   check('progress reports steps', await waitFor(`/Step \\d+ of 8/.test(document.querySelector(${q(inImage('.progress-card'))})?.textContent ?? "")`))
   await shot('02-progress')
@@ -411,6 +425,69 @@ try {
     await waitFor(`[...document.querySelectorAll(${q(inImage('.film img'))})].every(i => i.complete && i.naturalWidth > 0)`)
   )
   await shot('03-result')
+
+  console.log('queue')
+  // Long jobs (50 steps at the harness's 0.15 s a step), all cancelled before they finish an image.
+  const submitLong = (prompt) =>
+    js(`window.api.image.submit({ prompt: ${q(prompt)}, negative_prompt: "", width: 512, height: 512, steps: 50, guidance: 0, seed: 5, count: 1 })`)
+  const qa = await submitLong('queue: first')
+  const qb = await submitLong('queue: second')
+  const qc = await submitLong('queue: third')
+  const queueJob = (id) => `window.api.image.jobs().then((all) => all.find((j) => j.id === ${q(id)}))`
+  const row = (id, sel = '') => inImage(`.queue-row[data-job="${id}"] ${sel}`)
+  const rowPrompts = `[...document.querySelectorAll(${q(inImage('.queue-row .queue-prompt'))})].map((p) => p.textContent).join("|")`
+  const rowPlaces = `[...document.querySelectorAll(${q(inImage('.queue-row .queue-place'))})].map((p) => p.textContent).join("|")`
+  const card = `(document.querySelector(${q(inImage('.progress-card'))})?.textContent ?? "")`
+  check('the progress card says Cancel is for the job it shows', await waitFor(`${card}.includes("Cancel this one") && ${card}.includes("queue: first")`), await js(card))
+  check('and how many wait behind it', await waitFor(`${card}.includes("Queue · 2 waiting")`))
+  await click(inImage('.progress-card .queue-button'))
+  check('the queue window lists them in the order they run', await waitFor(`${rowPrompts} === "queue: first|queue: second|queue: third"`), await js(rowPrompts))
+  check('marking the one being made and the places in line', await waitFor(`${rowPlaces} === "Making now|Next|2nd in line"`))
+  await shot('03b-queue')
+
+  await clickText(row(qb.id, 'button'), 'Edit')
+  check('a queued job opens for editing', await waitFor(`!!document.querySelector(${q(row(qb.id, '.queue-editor'))})`))
+  check('with its own settings', await js(`document.querySelector(${q(row(qb.id, '.queue-editor textarea.prompt'))}).value === "queue: second"`))
+  await setValue(row(qb.id, '.queue-editor textarea.prompt'), 'queue: second, changed')
+  await clickText(row(qb.id, '.queue-editor [aria-label="Aspect ratio"] button'), '16:9')
+  await clickText(row(qb.id, '.queue-editor [aria-label="Resolution"] button'), 'Draft')
+  await setValue(row(qb.id, '.queue-editor input[aria-label="Images"]'), 2)
+  await shot('03c-queue-edit')
+  await clickText(row(qb.id, '.queue-editor button'), 'Save changes')
+  check(
+    'saving changes the queued job itself: same job, new prompt, size and count',
+    await waitFor(`${queueJob(qb.id)}.then((j) => j.status === "queued" && j.request.prompt === "queue: second, changed" && j.request.width > j.request.height && j.request.width * j.request.height < 600000 && j.request.count === 2 && j.request.seed === 5)`)
+  )
+  check('it keeps its place in line', await waitFor(`${rowPrompts} === "queue: first|queue: second, changed|queue: third" && !document.querySelector(${q(inImage('.queue-editor'))})`))
+
+  await clickText(row(qc.id, 'button'), 'Remove from queue')
+  check('removing one cancels it before it starts', await waitFor(`${queueJob(qc.id)}.then((j) => j.status === "cancelled" && j.started === null)`))
+  check('and takes it off the list', await waitFor(`${rowPrompts} === "queue: first|queue: second, changed"`))
+
+  await clickText(row(qa.id, 'button'), 'Edit')
+  check('editing the one being made says it will start again', await waitFor(`!!document.querySelector(${q(row(qa.id, '.queue-restart-note'))})`))
+  await setValue(row(qa.id, '.queue-editor textarea.prompt'), 'queue: first, again')
+  await clickText(row(qa.id, '.queue-editor button'), 'Save and restart')
+  check('saving stops it', await waitFor(`${queueJob(qa.id)}.then((j) => j.status === "cancelled")`))
+  check(
+    'and its changed copy runs next, ahead of what was queued',
+    await waitFor(`window.api.image.jobs().then((all) => all.some((j) => j.request.prompt === "queue: first, again" && j.status === "running") && all.find((j) => j.id === ${q(qb.id)}).status === "queued")`)
+  )
+  check('the window shows the copy first', await waitFor(`${rowPrompts} === "queue: first, again|queue: second, changed" && ${rowPlaces} === "Making now|Next"`))
+
+  await clickText(inImage('.progress-card button'), 'Cancel this one')
+  check("the card's Cancel stops the job it shows, and the next one starts", await waitFor(`${queueJob(qb.id)}.then((j) => j.status === "running")`))
+  check('which the card then shows', await waitFor(`${card}.includes("queue: second, changed")`))
+  await clickText(row(qb.id, 'button'), 'Cancel this one')
+  check('cancelling from the window works too, and empties it', await waitFor(`${queueJob(qb.id)}.then((j) => j.status === "cancelled") && document.querySelector(${q(inImage('.queue-empty'))}) !== null`))
+  check(
+    'none of them made an image',
+    await js(`window.api.image.jobs().then((all) => all.filter((j) => j.request.prompt?.startsWith("queue:")).every((j) => j.images.length === 0))`)
+  )
+  await click(inImage('.queue-foot input[type=checkbox]'))
+  check('opening after Generate can be switched off, and is remembered', await waitFor(`localStorage.getItem("lis.queue.openOnGenerate.v1") === "false"`))
+  await js(`window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }))`)
+  check('Escape closes the queue window', await waitFor(`!document.querySelector(${q(inImage('.queue-window'))})`))
 
   console.log('detail, gallery')
   await click(inImage('.stage-image'))
@@ -487,6 +564,11 @@ try {
   await clickText(inImage('.setup-box button'), 'Cancel')
   check('and can be backed out of', await waitFor(`!document.querySelector(${q(inImage('.setup .setup-box'))})`))
   check('every supported model is offered for download', (await count(inImage('.download-row'))) === 4)
+  const hardware = await js(`window.api.image.hardware()`)
+  check('the list says which computer it is judged for', await waitFor(`document.querySelector(${q(inImage('.hardware'))})?.textContent.startsWith("This PC: ")`))
+  check('naming its GPU, or that there is none', (await text(inImage('.hardware'))).includes(hardware.gpu ? hardware.gpu.name : 'No NVIDIA GPU found'))
+  check('every model says how it would run here', (await count(inImage('.download-row .fit-note'))) === 4)
+  check('a model marked Recommended runs well here', await js(`[...document.querySelectorAll(${q(inImage('.download-row'))})].every((row) => !row.querySelector(".tag:not(.fit-slow):not(.fit-no)") || row.querySelector(".fit-note.fit-good"))`))
   await clickText(inImage('.download-row button'), 'Download')
   check('a download first shows where the model comes from', await waitFor(`document.querySelector(${q(inImage('.download-row .facts'))})?.textContent.includes("@ f332072")`))
   check('and its license', (await text(inImage('.download-row .facts'))).includes('Apache License 2.0'))
@@ -614,6 +696,86 @@ try {
   await clickText(inImage('.media-filter button'), 'All')
   await shot('09-gallery-mixed')
 
+  // Thumbnail size, as a file manager's view sizes: the size it has always had, then two smaller.
+  const gridSize = () => js(`document.querySelector(${q(inImage('.gallery-grid'))}).dataset.size`)
+  const firstTileWidth = async () => {
+    // The grid reloads when the filter changes, so wait for a thumbnail to be there.
+    await waitFor(`!!document.querySelector(${q(inImage('.tile'))})`)
+    return js(`document.querySelector(${q(inImage('.tile'))}).getBoundingClientRect().width`)
+  }
+  const sizeButton = (label) => `[...document.querySelectorAll(${q(inImage('.tile-size button'))})].find((b) => b.textContent === ${q(label)})`
+  check('thumbnails start at the size they have always been', (await gridSize()) === 'large')
+  check('and the buttons say so', await js(`(${sizeButton('Large')}).getAttribute("aria-checked") === "true"`))
+  const largeWidth = await firstTileWidth()
+  await js(`(${sizeButton('Small')}).click()`)
+  check('a smaller size can be chosen', await waitFor(`document.querySelector(${q(inImage('.gallery-grid'))}).dataset.size === "small"`))
+  const smallWidth = await firstTileWidth()
+  check('and the thumbnails really are smaller', smallWidth < largeWidth, `${smallWidth} is not under ${largeWidth}`)
+  await js(`(${sizeButton('Medium')}).click()`)
+  const mediumWidth = await firstTileWidth()
+  check('with a size in between', mediumWidth > smallWidth && mediumWidth < largeWidth, `${smallWidth} < ${mediumWidth} < ${largeWidth}`)
+  check('the choice is kept for next time', await js(`localStorage.getItem("lis.gallery.tileSize.v1") === "medium"`))
+  await shot('09b-gallery-medium')
+  await js(`(${sizeButton('Large')}).click()`)
+  check('and the size it started at can be chosen again', await waitFor(`document.querySelector(${q(inImage('.gallery-grid'))}).dataset.size === "large"`))
+
+  // A mosaic over the thumbnails, for a screen other people can see. Off to begin with.
+  const mosaicOf = () => js(`document.querySelector(${q(inImage('.gallery-grid'))}).dataset.mosaic`)
+  const mosaicIs = (level) => waitFor(`document.querySelector(${q(inImage('.gallery-grid'))}).dataset.mosaic === ${q(level)}`)
+  const mosaicButton = (label) => `[...document.querySelectorAll(${q(inImage('.mosaic-level button'))})].find((b) => b.textContent === ${q(label)})`
+  const thumbDrawing = () =>
+    js(`(() => {
+      const tile = document.querySelector(${q(inImage('.tile'))});
+      const canvas = tile.querySelector("canvas.mosaic");
+      const shown = canvas ?? tile.querySelector("img");
+      return {
+        kind: canvas ? "mosaic" : "picture",
+        rendering: getComputedStyle(shown).imageRendering,
+        // How many blocks across the picture is drawn with, and whether it was drawn at all.
+        blocks: canvas ? canvas.width : null,
+        drawn: canvas ? canvas.dataset.drawn === "yes" : null,
+        // The whole tile is covered by what is shown.
+        coverage: shown.getBoundingClientRect().width / tile.getBoundingClientRect().width,
+      };
+    })()`)
+  const tileBox = () =>
+    js(`(() => { const r = document.querySelector(${q(inImage('.tile'))}).getBoundingClientRect(); return [Math.round(r.width), Math.round(r.height)] })()`)
+  const boxBefore = await tileBox()
+  const plain = await thumbDrawing()
+  check('thumbnails are not mosaicked to begin with', (await mosaicOf()) === 'off' && plain.kind === 'picture', JSON.stringify(plain))
+  await js(`(${mosaicButton('Weak')}).click()`)
+  check('a mosaic can be put over them', await mosaicIs('weak'))
+  await waitFor(`document.querySelector(${q(inImage('.tile canvas.mosaic'))})?.dataset.drawn === "yes"`)
+  const weak = await thumbDrawing()
+  check(
+    'and the thumbnail is then drawn as blocks, not blurred',
+    weak.kind === 'mosaic' && weak.rendering === 'pixelated' && weak.blocks === 24 && weak.drawn,
+    JSON.stringify(weak)
+  )
+  // All of the tile but its own 1px border, which is what a plain thumbnail fills too.
+  check('covering the whole thumbnail', weak.coverage >= 0.98, `${weak.coverage}`)
+  // The first attempt laid the thumbnail out small and the tiles collapsed into strips.
+  // Within a pixel: the tile's own aspect ratio counts its border, the thumbnail's height did not.
+  const boxAfter = await tileBox()
+  const sameBox = boxAfter.every((side, i) => Math.abs(side - boxBefore[i]) <= 1)
+  check('and the grid keeps its shape', sameBox, `${boxAfter} was ${boxBefore}`)
+  await js(`(${mosaicButton('Strong')}).click()`)
+  await mosaicIs('strong')
+  await waitFor(`document.querySelector(${q(inImage('.tile canvas.mosaic'))})?.dataset.drawn === "yes"`)
+  const strong = await thumbDrawing()
+  check('a stronger mosaic draws fewer, bigger blocks', strong.blocks === 8 && strong.drawn && strong.coverage >= 0.98, JSON.stringify(strong))
+  check('the choice is kept for next time', await js(`localStorage.getItem("lis.gallery.mosaic.v1") === "strong"`))
+  await shot('09c-gallery-mosaic')
+  // The mosaic is a cover for the grid: opening an item still shows it as it is.
+  // A still, by id: the newest tile may be a video, which has no <img> to look at.
+  const [aStill] = (await js(`window.api.image.gallery({ media: "image" })`)).items
+  await click(inImage(`.tile[data-id='${aStill.id}']`))
+  const detail = await js(`(() => { const s = getComputedStyle(document.querySelector(${q(inImage('.detail-image img'))})); return [s.imageRendering, s.transform].join(" ") })()`)
+  check('but an item opened from it is not mosaicked', detail === 'auto none', detail)
+  await js(`document.querySelector(${q(inImage('.modal-backdrop'))}).dispatchEvent(new MouseEvent("mousedown", { bubbles: true }))`)
+  await js(`(${mosaicButton('No mosaic')}).click()`)
+  check('and the mosaic can be taken off again', (await mosaicIs('off')) && (await thumbDrawing()).kind === 'picture')
+
   console.log('gallery folders')
   await clickText(inImage('.tabs button'), 'Gallery')
   check('the gallery has All, Favorites and a folder list', await waitFor(`!!document.querySelector(${q(inImage('.folder-list'))}) && document.querySelector(${q(inImage('.folder-list'))}).textContent.includes("Favorites")`))
@@ -648,6 +810,79 @@ try {
   check('and the choice is kept', await js(`localStorage.getItem("lis.gallery.folders.v1") === "hidden"`))
   await js(`window.dispatchEvent(new KeyboardEvent("keydown", { key: "b", ctrlKey: true, bubbles: true }))`)
   check('Ctrl+B brings it back', await waitFor(folderListShown))
+
+  // Putting the folders in an order by dragging them. A press is not a drag: the pointer
+  // has to travel (REORDER_SLOP in GalleryView.tsx) before anything moves, so a click
+  // never reorders the list.
+  // Scoped to the gallery's own list: the Train tab's LoRA library uses .folder-row too.
+  const GALLERY_ROWS = inImage('.gallery-view .folder-list .folder-row')
+  const namesExpression = `[...document.querySelectorAll(${q(`${GALLERY_ROWS} .folder-name`)})].map((n) => n.textContent).join()`
+  const folderNames = () => js(namesExpression)
+  const orderIs = (names) => waitFor(`${namesExpression} === ${q(names)}`)
+  const galleryRow = (name) =>
+    `[...document.querySelectorAll(${q(GALLERY_ROWS)})].find((r) => r.querySelector(".folder-name")?.textContent === ${q(name)})`
+  const engineFolderNames = async () => (await js(`window.api.image.folders()`)).map((f) => f.name).join()
+  /** Press a folder row, move the pointer to `aim` (a function of the target row's box), let it go, then click as a mouse would. */
+  const dragFolder = (name, target, aim) =>
+    js(`(() => {
+      const rows = [...document.querySelectorAll(${q(GALLERY_ROWS)})];
+      const named = (text) => rows.find((r) => r.querySelector(".folder-name")?.textContent === text);
+      const from = named(${q(name)}), to = named(${q(target)});
+      if (!from || !to) throw new Error("no such folder row");
+      const a = from.getBoundingClientRect(), b = to.getBoundingClientRect();
+      const x = a.left + 20, y = a.top + a.height / 2;
+      const aimY = (${aim})(b);
+      from.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, isPrimary: true, clientX: x, clientY: y }));
+      window.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: x, clientY: aimY }));
+      window.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, clientX: x, clientY: aimY }));
+      // The browser sends a click after the pointer goes up on the same element.
+      from.querySelector(".folder-item").click();
+      return true;
+    })()`)
+  // One at a time: creating a folder is a round trip, and the name box stays open until it is done.
+  const newFolder = async (name) => {
+    await click(inImage('.folder-head button'))
+    await nameFolder(name)
+    await waitFor(`!!(${galleryRow(name)})`)
+  }
+  await newFolder('Alps')
+  await newFolder('Zoo')
+  check('folders are in alphabetical order to begin with', await orderIs('Alps,Trips,Zoo'), await folderNames())
+
+  // A press that barely moves: the folder is selected, and the list is left alone.
+  await clickText(inImage('.folder-item'), 'All')
+  await dragFolder('Zoo', 'Zoo', '(b) => b.top + b.height / 2 + 3')
+  check('a press that barely moves does not reorder anything', (await folderNames()) === 'Alps,Trips,Zoo')
+  check('and still selects the folder, as a click', await waitFor(`document.querySelector(${q(inImage('.gallery-heading'))})?.textContent === "Zoo"`))
+
+  // A deliberate pull: Zoo lands in front of Trips, and the click that ends it is not a selection.
+  await clickText(inImage('.folder-item'), 'All')
+  await dragFolder('Zoo', 'Trips', '(b) => b.top + 2')
+  check('dragging a folder puts it where it was dropped', await orderIs('Alps,Zoo,Trips'), await folderNames())
+  check('and the drag does not open the folder it was dragging', await js(`document.querySelector(${q(inImage('.gallery-heading'))})?.textContent === "All"`))
+  check('the engine keeps the order', (await engineFolderNames()) === 'Alps,Zoo,Trips')
+
+  // Dropped below the last row: the end of the list.
+  await dragFolder('Alps', 'Trips', '(b) => b.bottom + 30')
+  check('a folder dropped past the last one goes to the end', await orderIs('Zoo,Trips,Alps'), await folderNames())
+
+  // Without a mouse: Alt and an arrow move the folder in focus one place.
+  await js(`(${galleryRow('Alps')}).querySelector(".folder-item").focus()`)
+  await js(`(${galleryRow('Alps')}).querySelector(".folder-item").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", altKey: true, bubbles: true }))`)
+  check('Alt+Up moves a folder up one place', await orderIs('Zoo,Alps,Trips'), await folderNames())
+  await js(`(${galleryRow('Zoo')}).querySelector(".folder-item").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", altKey: true, bubbles: true }))`)
+  check('and Alt+Down moves one down', await orderIs('Alps,Zoo,Trips'), await folderNames())
+  await newFolder('Aaa')
+  check('a new folder joins the end once the folders have an order', await orderIs('Alps,Zoo,Trips,Aaa'), await folderNames())
+
+  // The three extra folders go again, so the rest of the test sees the gallery it expects.
+  for (const name of ['Aaa', 'Alps', 'Zoo']) {
+    await js(`(${galleryRow(name)}).querySelector('[aria-label="Options for ${name}"]').click()`)
+    await clickText(inImage('.folder-menu button'), 'Delete folder…')
+    await clickText(inImage('.folder-confirm button'), 'Delete folder')
+    await waitFor(`!(${galleryRow(name)})`)
+  }
+  check('only the folder the rest of the test uses is left', (await folderNames()) === 'Trips', await folderNames())
 
   // Where the gallery opens: All by default, or where it was left.
   await clickText(inImage('.folder-item'), 'Trips')
@@ -730,6 +965,115 @@ try {
   check('and nothing that was in it is lost', (await js(`window.api.image.gallery({})`)).total === everything.length)
   check('it is back in no folder', (await js(`window.api.image.gallery({})`)).items.find((i) => i.id === video.id)?.folder_id === null)
 
+  console.log('choosing several, folders by keyboard')
+  const keyDown = (init) => js(`window.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...${JSON.stringify(init)} }))`)
+  const ctrlM = { key: 'm', code: 'KeyM', ctrlKey: true }
+  const digit = (n) => ({ key: String(n), code: `Digit${n}` })
+  const clickTile = (id, mods = {}) =>
+    js(`document.querySelector(${q(inImage(`.tile[data-id="${id}"]`))}).dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, ...${JSON.stringify(mods)} }))`)
+  const barText = `(document.querySelector(${q(inImage('.selection-bar'))})?.textContent ?? "")`
+  const foldersOf = (ids) => `window.api.image.gallery({}).then((p) => ${JSON.stringify(ids)}.map((id) => p.items.find((i) => i.id === id)?.folder_id ?? null))`
+  const until = async (test, ms = 10000) => {
+    for (const end = Date.now() + ms; Date.now() < end; await sleep(100)) if (test()) return true
+    return false
+  }
+  const folderOf = (id) => `window.api.image.gallery({}).then((p) => p.items.find((i) => i.id === ${q(id)})?.folder_id ?? null)`
+  await click(inImage('.folder-head button'))
+  await nameFolder('Picks A')
+  await waitFor(`!!(${folderRow('Picks A')})`)
+  await click(inImage('.folder-head button'))
+  await nameFolder('Picks B')
+  await waitFor(`!!(${folderRow('Picks B')})`)
+  const listed = await js(`window.api.image.folders()`)
+  const keyOf = (name) => listed.findIndex((f) => f.name === name) + 1
+  const idOf = (name) => listed.find((f) => f.name === name).id
+  await click(inImage('.folder-item')) // All
+  await waitFor(`document.querySelectorAll(${q(inImage('.tile'))}).length === ${everything.length}`)
+  check('there are enough items to choose from', everything.length >= 4, String(everything.length))
+  const order = await js(`[...document.querySelectorAll(${q(inImage('.tile'))})].map((t) => t.dataset.id)`)
+
+  await clickTile(order[0], { ctrlKey: true })
+  check('Ctrl+click chooses a tile instead of opening it', await waitFor(`${barText}.includes("1 chosen") && !document.querySelector(${q(inImage('.modal.detail'))})`))
+  await clickTile(order[2], { shiftKey: true })
+  check('Shift+click chooses the run up to it', await waitFor(`${barText}.includes("3 chosen") && document.querySelectorAll(${q(inImage('.tile.selected'))}).length === 3`))
+  await keyDown(ctrlM)
+  check('the shortcut opens a numbered folder list for them', await waitFor(`document.querySelector(${q(inImage('.selection-bar .folder-picker'))})?.textContent.includes("Picks A")`))
+  await shot('05b-gallery-choose')
+  await keyDown(digit(keyOf('Picks A')))
+  check(
+    'a number moves all of them to that folder at once',
+    await waitFor(`${foldersOf(order.slice(0, 3))}.then((f) => f.every((x) => x === ${q(idOf('Picks A'))}))`)
+  )
+  check('and says so', await waitFor(`document.querySelector(${q(inImage('.banner'))})?.textContent.includes("Moved 3 items")`))
+  check('which ends the choosing', await waitFor(`!document.querySelector(${q(inImage('.selection-bar'))})`))
+
+  await click(inImage('.select-toggle'))
+  await clickTile(order[3])
+  await clickTile(order[1])
+  check('in Select mode a plain click chooses', await waitFor(`${barText}.includes("2 chosen")`))
+  await clickText(inImage('.selection-bar button'), 'Save copies')
+  check('saving offers what to keep in the copies', await waitFor(`document.querySelector(${q(inImage('.save-many'))})?.textContent.includes(".txt")`))
+  check('keeping the prompt inside starts as the Save as setting has it (off)', await js(`!document.querySelectorAll(${q(inImage('.save-many input[type=checkbox]'))})[0].checked`))
+  await js(`document.querySelectorAll(${q(inImage('.save-many input[type=checkbox]'))})[1].click()`)
+  await clickText(inImage('.save-many button'), 'Choose a folder and save')
+  check('saving says where they went', await waitFor(`document.querySelector(${q(inImage('.banner'))})?.textContent.includes("Saved 2 items to")`))
+  const savedNow = readdirSync(exportFolder).sort()
+  const savedMedia = savedNow.filter((f) => !f.endsWith('.txt'))
+  check('both are there, each with its prompt file', savedMedia.length === 2 && savedNow.length === 4, savedNow.join(', '))
+  const savedPng = savedMedia.find((f) => f.endsWith('.png'))
+  check(
+    'an image copy leaves the prompt out, as chosen, and its .txt holds it',
+    !savedPng ||
+      (!readFileSync(join(exportFolder, savedPng)).includes('local-ai-studio') &&
+        readFileSync(join(exportFolder, savedPng.replace(/[.]png$/, '.txt')), 'utf8').includes('Seed:')),
+    savedPng
+  )
+  await clickText(inImage('.selection-bar button'), 'Save copies')
+  await waitFor(`!!document.querySelector(${q(inImage('.save-many'))})`)
+  await clickText(inImage('.save-many button'), 'Choose a folder and save')
+  check(
+    'saving again never overwrites: the new copies get numbers (the .txt option starts off again)',
+    (await until(() => readdirSync(exportFolder).length === 6)) && readdirSync(exportFolder).filter((f) => f.includes(' (2).')).length === 2,
+    readdirSync(exportFolder).join(', ')
+  )
+  await clickText(inImage('.selection-bar button'), 'Delete')
+  check('deleting the chosen ones asks first', await waitFor(`document.querySelector(${q(inImage('.selection-bar [role=alertdialog]'))})?.textContent.includes("Delete 2 items for good")`))
+  await clickText(inImage('.selection-bar [role=alertdialog] button'), 'Cancel')
+  await keyDown({ key: 'a', code: 'KeyA', ctrlKey: true })
+  check('Ctrl+A chooses every item shown', await waitFor(`${barText}.includes("${everything.length} chosen")`))
+  await keyDown({ key: 'Escape', code: 'Escape' })
+  check('and Escape lets go', await waitFor(`!document.querySelector(${q(inImage('.selection-bar'))}) && !document.querySelector(${q(inImage('.tile.selected'))})`))
+  check('nothing was deleted', (await js(`window.api.image.gallery({})`)).total === everything.length)
+
+  await clickTile(order[1])
+  check('a plain click opens the item again', await waitFor(`!!document.querySelector(${q(inImage('.modal.detail'))})`))
+  const detailSrc = `(document.querySelector(${q(inImage('.modal.detail .detail-image img, .modal.detail .detail-image video'))})?.getAttribute("src") ?? "")`
+  const firstSrc = await js(detailSrc)
+  await keyDown(ctrlM)
+  check('in its details the shortcut opens the numbered folder list', await waitFor(`!!document.querySelector(${q(inImage('.detail-folder-wrap .folder-picker'))})`))
+  await keyDown(digit(keyOf('Picks B')))
+  check('a number files it there', await waitFor(`${folderOf(order[1])}.then((f) => f === ${q(idOf('Picks B'))})`))
+  check('and stays on the same item, with the list closed', await waitFor(`${detailSrc} === ${q(firstSrc)} && !document.querySelector(${q(inImage('.folder-picker'))})`))
+  await js(`document.querySelector(${q(inImage('.detail-folder select'))}).focus()`)
+  await js(`document.querySelector(${q(inImage('.detail-folder select'))}).dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", code: "ArrowRight", bubbles: true, cancelable: true }))`)
+  check('the right arrow goes to the next item even from the folder list', await waitFor(`${detailSrc} !== ${q(firstSrc)}`))
+  check('and leaves the folder of the one before alone', await js(`${folderOf(order[1])}.then((f) => f === ${q(idOf('Picks B'))})`))
+  await keyDown({ key: 'ArrowLeft', code: 'ArrowLeft' })
+  check('the left arrow goes back', await waitFor(`${detailSrc} === ${q(firstSrc)}`))
+  await keyDown(ctrlM)
+  await waitFor(`!!document.querySelector(${q(inImage('.detail-folder-wrap .folder-picker'))})`)
+  await keyDown(digit(0))
+  check('0 takes it out of its folder', await waitFor(`${folderOf(order[1])}.then((f) => f === null)`))
+  await keyDown({ key: 'Escape', code: 'Escape' })
+  await waitFor(`!document.querySelector(${q(inImage('.modal.detail'))})`)
+  for (const name of ['Picks A', 'Picks B']) {
+    await openMenu(name)
+    await clickText(inImage('.folder-menu button'), 'Delete folder')
+    await clickText(inImage('.folder-confirm button'), 'Delete folder')
+    await waitFor(`!(${folderRow(name)})`)
+  }
+  check('with those folders gone, everything is back in no folder', (await js(`window.api.image.gallery({})`)).items.every((i) => i.id === favorite.id || i.folder_id === null))
+
   console.log('hidden and locked folders')
   const pinField = (label) => inImage(`.folder-pin input[aria-label="${label}"]`)
   const submitPin = () => js(`document.querySelector(${q(inImage('.folder-pin'))}).requestSubmit()`)
@@ -739,7 +1083,14 @@ try {
   check('another folder is made', await waitFor(`!!(${folderRow('Vault')})`))
   await click(inImage('.folder-item'))  // All
   await waitFor(tileShown(favorite.id))
-  check('and given an item', (await dragTile(favorite.id, `.studio-pane:not([hidden]) .image-studio .folder-row`)) && (await waitFor(`(${folderRow('Vault')})?.querySelector(".folder-count")?.textContent === "1"`)))
+  // Onto that folder by id, not "the first row": a list with one row more than the
+  // test expected would otherwise drop the item somewhere else and fail obscurely.
+  const vaultRow = (await js(`window.api.image.folders()`)).find((f) => f.name === 'Vault')?.id
+  check(
+    'and given an item',
+    (await dragTile(favorite.id, `${GALLERY_ROWS}[data-folder-id="${vaultRow}"]`)) && (await waitFor(`(${folderRow('Vault')})?.querySelector(".folder-count")?.textContent === "1"`)),
+    `tile ${await js(tileShown(favorite.id))}, rows ${await count(GALLERY_ROWS)}, heading ${await js(`document.querySelector(${q(inImage('.gallery-heading'))})?.textContent`)}`
+  )
   await openMenu('Vault')
   await clickText(inImage('.folder-menu button'), 'Lock with a PIN')
   await setValue(pinField('PIN'), '246810')
@@ -961,8 +1312,9 @@ try {
   check('chat side back', await waitFor(`!document.querySelector(".studio-pane:not([hidden]) .image-studio")`))
   await clickText('.rail-button', 'Image')
   await clickText(inImage('.tabs button'), 'Image')
-  // Two from the image section, plus the one made with a LoRA when the Train tab trained for real.
-  check('session images survive the switch', (await count(inImage('.film'))) === (TRAINS_FOR_REAL ? 3 : 2))
+  // Two from the image section, less the favorite, which went into the locked Vault and so left
+  // this window's strip; plus the one made with a LoRA when the Train tab trained for real.
+  check('session images survive the switch', (await count(inImage('.film'))) === (TRAINS_FOR_REAL ? 2 : 1), await js(`[...document.querySelectorAll(${q(inImage('.film'))})].map((f) => f.title).join(" | ")`))
   check('prompt survives the switch', await js(`document.querySelector(${q(inImage('textarea.prompt'))}).value.includes("lighthouse")`))
 
   check('no console errors', consoleErrors.length === 0, consoleErrors.join(' | '))
@@ -982,11 +1334,40 @@ try {
   check('the per-model choices wait until background is chosen', await js(`[...document.querySelectorAll(".keep-models .keep-row button")].every((b) => b.disabled)`))
   const privacyRow = (label) => `[...document.querySelectorAll(".app-settings .keep-row")].find((r) => r.textContent.startsWith(${q(label)}))`
   check('open folders stay open on minimizing, by default', await js(`(${privacyRow('When the window is minimized')}).querySelector("button.active").textContent === "Leave them open"`))
+  check('notices are on by default and wait until background is chosen', await js(`["A chat reply arrives", "An image or video is finished"].every((label) => { const r = [...document.querySelectorAll(".app-settings .keep-row")].find((x) => x.textContent.startsWith(label)); return r && r.querySelector("button.active").textContent === "Notify me" && [...r.querySelectorAll("button")].every((b) => b.disabled) })`))
   check('and lock again on closing to the background, a choice that waits until background is chosen', await js(`(() => { const r = ${privacyRow('When the window closes to the background')}; return r.querySelector("button.active").textContent === "Lock them again" && [...r.querySelectorAll("button")].every((b) => b.disabled) })()`))
   await click('.app-settings input[value=background]')
   check('background can be chosen', await waitFor(`window.api.getConfig().then((c) => c.background.closeBehavior === "background")`))
   check('every model stays on the GPU by default', await js(`window.api.getConfig().then((c) => Object.values(c.background.keepLoaded).every(Boolean))`))
+  await js(`(${privacyRow('An image or video is finished')}).querySelectorAll("button")[1].click()`)
+  check('a notice can be turned off, on its own', await waitFor(`window.api.getConfig().then((c) => c.notifications.mediaDone === false && c.notifications.chatReply === true)`))
+  check('and shows as off', await waitFor(`(${privacyRow('An image or video is finished')}).querySelector("button.active").textContent === "Stay quiet"`))
+  await js(`(${privacyRow('An image or video is finished')}).querySelectorAll("button")[0].click()`)
+  check('and on again', await waitFor(`window.api.getConfig().then((c) => c.notifications.mediaDone === true)`))
+  check('a malformed notice setting is refused', await js(`window.api.setNotifications({ chatReply: "yes", mediaDone: true }).then(() => false, () => true)`))
   await shot('10-app-settings')
+
+  // Where things are kept: moving the gallery changes where new media goes and
+  // leaves the old folder alone (decisions S18). The chats folder is only read
+  // here: moving it would need a restart, which the test does its own way.
+  const folderRowOf = (label) => `[...document.querySelectorAll(".data-folder")].find((r) => r.textContent.startsWith(${q(label)}))`
+  const galleryPath = () => js(`(${folderRowOf('Gallery')}).querySelector(".data-folder-path").textContent`)
+  const defaultGallery = join(profile, 'image', 'outputs')
+  const beforeMove = (await js(`window.api.image.gallery({})`)).items.length
+  check('both folders are listed where they started', await js(`(${folderRowOf('Chats and settings')}).querySelector(".data-folder-path").textContent === ${q(join(profile, 'userData'))}`) && (await galleryPath()) === defaultGallery)
+  check('and neither offers to go back to a default it is already on', await js(`[...document.querySelectorAll(".data-folder-actions")].every((a) => a.querySelectorAll("button")[1].disabled)`))
+  check('the gallery has something in it to leave behind', beforeMove > 0 && pngsUnder(defaultGallery).length > 0)
+
+  await js(`(${folderRowOf('Gallery')}).querySelectorAll(".data-folder-actions button")[0].click()`)
+  check('the gallery folder can be moved', await waitFor(`(${folderRowOf('Gallery')}).querySelector(".data-folder-path").textContent === ${q(movedGallery)}`))
+  check('which needs no restart, unlike the chats folder', await js(`!document.querySelector(".data-folder-restart")`))
+  check('the engine comes back on it', await waitFor(`window.api.image.engineState().then((s) => s.state === "running")`, 90000))
+  check('the new folder starts empty', await waitFor(`window.api.image.gallery({}).then((p) => p.items.length === 0)`))
+  check('and nothing was taken out of the old one', pngsUnder(defaultGallery).length > 0)
+
+  await js(`(${folderRowOf('Gallery')}).querySelectorAll(".data-folder-actions button")[1].click()`)
+  check('the default can be chosen again', await waitFor(`(${folderRowOf('Gallery')}).querySelector(".data-folder-path").textContent === ${q(defaultGallery)}`))
+  check('and everything in it is there as it was', await waitFor(`window.api.image.engineState().then((s) => s.state === "running")`, 90000) && await waitFor(`window.api.image.gallery({}).then((p) => p.items.length === ${beforeMove})`))
 
   // Keyboard shortcuts: every one listed; a changeable one takes the next keys pressed.
   const kbdOf = (label) => js(`[...document.querySelectorAll(".shortcut-row")].find((r) => r.textContent.startsWith(${q(label)}))?.querySelector("kbd")?.textContent`)
@@ -1109,6 +1490,43 @@ try {
   await attach()
   check('the last folder is open again after a restart', await waitFor(`document.querySelector(".ws-current")?.textContent.includes("demo-project")`, 15000))
   check('its project rule is still there', await waitFor(`document.querySelector(".ws-foot")?.textContent.includes("1 project rule")`))
+
+  console.log('moving the chats folder')
+  // The chats folder is read once, at startup, so a new one is used from the next
+  // start, and the folder left behind keeps its chats (decisions S18). The window's
+  // own "Restart now" calls app.relaunch(); the test restarts the studio the way it
+  // does everywhere else, so the process it then drives is one it owns.
+  const chatsRow = `[...document.querySelectorAll(".data-folder")].find((r) => r.textContent.startsWith("Chats and settings"))`
+  const chatsPath = () => js(`(${chatsRow}).querySelector(".data-folder-path").textContent`)
+  await clickText('.rail-button', 'Settings')
+  await waitFor(`!!document.querySelector(".app-settings")`)
+  await js(`(${chatsRow}).querySelectorAll(".data-folder-actions button")[0].click()`)
+  check('a new chats folder is taken, and asks for a restart', (await waitFor(`!!document.querySelector(".data-folder-restart")`)) && (await chatsPath()) === movedChats)
+  await clickText('.rail-button', 'Chat')
+  check('the studio stays on the folder it started with until then', await js(`document.querySelector(".ws-current")?.textContent.includes("demo-project")`))
+
+  async function restartStudio() {
+    ws.close()
+    if (process.platform === 'win32') execSync(`taskkill /PID ${app.pid} /T /F`, { stdio: 'ignore' })
+    else app.kill('SIGKILL')
+    await waitPortFree(ENGINE_PORT, 10000)
+    app = launch()
+    await attach()
+  }
+
+  await restartStudio()
+  check('the next start uses it', (await js(`window.api.locations.get().then((v) => v.userData.path)`)) === movedChats)
+  check('and nothing is left over to restart for', await js(`window.api.locations.get().then((v) => v.restartNeeded === false)`))
+  check('an empty folder means an empty studio: no workspace, no chats', await waitFor(`!document.querySelector(".ws-current") && document.querySelectorAll(".chat-item").length === 0`, 15000))
+  check('while the folder left behind still holds its chats', readdirSync(join(profile, 'userData', 'workspaces')).length > 0)
+
+  await clickText('.rail-button', 'Settings')
+  await waitFor(`!!document.querySelector(".app-settings")`)
+  await js(`(${chatsRow}).querySelectorAll(".data-folder-actions button")[1].click()`)
+  check('the old folder can be chosen again', (await waitFor(`!!document.querySelector(".data-folder-restart")`)) && (await chatsPath()) === join(profile, 'userData'))
+  await restartStudio()
+  check('and has everything it had: the workspace, its chats and its rule', await waitFor(`document.querySelector(".ws-current")?.textContent.includes("demo-project")`, 15000) && (await waitFor(`document.querySelector(".ws-foot")?.textContent.includes("1 project rule")`)))
+  check('the chats folder is back to the default', await js(`window.api.locations.get().then((v) => v.userData.isDefault === true)`))
 
   console.log('closing the window, quit mode')
   const exited = new Promise((done) => app.once('exit', () => done(true)))

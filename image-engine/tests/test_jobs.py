@@ -7,7 +7,7 @@ from pathlib import Path
 from image_engine.events import EventHub
 from image_engine.gallery import Gallery
 from image_engine.jobs import CANCELLED, DONE, FAILED, JobQueue
-from image_engine.params import parse_request
+from image_engine.params import parse_request, parse_video_request
 
 from .fakes import FakeBackend
 
@@ -112,6 +112,50 @@ class JobQueueTests(unittest.TestCase):
         self.backend.step_gate.set()
         self.assertTrue(wait_for(lambda: first.status == DONE))
         self.assertNotIn(("encode", "a dog"), self.backend.calls)
+
+    def test_a_queued_job_changed_keeps_its_place_and_runs_as_changed(self):
+        self.backend.step_gate = threading.Event()
+        first = self.submit(steps=3)
+        second = self.submit(prompt="a dog")
+        third = self.submit(prompt="a bird")
+        self.assertTrue(wait_for(lambda: first.stage == "sampling"))
+        changed = self.jobs.replace(second.id, parse_request({"prompt": "a horse", "width": 512, "height": 256}))
+        self.assertIs(changed, second)
+        self.assertEqual(self.jobs.list()[1]["request"]["prompt"], "a horse")
+        self.backend.step_gate.set()
+        self.assertTrue(wait_for(lambda: third.status == DONE))
+        encoded = [c[1] for c in self.backend.calls if c[0] == "encode"]
+        self.assertEqual(encoded, ["a cat", "a horse", "a bird"])
+        self.assertEqual(self.gallery.get(second.images[0])["width"], 512)
+
+    def test_the_running_job_changed_restarts_first_in_line(self):
+        self.backend.step_gate = threading.Event()
+        first = self.submit(steps=20, count=4)
+        waiting = self.submit(prompt="a bird")
+        self.assertTrue(wait_for(lambda: first.stage == "sampling"))
+        again = self.jobs.replace(first.id, parse_request({"prompt": "a lion", "width": 256, "height": 256, "steps": 2}))
+        self.assertIsNot(again, first)
+        self.assertEqual(again.created, first.created)
+        self.backend.step_gate.set()
+        self.assertTrue(wait_for(lambda: waiting.status == DONE))
+        self.assertEqual(first.status, CANCELLED)
+        self.assertEqual(again.status, DONE)
+        encoded = [c[1] for c in self.backend.calls if c[0] == "encode"]
+        self.assertEqual(encoded, ["a cat", "a lion", "a bird"])
+
+    def test_a_finished_job_or_one_of_another_kind_is_not_changed(self):
+        job = self.submit()
+        self.assertTrue(wait_for(lambda: job.status == DONE))
+        self.assertIs(self.jobs.replace(job.id, parse_request({"prompt": "x"})), job)
+        self.assertEqual(job.request.prompt, "a cat")
+        self.assertIsNone(self.jobs.replace("0123456789abcdef", parse_request({"prompt": "x"})))
+        self.backend.step_gate = threading.Event()
+        busy, queued = self.submit(), self.submit()
+        self.assertTrue(wait_for(lambda: busy.stage == "sampling"))
+        video = parse_video_request({"prompt": "waves"})
+        with self.assertRaises(ValueError):
+            self.jobs.replace(queued.id, video)
+        self.backend.step_gate.set()
 
     def test_jobs_run_in_submission_order(self):
         jobs = [self.submit(prompt=f"p{i}") for i in range(3)]

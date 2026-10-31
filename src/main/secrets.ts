@@ -2,8 +2,11 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
 
+import type { SearchProviderId } from '@shared/search.js'
+
 /**
- * Secrets the app holds for the user: for now, the web search key.
+ * Secrets the app holds for the user: for now, the web search keys, one per
+ * search service, so switching services and back does not lose a key.
  *
  * Kept apart from config.json, which the window can read, and encrypted with
  * the operating system's own store (DPAPI on Windows, the keychain on macOS)
@@ -17,7 +20,12 @@ export interface Cipher {
   decryptString(data: Buffer): string
 }
 
-type Name = 'searchKey'
+/** `searchKey` on its own is the name from before services could be chosen, when the only one was Brave. */
+type Name = 'searchKey' | `searchKey:${SearchProviderId}`
+
+export function searchKeyName(provider: SearchProviderId): Name {
+  return `searchKey:${provider}`
+}
 
 export class SecretStore {
   private cache = new Map<Name, string | null>()
@@ -52,6 +60,13 @@ export class SecretStore {
 
   has(name: Name): boolean {
     return this.get(name) !== null
+  }
+
+  /** The key for a search service; a key saved before services could be chosen counts as Brave's. */
+  searchKey(provider: SearchProviderId): string | null {
+    const own = this.get(searchKeyName(provider))
+    if (own !== null || provider !== 'brave') return own
+    return this.get('searchKey')
   }
 
   async set(name: Name, value: string | null): Promise<void> {

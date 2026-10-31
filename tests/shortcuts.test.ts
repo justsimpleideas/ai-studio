@@ -26,7 +26,7 @@ const press = (key: string, mods: Partial<KeyLike> = {}): KeyLike => ({
 
 describe('keyboard shortcuts', () => {
   it('starts with the keys the studio always had', () => {
-    expect(DEFAULT_SHORTCUTS).toEqual({ toggleSidebar: 'Ctrl+B', lockFolders: 'Ctrl+Shift+L', generate: 'Ctrl+Enter' })
+    expect(DEFAULT_SHORTCUTS).toEqual({ toggleSidebar: 'Ctrl+B', lockFolders: 'Ctrl+Shift+L', generate: 'Ctrl+Enter', pickFolder: 'Ctrl+M' })
     for (const { id } of SHORTCUTS) expect(shortcutProblem(id, DEFAULT_SHORTCUTS[id], DEFAULT_SHORTCUTS)).toBeNull()
   })
 

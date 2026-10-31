@@ -11,12 +11,6 @@ import { TOOL_NAMES, type ToolName, type WebToolName } from './tools.js'
  */
 export type InternetLevel = 'offline' | 'search' | 'download'
 
-/**
- * Where web_search queries go: the one search API the studio talks to, using
- * the key the user enters. Shown to the user wherever a query is about to leave.
- */
-export const SEARCH_HOST = 'api.search.brave.com'
-
 export const INTERNET_LEVELS: Array<{ level: InternetLevel; title: string; help: string }> = [
   {
     level: 'offline',
@@ -41,8 +35,13 @@ const WEB_TOOLS_FOR: Record<InternetLevel, WebToolName[]> = {
   download: ['web_search', 'fetch_page', 'download_file']
 }
 
-/** The tools a model is given in a workspace at this level. */
-export function toolsFor(level: InternetLevel): ToolName[] {
+/**
+ * The tools a model is given in a workspace at this level. In strict mode
+ * there are none: the model is not told about any tool, and the grammar that
+ * shapes its output has no function calls in it to make.
+ */
+export function toolsFor(level: InternetLevel, strict = false): ToolName[] {
+  if (strict) return []
   return [...TOOL_NAMES, ...WEB_TOOLS_FOR[level]]
 }
 

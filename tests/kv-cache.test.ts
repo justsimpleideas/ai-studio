@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
-import { kvCacheOptions } from '../src/engine/kv-cache.js'
+import { kvCacheOptions, kvModelOptions } from '../src/engine/kv-cache.js'
 import { ConfigStore } from '../src/main/store.js'
 import { isKvCacheType } from '../src/shared/config.js'
 
@@ -28,18 +28,28 @@ describe('context memory (KV cache) type', () => {
     })
   })
 
+  it('gives the model load the same choice, so the GPU layer fit plans for it', () => {
+    expect(kvModelOptions('f16')).toEqual({})
+    expect(kvModelOptions('q8_0')).toEqual({
+      defaultContextFlashAttention: true,
+      experimentalDefaultContextKvCacheKeyType: 'Q8_0',
+      experimentalDefaultContextKvCacheValueType: 'Q8_0'
+    })
+  })
+
   it('accepts only the two known types', () => {
     expect(isKvCacheType('f16')).toBe(true)
     expect(isKvCacheType('q8_0')).toBe(true)
     for (const other of ['q4_0', 'F16', '', null, undefined, 8]) expect(isKvCacheType(other)).toBe(false)
   })
 
-  it('defaults to 16-bit for a config saved before the setting existed', () => {
-    expect(storeWith({ backend: 'auto' }).get().model.kvCache).toBe('f16')
+  it('defaults to 8-bit for a config saved before the setting existed', () => {
+    expect(storeWith({ backend: 'auto' }).get().model.kvCache).toBe('q8_0')
   })
 
-  it('keeps a saved 8-bit choice, and turns an unknown one back into 16-bit', () => {
+  it('keeps a saved choice, and turns an unknown one into the default (8-bit)', () => {
     expect(storeWith({ kvCache: 'q8_0' }).get().model.kvCache).toBe('q8_0')
-    expect(storeWith({ kvCache: 'q2_k' }).get().model.kvCache).toBe('f16')
+    expect(storeWith({ kvCache: 'f16' }).get().model.kvCache).toBe('f16')
+    expect(storeWith({ kvCache: 'q2_k' }).get().model.kvCache).toBe('q8_0')
   })
 })

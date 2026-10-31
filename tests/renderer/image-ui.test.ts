@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_FORM, fitToModel, fromImage, loadForm, loadSeenModel, saveSeenModel, toRequest } from '../../src/renderer/image/form.js';
 import { formatBytes, formatDuration, stageLabel } from '../../src/renderer/image/format.js';
 import { ASPECT_RATIOS, SQUARE, closestRatio, isValidSide, sizeFor, snap } from '../../src/renderer/image/sizes.js';
-import type { ImageRecord, Job } from '../../src/renderer/image/types.js';
+import type { ImageRecord, Job, Status } from '../../src/renderer/image/types.js';
 import { activeJob, engineReducer, initialEngineState, queuedCount } from '../../src/renderer/image/useEngine.js';
 
 describe("sizes", () => {
@@ -156,6 +156,22 @@ describe("engine state", () => {
     s = engineReducer(s, { type: "event", event: { type: "image", job_id: "t", image: { id: "c" } as ImageRecord } });
     expect(s.session).toEqual([]);
     expect(s.galleryVersion).toBe(1);
+  });
+
+  it("a fresh engine makes the window read the gallery again", () => {
+    const hello = { type: "hello" as const, status: {} as Status, jobs: [] };
+    let s = engineReducer(initialEngineState, { type: "event", event: { type: "image", job_id: "j", image: { id: "1" } as ImageRecord } });
+    s = engineReducer(s, { type: "event", event: hello });
+    expect(s.galleryVersion).toBe(2);
+    // The strip is kept: the same engine restarted on the same folder still has them.
+    expect(s.session.map((i) => i.id)).toEqual(["1"]);
+  });
+
+  it("a moved gallery folder leaves nothing of the old one on screen", () => {
+    let s = engineReducer(initialEngineState, { type: "event", event: { type: "image", job_id: "j", image: { id: "1" } as ImageRecord } });
+    s = engineReducer(s, { type: "gallery-moved" });
+    expect(s.session).toEqual([]);
+    expect(s.galleryVersion).toBe(2);
   });
 
   it("job events upsert by id", () => {

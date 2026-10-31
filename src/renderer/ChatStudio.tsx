@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { AppConfig, GlobalRule, KvCacheType, WorkingContext } from '@shared/config.js'
+import type { AppConfig, ChatEngine, GlobalRule, KvCacheType, ServerPreferences, WorkingContext } from '@shared/config.js'
 import type { ModelInfo } from '@shared/engine-protocol.js'
+import {
+  contextChoicesFor,
+  defaultContextSize,
+  THINKING_BUDGETS,
+  type GenerationPreferences,
+  type SamplingValues,
+  type ThinkingMode
+} from '@shared/generation.js'
 import type { ApprovalRequest, ApprovalResponse, ToolOutcome } from '@shared/broker-types.js'
 import type { ClassMode } from '@shared/permissions.js'
 import type { RiskClass } from '@shared/tools.js'
@@ -8,28 +16,34 @@ import type { UsageSnapshot } from '@shared/usage.js'
 import type { WorkspaceSnapshot, WorkspaceState } from '@shared/workspace.js'
 import type { ChangeGroup } from '@shared/changes.js'
 import { matchesShortcut } from '@shared/shortcuts.js'
+import { parseReplyStats, type ReplyStats } from '@shared/reply-stats.js'
 import { useShortcuts } from './useShortcuts.js'
 import { ActivityLog } from './components/ActivityLog.js'
 import { ApprovalDialog } from './components/ApprovalDialog.js'
+import { EngineSettings } from './components/EngineSettings.js'
+import { ModelCheckPanel } from './components/ModelCheckPanel.js'
 import { PermissionsPanel } from './components/PermissionsPanel.js'
 import { PromptPreview, RulesPanel } from './components/RulesPanel.js'
+import { ReplyMeta } from './components/ReplyMeta.js'
 import { ContextMeter, UsagePanel } from './components/UsagePanel.js'
 import { internetLabel, WorkspaceSidebar } from './components/WorkspaceSidebar.js'
 import { cleanError } from './image/api.js'
 import { formatBytes } from './image/format.js'
 
-type Tab = 'chat' | 'usage' | 'permissions' | 'rules'
+type Tab = 'chat' | 'usage' | 'permissions' | 'rules' | 'model'
 
 const TAB_LABEL: Record<Tab, string> = {
   chat: 'Chat',
   usage: 'Token usage',
   permissions: 'Permissions',
-  rules: 'Rules'
+  rules: 'Rules',
+  model: 'Model check'
 }
 
 /** Shorter labels the top bar switches to when the window is narrow. */
 const TAB_SHORT: Partial<Record<Tab, string>> = {
-  usage: 'Usage'
+  usage: 'Usage',
+  model: 'Check'
 }
 
 const SIDEBAR_KEY = 'studio.chatSidebar'
@@ -38,7 +52,24 @@ interface Turn {
   id: string
   role: 'user' | 'assistant' | 'system'
   text: string
+  /** The model's chain of thought, when it wrote one; shown folded. */
+  thinking: string
   streaming: boolean
+  /** When this window saw the thought start and the reply begin (Date.now()); the live figure. */
+  thinkingStartedAt?: number
+  thinkingEndedAt?: number
+  /** The engine's own timing, once the reply is done. */
+  stats?: ReplyStats
+}
+
+const THINKING_LABEL: Record<ThinkingMode, string> = { on: 'On', model: 'Model decides', off: 'Off' }
+
+function tokensLabel(n: number): string {
+  return n % 1024 === 0 ? `${n / 1024}k` : n.toLocaleString()
+}
+
+function samplingLabel(s: SamplingValues): string {
+  return `temperature ${s.temperature}, top-p ${s.topP}, top-k ${s.topK}, min-p ${s.minP}`
 }
 
 /**
@@ -85,7 +116,7 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
   }, [visible, tab, toggleSidebar, shortcuts.toggleSidebar])
 
   const say = useCallback((text: string) => {
-    setTurns((prev) => [...prev, { id: `note-${Date.now()}`, role: 'system', text, streaming: false }])
+    setTurns((prev) => [...prev, { id: `note-${Date.now()}`, role: 'system', text, thinking: '', streaming: false }])
   }, [])
 
   const refreshChanges = useCallback(() => {
@@ -127,7 +158,12 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
       if (prev?.active?.id !== snap.state.active?.id) setSessionGrants(0)
       return snap.state
     })
-    setTurns((snap.chat?.turns ?? []).map((t) => ({ ...t, streaming: false })))
+    setTurns(
+      (snap.chat?.turns ?? []).map(({ stats, ...t }) => {
+        const parsed = parseReplyStats(stats)
+        return { ...t, thinking: t.thinking ?? '', streaming: false, ...(parsed ? { stats: parsed } : {}) }
+      })
+    )
     setOutcomes(snap.chat?.outcomes ?? [])
     setUsage(null)
   }, [])
@@ -217,8 +253,30 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
             break
           case 'chunk':
             setTurns((prev) =>
-              prev.map((t) => (t.id === event.id ? { ...t, text: t.text + event.text } : t))
+              prev.map((t) =>
+                t.id === event.id
+                  ? {
+                      ...t,
+                      text: t.text + event.text,
+                      ...(t.thinkingStartedAt !== undefined && t.thinkingEndedAt === undefined
+                        ? { thinkingEndedAt: Date.now() }
+                        : {})
+                    }
+                  : t
+              )
             )
+            break
+          case 'thought':
+            setTurns((prev) =>
+              prev.map((t) =>
+                t.id === event.id
+                  ? { ...t, thinking: t.thinking + event.text, thinkingStartedAt: t.thinkingStartedAt ?? Date.now() }
+                  : t
+              )
+            )
+            break
+          case 'stats':
+            setTurns((prev) => prev.map((t) => (t.id === event.id ? { ...t, stats: event.stats } : t)))
             break
           case 'complete':
             setTurns((prev) =>
@@ -252,6 +310,7 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
                 id: `err-${Date.now()}`,
                 role: 'system',
                 text: event.message,
+                thinking: '',
                 streaming: false
               }
             ])
@@ -285,8 +344,8 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
       const id = await window.api.sendMessage(text)
       setTurns((prev) => [
         ...prev,
-        { id: `u-${id}`, role: 'user', text, streaming: false },
-        { id, role: 'assistant', text: '', streaming: true }
+        { id: `u-${id}`, role: 'user', text, thinking: '', streaming: false },
+        { id, role: 'assistant', text: '', thinking: '', streaming: true }
       ])
       setActivePrompt(id)
     } catch (err) {
@@ -319,6 +378,31 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
     },
     [say]
   )
+
+  const setContextSize = useCallback(
+    (size: number | null) => {
+      void window.api.setContextSize(size).then(setConfig, (err) => say(cleanError(err).message))
+    },
+    [say]
+  )
+
+  const setGeneration = useCallback(
+    (prefs: GenerationPreferences) => {
+      void window.api.setGeneration(prefs).then(setConfig, (err) => say(cleanError(err).message))
+    },
+    [say]
+  )
+
+  const setEngine = useCallback(
+    (engine: ChatEngine, server: ServerPreferences) => {
+      void window.api.setEngine(engine, server).then(setConfig, (err) => say(cleanError(err).message))
+    },
+    [say]
+  )
+
+  const pickServer = useCallback(() => {
+    void window.api.pickServer().then((config) => config && setConfig(config), (err) => say(cleanError(err).message))
+  }, [say])
 
   const newChat = useCallback(() => void act(() => window.api.workspace.newChat()), [act])
 
@@ -400,7 +484,11 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
               <code className="mm-path">{model.path}</code>
               <dl className="mm-facts">
                 <dt>Runs on</dt>
-                <dd>{model.gpuLayers > 0 ? `${model.backend}, ${model.gpuLayers} layers on the GPU` : 'CPU only'}</dd>
+                <dd>
+                  {model.gpuLayers > 0
+                    ? `${model.backend}${model.devices.length ? ` (${model.devices.join(', ')})` : ''}, ${model.gpuLayers} layers on the GPU`
+                    : 'CPU only'}
+                </dd>
                 <dt>Context</dt>
                 <dd>
                   {model.contextSize.toLocaleString()} tokens
@@ -409,9 +497,157 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
                     : ''}
                   , {model.kvCache === 'q8_0' ? '8-bit' : '16-bit'} memory
                 </dd>
+                <dt>Model</dt>
+                <dd>
+                  {model.traits.architecture}
+                  {model.traits.experts
+                    ? `, mixture of ${model.traits.experts.total} experts (${model.traits.experts.active} per token)`
+                    : ''}
+                  {model.traits.quantization ? `, ${model.traits.quantization}` : ''}
+                  {model.traits.thinking ? ', can think before replying' : ''}
+                </dd>
                 <dt>File</dt>
                 <dd>{formatBytes(model.fileSizeBytes)}</dd>
               </dl>
+              <EngineSettings
+                config={config}
+                model={model}
+                busy={busy}
+                onChange={setEngine}
+                onPickServer={pickServer}
+                onReload={fromMenu(() => void loadPath(model.path))}
+              />
+              <div className="mm-kv">
+                <div className="mm-kv-row">
+                  <span>Context</span>
+                  <div className="seg" role="group" aria-label="Context size">
+                    {contextChoicesFor(model.trainContextSize).map((size) => (
+                      <button
+                        key={size}
+                        aria-pressed={(config.model.contextSize ?? defaultContextSize(model.trainContextSize)) === size}
+                        onClick={() => setContextSize(size === defaultContextSize(model.trainContextSize) ? null : size)}
+                      >
+                        {tokensLabel(size)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <p className="help">
+                  A smaller context leaves more of the model on the GPU, so replies come faster; a larger one holds a longer
+                  conversation. The model was trained for {model.trainContextSize.toLocaleString()} tokens.
+                </p>
+                {(config.model.contextSize ?? defaultContextSize(model.trainContextSize)) !== model.contextSize ? (
+                  <button className="primary small" disabled={busy} onClick={fromMenu(() => void loadPath(model.path))}>
+                    Reload with {tokensLabel(config.model.contextSize ?? defaultContextSize(model.trainContextSize))} context
+                  </button>
+                ) : null}
+              </div>
+              {model.traits.thinking ? (
+                <div className="mm-kv">
+                  <div className="mm-kv-row">
+                    <span>Thinking</span>
+                    <div className="seg" role="group" aria-label="Thinking">
+                      {(Object.keys(THINKING_LABEL) as ThinkingMode[]).map((mode) => (
+                        <button
+                          key={mode}
+                          aria-pressed={config.model.generation.thinking === mode}
+                          onClick={() => setGeneration({ ...config.model.generation, thinking: mode })}
+                        >
+                          {THINKING_LABEL[mode]}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  {config.model.generation.thinking !== 'off' ? (
+                    <div className="mm-kv-row mm-sub">
+                      <span>At most</span>
+                      <select
+                        aria-label="Thinking budget"
+                        value={config.model.generation.thinkingBudget ?? ''}
+                        onChange={(e) =>
+                          setGeneration({
+                            ...config.model.generation,
+                            thinkingBudget: e.target.value === '' ? null : Number(e.target.value)
+                          })
+                        }
+                      >
+                        {THINKING_BUDGETS.map((budget) => (
+                          <option key={budget ?? 'none'} value={budget ?? ''}>
+                            {budget === null ? 'No limit' : `${tokensLabel(budget)} tokens`}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : null}
+                  <p className="help">
+                    This model works through a problem before answering. Thinking makes hard questions better and every reply
+                    slower; the thought is shown folded above the reply.
+                  </p>
+                </div>
+              ) : null}
+              <div className="mm-kv">
+                <div className="mm-kv-row">
+                  <span>Sampling</span>
+                  <div className="seg" role="group" aria-label="Sampling">
+                    <button
+                      aria-pressed={config.model.generation.sampling.kind === 'recommended'}
+                      onClick={() => setGeneration({ ...config.model.generation, sampling: { kind: 'recommended' } })}
+                    >
+                      Recommended
+                    </button>
+                    <button
+                      aria-pressed={config.model.generation.sampling.kind === 'custom'}
+                      onClick={() =>
+                        setGeneration({
+                          ...config.model.generation,
+                          sampling: { kind: 'custom', ...model.recommendedSampling }
+                        })
+                      }
+                    >
+                      Custom
+                    </button>
+                  </div>
+                </div>
+                {config.model.generation.sampling.kind === 'custom' ? (
+                  <div className="mm-fields">
+                    {(
+                      [
+                        ['temperature', 'Temperature', 0, 2, 0.05],
+                        ['topP', 'Top-p', 0, 1, 0.01],
+                        ['topK', 'Top-k', 0, 1000, 1],
+                        ['minP', 'Min-p', 0, 1, 0.01]
+                      ] as const
+                    ).map(([key, label, min, max, step]) => (
+                      <label key={key}>
+                        <span>{label}</span>
+                        <input
+                          type="number"
+                          min={min}
+                          max={max}
+                          step={step}
+                          value={(config.model.generation.sampling as SamplingValues)[key]}
+                          onChange={(e) => {
+                            const value = Number(e.target.value)
+                            if (!Number.isFinite(value) || value < min || value > max) return
+                            setGeneration({
+                              ...config.model.generation,
+                              sampling: {
+                                ...(config.model.generation.sampling as { kind: 'custom' } & SamplingValues),
+                                [key]: key === 'topK' ? Math.round(value) : value
+                              }
+                            })
+                          }}
+                        />
+                      </label>
+                    ))}
+                  </div>
+                ) : null}
+                <p className="help">
+                  {config.model.generation.sampling.kind === 'recommended'
+                    ? `What this model's publisher recommends: ${samplingLabel(model.recommendedSampling)}.`
+                    : `The publisher recommends ${samplingLabel(model.recommendedSampling)}.`}
+                </p>
+              </div>
               <div className="mm-kv">
                 <div className="mm-kv-row">
                   <span>Context memory</span>
@@ -435,6 +671,14 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
                 ) : null}
               </div>
               <div className="mm-actions">
+                <button
+                  onClick={fromMenu(() => {
+                    setTab('model')
+                    void window.api.inspectModel().catch((err) => say(cleanError(err).message))
+                  })}
+                >
+                  Check this file…
+                </button>
                 <button onClick={fromMenu(() => void pickAndLoad())}>Change model…</button>
                 <button onClick={fromMenu(() => void window.api.unloadModel())}>Unload</button>
               </div>
@@ -443,6 +687,19 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
         ) : (
           <>
             <div className="model-chip idle">No model loaded</div>
+            <button popoverTarget="engine-menu" title="Which engine runs the chat model">
+              {config.model.engine === 'server' ? 'llama-server' : 'Built-in'} <span aria-hidden>▾</span>
+            </button>
+            <div className="model-menu" id="engine-menu" popover="auto">
+              <EngineSettings
+                config={config}
+                model={null}
+                busy={busy}
+                onChange={setEngine}
+                onPickServer={pickServer}
+                onReload={() => undefined}
+              />
+            </div>
             <button onClick={pickAndLoad}>Load a GGUF model…</button>
           </>
         )}
@@ -476,6 +733,7 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
                   {active.name}
                 </strong>
                 <span className="chat-head-title truncate">{chatTitle}</span>
+                {active.strict ? <span className="ws-strict">Strict: chat only</span> : null}
                 <span className={`ws-net ws-net-${active.internet}`}>{internetLabel(active.internet)}</span>
                 <div className="spacer" />
                 <button className="small" onClick={newChat} disabled={busy}>
@@ -510,6 +768,15 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
                     <div className="who">
                       {turn.role === 'user' ? 'You' : turn.role === 'system' ? 'App' : 'Model'}
                     </div>
+                    {turn.role === 'assistant' ? (
+                      <ReplyMeta
+                        thinking={turn.thinking}
+                        stillThinking={turn.streaming && turn.text === ''}
+                        thinkingStartedAt={turn.thinkingStartedAt}
+                        thinkingEndedAt={turn.thinkingEndedAt}
+                        stats={turn.stats}
+                      />
+                    ) : null}
                     {/* Leading blank lines are dropped: some models open every reply with
                         the newlines left behind by an empty thinking block. */}
                     <div className={`bubble ${turn.streaming ? 'cursor' : ''}`}>{turn.text.trimStart()}</div>
@@ -585,9 +852,12 @@ export function ChatStudio({ visible }: { visible: boolean }): React.JSX.Element
           }}
           onSetProtected={(list) => void update(() => window.api.workspace.setProtected(list))}
           onSetInternet={(level) => void update(() => window.api.workspace.setInternet(level))}
+          onSetStrict={(strict) => void update(() => window.api.workspace.setStrict(strict))}
           changes={changes}
           onRevert={(group) => void revert(group)}
         />
+      ) : tab === 'model' ? (
+        <ModelCheckPanel model={model} config={config} internet={active?.internet ?? null} strict={active?.strict ?? false} />
       ) : (
         <div className="panel">
           {active ? (

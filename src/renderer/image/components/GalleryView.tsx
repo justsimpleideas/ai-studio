@@ -2,15 +2,42 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { FOLDER_NAME_MAX, FOLDER_PIN } from "@shared/image.js";
 import { matchesShortcut } from "@shared/shortcuts.js";
 import { useShortcuts, useShortcutsRef } from "../../useShortcuts";
-import { saveGalleryView, startView, type GalleryStart, type GalleryViewKind } from "../display";
+import {
+  loadMosaic,
+  loadTileSize,
+  MOSAIC_LEVELS,
+  nudgeTarget,
+  reorderedIds,
+  saveGalleryView,
+  saveMosaic,
+  saveTileSize,
+  startView,
+  TILE_SIZES,
+  type GalleryStart,
+  type GalleryViewKind,
+  type MosaicLevel,
+  type TileSize,
+} from "../display";
 import { api } from "../api";
 import { formatSeconds } from "../format";
-import type { GalleryFolder, ImageRecord, MediaKind } from "../types";
+import { planRead, readChunks, selectWith, type Loaded } from "../selection";
+import type { GalleryFolder, ImageRecord, MediaKind, SaveManyOptions } from "../types";
 import type { Folders } from "../useFolders";
+import { FolderPicker } from "./FolderPicker";
 
 const PAGE = 60;
+/**
+ * How far the pointer must travel, in pixels, before a press on a folder becomes a
+ * drag that reorders the list. Generous on purpose: a folder is clicked far more
+ * often than it is moved, and a list that reshuffles on a twitch is worse than one
+ * that needs a deliberate pull.
+ */
+const REORDER_SLOP = 8;
 const FOLDERS_KEY = "lis.gallery.folders.v1";
-/** What a tile carries while it is dragged onto a folder. Not a file, so the file drop zones ignore it. */
+/**
+ * What a tile carries while it is dragged onto a folder: its id, or the ids of every chosen
+ * item, comma-separated. Not a file, so the file drop zones ignore it.
+ */
 export const ITEM_DRAG_TYPE = "application/x-studio-item";
 
 export type { GalleryViewKind } from "../display";
@@ -24,15 +51,26 @@ interface Props {
   onError: (message: string) => void;
   /** File an item in a folder (null: take it out of its folder). */
   onMove: (image: ImageRecord, folderId: string | null) => Promise<void>;
+  /** File several at once (a multi-select, or a drag of one); resolves to how many moved. */
+  onMoveMany: (ids: string[], folderId: string | null) => Promise<number>;
   /** Delete an item for good (already confirmed). */
   onDelete: (image: ImageRecord) => Promise<void>;
+  /** Delete several for good (already confirmed). */
+  onDeleteMany: (images: ImageRecord[]) => Promise<void>;
+  /** A note that something went as asked ("Saved 3 items to ..."). */
+  onNotice: (message: string) => void;
+  /** Something is open over the gallery (an item's details, the queue): its keys are not the gallery's. */
+  covered?: boolean;
   /** Changes when every open PIN folder was just locked at once (a shortcut, Ctrl+Shift+L by default). */
   lockedAll?: number;
   /** Open on All, Favorites or a chosen folder each time, or on the view last open (Settings). */
   start?: GalleryStart;
 }
 
-export function GalleryView({ version, folders, onOpen, registerUpdater, onError, onMove, onDelete, lockedAll = 0, start = "all" }: Props) {
+export function GalleryView({
+  version, folders, onOpen, registerUpdater, onError, onMove, onMoveMany, onDelete, onDeleteMany, onNotice,
+  covered = false, lockedAll = 0, start = "all",
+}: Props) {
   const [items, setItems] = useState<ImageRecord[]>([]);
   const [total, setTotal] = useState(0);
   const [query, setQuery] = useState("");
@@ -40,6 +78,12 @@ export function GalleryView({ version, folders, onOpen, registerUpdater, onError
   // Kept either way, so switching to "where it was left" picks up from now.
   useEffect(() => saveGalleryView(view), [view]);
   const [media, setMedia] = useState<MediaKind | null>(null);
+  // How big the thumbnails are, as in a file manager. Remembered for next time.
+  const [tileSize, setTileSize] = useState<TileSize>(loadTileSize);
+  useEffect(() => saveTileSize(tileSize), [tileSize]);
+  // A mosaic over the thumbnails, for when the screen is not private. Remembered too.
+  const [mosaic, setMosaic] = useState<MosaicLevel>(loadMosaic);
+  useEffect(() => saveMosaic(mosaic), [mosaic]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [menu, setMenu] = useState<TileMenuAt | null>(null);
@@ -96,34 +140,156 @@ export function GalleryView({ version, folders, onOpen, registerUpdater, onError
     }
   }, [lockedAll]);
 
-  const load = useCallback(async (offset: number) => {
-    if (viewGone) return;
-    const id = ++request.current;
-    setLoading(true);
-    try {
-      const page = await api.gallery({
-        offset,
-        limit: PAGE,
-        q: query.trim(),
-        favorites: view.kind === "favorites",
-        ...(view.kind === "folder" ? { folder: view.id } : {}),
-        ...(media ? { media } : {}),
-      });
-      if (id !== request.current) return;
-      setTotal(page.total);
-      setItems((prev) => (offset === 0 ? page.items : [...prev, ...page.items]));
-      setError(null);
-    } catch (e) {
-      if (id === request.current) setError((e as Error).message);
-    } finally {
-      if (id === request.current) setLoading(false);
-    }
-  }, [query, view, media, viewGone]);
+  // What is on screen is read as "the first `want` items of this list". Load more asks for more
+  // of the same list and reads only what is missing; a change elsewhere (a new image, a move,
+  // a deletion) reads the list again as far down as it was, so pages already brought in stay.
+  // Only the newest read counts: a slow answer for a view that was left is dropped.
+  const listKey = JSON.stringify([view, media]);
+  const readKey = JSON.stringify([view, media, query.trim()]);
+  const [want, setWant] = useState(PAGE);
+  const [refreshTick, setRefreshTick] = useState(0);
+  const readVersion = `${version}:${refreshTick}`;
+  const loaded = useRef<Loaded | null>(null);
+
+  // Another view or filter: what the last one showed goes at once, rather than standing in
+  // for the new one until its answer arrives.
+  const shownKey = useRef(listKey);
+  if (shownKey.current !== listKey) {
+    shownKey.current = listKey;
+    loaded.current = null;
+    setItems([]);
+    setTotal(0);
+    setWant(PAGE);
+  }
 
   useEffect(() => {
-    const t = window.setTimeout(() => load(0), query ? 200 : 0);
+    if (viewGone) return;
+    const plan = planRead(loaded.current, { key: readKey, version: readVersion, count: want });
+    const id = ++request.current;
+    const base = {
+      q: query.trim(),
+      favorites: view.kind === "favorites",
+      ...(view.kind === "folder" ? { folder: view.id } : {}),
+      ...(media ? { media } : {}),
+    };
+    // Typing in the search box waits for a pause; nothing else does.
+    const typing = plan.replace && query !== "" && loaded.current !== null && loaded.current.key !== readKey;
+    const t = window.setTimeout(async () => {
+      setLoading(true);
+      try {
+        const got: ImageRecord[] = [];
+        let all = 0;
+        for (const chunk of readChunks(plan.offset, plan.count)) {
+          const page = await api.gallery({ ...base, ...chunk });
+          if (id !== request.current) return;
+          got.push(...page.items);
+          all = page.total;
+          if (page.items.length < chunk.limit) break;
+        }
+        setTotal(all);
+        setItems((prev) => {
+          if (plan.replace) return got;
+          const have = new Set(prev.map((i) => i.id));
+          return [...prev, ...got.filter((i) => !have.has(i.id))];
+        });
+        loaded.current = { key: readKey, version: readVersion, count: (plan.replace ? 0 : loaded.current?.count ?? 0) + got.length };
+        setError(null);
+      } catch (e) {
+        if (id === request.current) setError((e as Error).message);
+      } finally {
+        if (id === request.current) setLoading(false);
+      }
+    }, typing ? 200 : 0);
     return () => window.clearTimeout(t);
-  }, [load, version, query]);
+  }, [readKey, readVersion, want, viewGone]);
+
+  // ---------------------------------------------------------------- choosing several
+
+  const [selecting, setSelecting] = useState(false);
+  const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
+  const [bulk, setBulk] = useState<"move" | "save" | "delete" | null>(null);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const anchor = useRef<string | null>(null);
+  const endSelecting = useCallback(() => {
+    setSelecting(false);
+    setSelected(new Set());
+    setBulk(null);
+    anchor.current = null;
+  }, []);
+  // A selection belongs to the list it was made in.
+  useEffect(() => endSelecting(), [listKey, endSelecting]);
+  // Items that left the list (moved out, deleted, out of view) leave the selection too.
+  useEffect(() => {
+    setSelected((s) => {
+      if (s.size === 0) return s;
+      const present = new Set(items.map((i) => i.id));
+      const kept = [...s].filter((id) => present.has(id));
+      return kept.length === s.size ? s : new Set(kept);
+    });
+  }, [items]);
+  const chosen = items.filter((i) => selected.has(i.id));
+  const selectAll = (): void => {
+    setSelecting(true);
+    setSelected(new Set(items.map((i) => i.id)));
+  };
+
+  const moveChosen = async (folderId: string | null): Promise<void> => {
+    const ids = chosen.map((i) => i.id);
+    if (ids.length === 0) return;
+    setBulk(null);
+    setBulkBusy(true);
+    try {
+      const moved = await onMoveMany(ids, folderId);
+      const where = folderId === null
+        ? "out of their folders"
+        : `to \u201c${folders.list.find((f) => f.id === folderId)?.name ?? "the folder"}\u201d`;
+      onNotice(`Moved ${moved} item${moved === 1 ? "" : "s"} ${where}.`);
+      endSelecting();
+    } catch (e) {
+      onError((e as Error).message);
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
+  const deleteChosen = async (): Promise<void> => {
+    setBulkBusy(true);
+    try {
+      await onDeleteMany(chosen);
+      endSelecting();
+    } catch (e) {
+      onError((e as Error).message);
+    } finally {
+      setBulkBusy(false);
+      setRefreshTick((n) => n + 1);
+    }
+  };
+
+  // Ctrl+A chooses every item shown, Escape lets go, and the "Move to a folder" shortcut opens
+  // the numbered folder list for what is chosen, while the gallery is in front and no text box
+  // has the keys.
+  const keys = useRef({ selecting, chosen: chosen.length, covered, menu: menu !== null, selectAll, endSelecting });
+  keys.current = { selecting, chosen: chosen.length, covered, menu: menu !== null, selectAll, endSelecting };
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const k = keys.current;
+      if (k.covered || k.menu || !sectionRef.current || sectionRef.current.offsetParent === null) return;
+      const t = e.target;
+      if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t instanceof HTMLSelectElement) return;
+      if (matchesShortcut(e, "Ctrl+A")) {
+        e.preventDefault();
+        k.selectAll();
+      } else if (e.key === "Escape" && k.selecting) {
+        k.endSelecting();
+      } else if (matchesShortcut(e, shortcuts.current.pickFolder) && k.chosen > 0) {
+        e.preventDefault();
+        setBulk((b) => (b === "move" ? null : "move"));
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  const pickKeys = useShortcuts().pickFolder;
 
   useEffect(() => {
     registerUpdater((update) => {
@@ -135,13 +301,16 @@ export function GalleryView({ version, folders, onOpen, registerUpdater, onError
       }
     });
   }, [registerUpdater]);
+  const moveDropped = (ids: string[], folderId: string | null): void => {
+    onMoveMany(ids, folderId).catch((e: Error) => onError(e.message));
+  };
 
   const heading = view.kind === "all" ? "All" : view.kind === "favorites" ? "Favorites" : folder?.name ?? "";
   const noun = media ?? "item";
 
   return (
     <section className={`gallery-view ${showFolders ? "" : "folders-hidden"}`} ref={sectionRef}>
-      {showFolders && <FolderList view={view} onView={setView} folders={folders} onError={onError} />}
+      {showFolders && <FolderList view={view} onView={setView} folders={folders} onError={onError} onMoveItems={moveDropped} />}
       <div className="gallery-main">
         <div className="gallery-toolbar">
           <button
@@ -179,9 +348,109 @@ export function GalleryView({ version, folders, onOpen, registerUpdater, onError
               </button>
             ))}
           </div>
+          <div className="segmented tile-size" role="radiogroup" aria-label="Thumbnail size">
+            {TILE_SIZES.map((size) => (
+              <button
+                type="button"
+                key={size}
+                role="radio"
+                aria-checked={tileSize === size}
+                className={tileSize === size ? "active" : ""}
+                title={`${size === "large" ? "Large" : size === "medium" ? "Medium" : "Small"} thumbnails`}
+                onClick={() => setTileSize(size)}
+              >
+                {size === "large" ? "Large" : size === "medium" ? "Medium" : "Small"}
+              </button>
+            ))}
+          </div>
+          <div className="segmented mosaic-level" role="radiogroup" aria-label="Mosaic">
+            {MOSAIC_LEVELS.map((level) => (
+              <button
+                type="button"
+                key={level}
+                role="radio"
+                aria-checked={mosaic === level}
+                className={mosaic === level ? "active" : ""}
+                title={
+                  level === "off"
+                    ? "Thumbnails as they are"
+                    : `A ${level} mosaic over the thumbnails. Opening one still shows it.`
+                }
+                onClick={() => setMosaic(level)}
+              >
+                {level === "off" ? "No mosaic" : level === "weak" ? "Weak" : "Strong"}
+              </button>
+            ))}
+          </div>
           <span className="muted small">{total} {noun}{total === 1 ? "" : "s"}</span>
+          <button
+            type="button"
+            className={`small select-toggle ${selecting ? "active" : ""}`}
+            aria-pressed={selecting}
+            title="Choose several items to move, save or delete together (or Ctrl+click and Shift+click a tile)"
+            onClick={() => (selecting ? endSelecting() : setSelecting(true))}
+          >
+            {selecting ? "Done" : "Select"}
+          </button>
         </div>
+        {selecting && (
+          <div className="selection-bar" role="toolbar" aria-label="Chosen items">
+            <span className="selection-count">{chosen.length === 0 ? "Click items to choose them" : `${chosen.length} chosen`}</span>
+            <button type="button" className="ghost small" onClick={selectAll} disabled={items.length === 0}>
+              Select all{items.length < total ? ` ${items.length} shown` : ""}
+            </button>
+            {chosen.length > 0 && (
+              <button type="button" className="ghost small" onClick={() => setSelected(new Set())}>Clear</button>
+            )}
+            <span className="selection-actions">
+              <span className="selection-anchor">
+                <button type="button" className="small" disabled={chosen.length === 0 || bulkBusy} aria-expanded={bulk === "move"} onClick={() => setBulk(bulk === "move" ? null : "move")}>
+                  Move to folder… <span className="folder-shortcut">{pickKeys.replaceAll("+", " + ")}</span>
+                </button>
+                {bulk === "move" && (
+                  <FolderPicker
+                    folders={folders.list}
+                    subject={`${chosen.length} item${chosen.length === 1 ? "" : "s"}`}
+                    onPick={(folderId) => void moveChosen(folderId)}
+                    onClose={() => setBulk(null)}
+                  />
+                )}
+              </span>
+              <span className="selection-anchor">
+                <button type="button" className="small" disabled={chosen.length === 0 || bulkBusy} aria-expanded={bulk === "save"} onClick={() => setBulk(bulk === "save" ? null : "save")}>
+                  Save copies…
+                </button>
+                {bulk === "save" && (
+                  <SaveManyPanel
+                    items={chosen}
+                    onClose={() => setBulk(null)}
+                    onSaved={(text) => {
+                      setBulk(null);
+                      onNotice(text);
+                    }}
+                    onError={onError}
+                  />
+                )}
+              </span>
+              <span className="selection-anchor">
+                <button type="button" className="small ghost danger-text" disabled={chosen.length === 0 || bulkBusy} onClick={() => setBulk(bulk === "delete" ? null : "delete")}>
+                  Delete…
+                </button>
+                {bulk === "delete" && (
+                  <div className="bulk-pop" role="alertdialog" aria-label="Delete the chosen items">
+                    <p>Delete {chosen.length} item{chosen.length === 1 ? "" : "s"} for good? This cannot be undone.</p>
+                    <div className="row-gap">
+                      <button type="button" className="danger small" disabled={bulkBusy} onClick={() => void deleteChosen()}>Delete for good</button>
+                      <button type="button" className="ghost small" onClick={() => setBulk(null)}>Cancel</button>
+                    </div>
+                  </div>
+                )}
+              </span>
+            </span>
+          </div>
+        )}
         {error && <div className="error-text">{error}</div>}
+        {loading && items.length === 0 && <div className="empty-gallery muted">Loading…</div>}
         {!loading && items.length === 0 && !error && (
           <div className="empty-gallery muted">
             {query || media
@@ -193,19 +462,32 @@ export function GalleryView({ version, folders, onOpen, registerUpdater, onError
                   : "Nothing here yet. Generated images and videos are saved automatically."}
           </div>
         )}
-        <div className="gallery-grid">
+        <div className="gallery-grid" data-size={tileSize} data-mosaic={mosaic}>
           {items.map((img) => (
             <button
               key={img.id}
-              className="tile"
+              className={`tile ${selected.has(img.id) ? "selected" : ""}`}
               data-id={img.id}
+              aria-pressed={selecting ? selected.has(img.id) : undefined}
               style={{ "--ar": img.width > 0 && img.height > 0 ? img.width / img.height : 1.6 } as React.CSSProperties}
               draggable
               onDragStart={(e) => {
-                e.dataTransfer.setData(ITEM_DRAG_TYPE, img.id);
+                // A chosen tile takes every chosen item along.
+                const ids = selected.has(img.id) ? chosen.map((i) => i.id) : [img.id];
+                e.dataTransfer.setData(ITEM_DRAG_TYPE, ids.join(","));
                 e.dataTransfer.effectAllowed = "move";
               }}
-              onClick={() => onOpen(img, items)}
+              onClick={(e) => {
+                const toggle = e.ctrlKey || e.metaKey;
+                const range = e.shiftKey;
+                if (selecting || toggle || range) {
+                  setSelecting(true);
+                  setSelected((s) => selectWith(s, items.map((i) => i.id), img.id, { toggle, range }, anchor.current));
+                  if (!range || anchor.current === null) anchor.current = img.id;
+                  return;
+                }
+                onOpen(img, items);
+              }}
               onContextMenu={(e) => {
                 e.preventDefault();
                 setMenu({ image: img, x: e.clientX, y: e.clientY });
@@ -220,8 +502,13 @@ export function GalleryView({ version, folders, onOpen, registerUpdater, onError
               }}
               title={img.prompt}
             >
-              <img src={img.thumb_url} alt={img.prompt} loading="lazy" style={{ aspectRatio: `${img.width} / ${img.height}` }} />
+              {mosaic === "off" ? (
+                <img src={img.thumb_url} alt={img.prompt} loading="lazy" style={{ aspectRatio: `${img.width} / ${img.height}` }} />
+              ) : (
+                <MosaicThumb src={img.thumb_url} ratio={img.width / img.height} level={mosaic} />
+              )}
               {img.favorite && <span className="badge" aria-label="Favorite">★</span>}
+              {selecting && <span className="tile-check" aria-hidden>{selected.has(img.id) ? "✓" : ""}</span>}
               {img.media === "video" && (
                 <span className="video-badge" aria-label="Video">▶ {formatSeconds(img.frames ?? 0, img.fps ?? 0)}</span>
               )}
@@ -230,7 +517,7 @@ export function GalleryView({ version, folders, onOpen, registerUpdater, onError
         </div>
         {items.length < total && (
           <div className="center">
-            <button onClick={() => load(items.length)} disabled={loading}>{loading ? "Loading…" : "Load more"}</button>
+            <button onClick={() => setWant(items.length + PAGE)} disabled={loading}>{loading ? "Loading…" : "Load more"}</button>
           </div>
         )}
       </div>
@@ -246,6 +533,73 @@ export function GalleryView({ version, folders, onOpen, registerUpdater, onError
         />
       )}
     </section>
+  );
+}
+
+// ------------------------------------------------------------ saving copies
+
+/**
+ * Copies of the chosen items, saved into a folder picked next. The options: whether images keep
+ * the prompt and settings inside them (the "Save as…" setting to start with), and whether
+ * each item gets a .txt beside it with its prompt and settings. Nothing is overwritten.
+ */
+function SaveManyPanel({ items, onClose, onSaved, onError }: {
+  items: ImageRecord[];
+  onClose: () => void;
+  onSaved: (message: string) => void;
+  onError: (message: string) => void;
+}) {
+  const [options, setOptions] = useState<SaveManyOptions>({ includeSettings: false, promptFiles: false });
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    api.includeSettingsInExports().then((on) => setOptions((o) => ({ ...o, includeSettings: on })), () => undefined);
+  }, []);
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", key);
+    return () => document.removeEventListener("keydown", key);
+  }, [onClose]);
+  const videos = items.filter((i) => i.media === "video").length;
+
+  const save = async (): Promise<void> => {
+    setBusy(true);
+    try {
+      const result = await api.saveManyTo(items.map((i) => i.id), options);
+      if (result) {
+        const failed = result.failed ? ` ${result.failed} could not be saved.` : "";
+        onSaved(`Saved ${result.saved} item${result.saved === 1 ? "" : "s"} to ${result.folder}.${failed}`);
+      }
+    } catch (e) {
+      onError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="bulk-pop save-many" role="dialog" aria-label="Save copies">
+      <p className="folder-picker-title">Save {items.length} item{items.length === 1 ? "" : "s"}</p>
+      <label className="toggle wrap">
+        <input type="checkbox" checked={options.includeSettings} onChange={(e) => setOptions({ ...options, includeSettings: e.target.checked })} />
+        <span>Keep the prompt and settings inside each image</span>
+      </label>
+      <label className="toggle wrap">
+        <input type="checkbox" checked={options.promptFiles} onChange={(e) => setOptions({ ...options, promptFiles: e.target.checked })} />
+        <span>Also save each prompt and its settings as a .txt file beside it</span>
+      </label>
+      <p className="hint">
+        {videos > 0 ? "Videos never carry the prompt inside the file. " : ""}
+        Files already in the folder are kept; a copy with the same name gets a number.
+      </p>
+      <div className="row-gap">
+        <button type="button" className="primary small" disabled={busy} onClick={() => void save()}>
+          {busy ? "Saving…" : "Choose a folder and save"}
+        </button>
+        <button type="button" className="ghost small" onClick={onClose}>Cancel</button>
+      </div>
+    </div>
   );
 }
 
@@ -364,8 +718,8 @@ function hasItem(e: React.DragEvent): boolean {
   return Array.from(e.dataTransfer.types).includes(ITEM_DRAG_TYPE);
 }
 
-/** A place a dragged tile can be dropped on: a folder, or "All" to take it out of its folder. */
-function useDropTarget(onItem: (id: string) => void) {
+/** A place dragged tiles can be dropped on: a folder, or "All" to take them out of their folders. */
+function useDropTarget(onItems: (ids: string[]) => void) {
   const [over, setOver] = useState(false);
   return {
     over,
@@ -381,20 +735,27 @@ function useDropTarget(onItem: (id: string) => void) {
         if (!hasItem(e)) return;
         e.preventDefault();
         setOver(false);
-        const id = e.dataTransfer.getData(ITEM_DRAG_TYPE);
-        if (id) onItem(id);
+        const ids = e.dataTransfer.getData(ITEM_DRAG_TYPE).split(",").filter(Boolean);
+        if (ids.length > 0) onItems(ids);
       },
     },
   };
 }
 
-function FolderList({ view, onView, folders, onError }: {
+function FolderList({ view, onView, folders, onError, onMoveItems }: {
   view: GalleryViewKind;
   onView: (view: GalleryViewKind) => void;
   folders: Folders;
   onError: (message: string) => void;
+  onMoveItems: (ids: string[], folderId: string | null) => void;
 }) {
   const [creating, setCreating] = useState(false);
+  // Dragging a folder into a new place. A press is not a drag: nothing moves until the
+  // pointer has travelled REORDER_SLOP, so clicking a folder — or a slip of the hand on
+  // the way to a click — never reorders the list.
+  const [drag, setDrag] = useState<{ id: string; before: string | null } | null>(null);
+  const dragged = useRef(false);
+  const listRef = useRef<HTMLElement>(null);
   const attempt = async (run: () => Promise<unknown>): Promise<boolean> => {
     try {
       await run();
@@ -404,10 +765,79 @@ function FolderList({ view, onView, folders, onError }: {
       return false;
     }
   };
-  const all = useDropTarget((id) => void attempt(() => folders.move(id, null)));
+  const all = useDropTarget((ids) => onMoveItems(ids, null));
+
+  /** The folder a dragged one would land in front of, or null for the end of the list. */
+  const landsBefore = (y: number, id: string): string | null => {
+    const rows = [...(listRef.current?.querySelectorAll<HTMLElement>("[data-folder-id]") ?? [])];
+    for (const row of rows) {
+      const other = row.dataset.folderId;
+      if (!other || other === id) continue;
+      const box = row.getBoundingClientRect();
+      if (y < box.top + box.height / 2) return other;
+    }
+    return null;
+  };
+
+  /** Whether moving `id` in front of `before` would change the order at all. */
+  const wouldMove = (id: string, before: string | null): boolean => {
+    const ids = folders.list.map((f) => f.id);
+    return reorderedIds(ids, id, before).join() !== ids.join();
+  };
+
+  const startReorder = (e: React.PointerEvent, id: string): void => {
+    dragged.current = false;
+    // Left button only, one pointer, and never from the row's own buttons.
+    if (e.button !== 0 || !e.isPrimary || (e.target as HTMLElement).closest(".folder-actions")) return;
+    const from = { x: e.clientX, y: e.clientY };
+    let moving = false;
+    let landing: string | null = null;
+    const stop = (): void => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("keydown", onKey);
+      setDrag(null);
+    };
+    const onMove = (ev: PointerEvent): void => {
+      if (!moving) {
+        if (Math.hypot(ev.clientX - from.x, ev.clientY - from.y) < REORDER_SLOP) return;
+        moving = true;
+        // From here the press is a drag, so the click it would end in is dropped.
+        dragged.current = true;
+      }
+      landing = landsBefore(ev.clientY, id);
+      setDrag({ id, before: landing });
+    };
+    const onUp = (): void => {
+      const move = moving && wouldMove(id, landing);
+      stop();
+      if (move) void attempt(() => folders.reorder(id, landing));
+    };
+    const onCancel = (): void => stop();
+    const onKey = (ev: KeyboardEvent): void => {
+      if (ev.key === "Escape") {
+        moving = false;
+        stop();
+      }
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("keydown", onKey);
+  };
+
+  /** Alt+Up/Down moves the focused folder one place, for anyone not using a mouse. */
+  const nudge = (id: string, direction: -1 | 1): void => {
+    const target = nudgeTarget(folders.list.map((f) => f.id), id, direction);
+    if (!target) return;
+    void attempt(() => folders.reorder(id, target.before));
+  };
+
+  const rest = folders.list.filter((f) => f.id !== drag?.id);
 
   return (
-    <aside className="folder-list" aria-label="Folders">
+    <aside className={`folder-list ${drag ? "reordering" : ""}`} aria-label="Folders" ref={listRef}>
       <button
         className={`folder-item ${view.kind === "all" ? "active" : ""} ${all.over ? "drop" : ""}`}
         onClick={() => onView({ kind: "all" })}
@@ -421,7 +851,7 @@ function FolderList({ view, onView, folders, onError }: {
       </button>
 
       <div className="folder-head">
-        <span>Folders</span>
+        <span title="Drag a folder to change the order, or press Alt and the up or down arrow.">Folders</span>
         <button className="icon-button small" title="New folder" aria-label="New folder" onClick={() => setCreating(true)}>+</button>
       </div>
       {creating && (
@@ -442,7 +872,20 @@ function FolderList({ view, onView, folders, onError }: {
           folders={folders}
           active={view.kind === "folder" && view.id === f.id}
           onSelect={() => onView({ kind: "folder", id: f.id })}
-          onDropItem={(id) => void attempt(() => folders.move(id, f.id))}
+          onDropItems={(ids) => onMoveItems(ids, f.id)}
+          reorder={{
+            dragging: drag?.id === f.id,
+            dropBefore: drag !== null && drag.before === f.id,
+            dropAfter: drag !== null && drag.before === null && rest.at(-1)?.id === f.id,
+            clicked: () => {
+              // The pointer-up that ends a drag also lands as a click; not a selection.
+              if (!dragged.current) return true;
+              dragged.current = false;
+              return false;
+            },
+            onPointerDown: (e) => startReorder(e, f.id),
+            onNudge: (direction) => nudge(f.id, direction),
+          }}
           onRename={(name) => attempt(() => folders.rename(f.id, name))}
           onDelete={() =>
             attempt(async () => {
@@ -460,19 +903,83 @@ function FolderList({ view, onView, folders, onError }: {
 
 type RowMode = "idle" | "rename" | "confirm" | "menu" | "unlock" | "set-pin" | "change-pin" | "remove-pin";
 
-function FolderRow({ folder, folders, active, onSelect, onDropItem, onRename, onDelete, onError }: {
+/** How many blocks across a thumbnail is drawn with, per strength. */
+const MOSAIC_BLOCKS: Record<Exclude<MosaicLevel, "off">, number> = { weak: 24, strong: 8 };
+
+/**
+ * A thumbnail as a mosaic.
+ *
+ * The thumbnail is drawn into a canvas a few blocks wide and shown at the tile's
+ * full size, so the browser blows up those blocks with no smoothing (CSS
+ * `image-rendering: pixelated`). Scaling the picture itself down and back up
+ * with a transform was tried first and only softened it: the compositor smooths
+ * what it scales, whatever the image is asked to render like.
+ *
+ * It is a cover for the grid, not protection: opening the item shows it as it
+ * is, the prompt is still in its tooltip and in search, and nothing on disk
+ * changes. Hidden and locked folders are what keep things out of view.
+ */
+function MosaicThumb({ src, ratio, level }: {
+  src: string;
+  ratio: number;
+  level: Exclude<MosaicLevel, "off">;
+}) {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  const across = MOSAIC_BLOCKS[level];
+  const down = Math.max(2, Math.round(across / (ratio > 0 ? ratio : 1.6)));
+
+  useEffect(() => {
+    const target = canvas.current;
+    if (!target) return;
+    let gone = false;
+    const image = new Image();
+    image.onload = () => {
+      if (gone) return;
+      const ctx = target.getContext("2d");
+      if (!ctx) return;
+      ctx.clearRect(0, 0, target.width, target.height);
+      ctx.drawImage(image, 0, 0, target.width, target.height);
+      target.dataset.drawn = "yes";
+    };
+    image.src = src;
+    return () => {
+      gone = true;
+    };
+  }, [src, across, down]);
+
+  // Not described: a mosaic is there so that what the picture shows is not read out either.
+  // The prompt is still the tile's tooltip, as it is for every other item.
+  return <canvas className="mosaic" ref={canvas} width={across} height={down} role="img" aria-label="Behind a mosaic" />;
+}
+
+/** What a row needs to take part in reordering; see FolderList's startReorder. */
+interface Reorder {
+  /** This row is the one being dragged. */
+  dragging: boolean;
+  /** The dragged folder would land in front of this row. */
+  dropBefore: boolean;
+  /** It would land at the end, after this (the last) row. */
+  dropAfter: boolean;
+  /** False when the click only ends a drag and must not select the folder. */
+  clicked: () => boolean;
+  onPointerDown: (e: React.PointerEvent) => void;
+  onNudge: (direction: -1 | 1) => void;
+}
+
+function FolderRow({ folder, folders, active, onSelect, onDropItems, onRename, onDelete, onError, reorder }: {
   folder: GalleryFolder;
   folders: Folders;
   active: boolean;
   onSelect: () => void;
-  onDropItem: (id: string) => void;
+  onDropItems: (ids: string[]) => void;
   onRename: (name: string) => Promise<boolean>;
   onDelete: () => Promise<boolean>;
   onError: (message: string) => void;
+  reorder: Reorder;
 }) {
   const [mode, setMode] = useState<RowMode>("idle");
   const lockAllKeys = useShortcuts().lockFolders;
-  const drop = useDropTarget(onDropItem);
+  const drop = useDropTarget(onDropItems);
   const closed = folder.locked && !folder.unlocked;
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -596,12 +1103,29 @@ function FolderRow({ folder, folders, active, onSelect, onDropItem, onRename, on
       </div>
     );
   }
+  const marks = [
+    active ? "active" : "",
+    drop.over ? "drop" : "",
+    folder.hidden ? "hidden-folder" : "",
+    reorder.dragging ? "dragging" : "",
+    reorder.dropBefore ? "drop-before" : "",
+    reorder.dropAfter ? "drop-after" : "",
+  ].join(" ");
   return (
-    <div className={`folder-row ${active ? "active" : ""} ${drop.over ? "drop" : ""} ${folder.hidden ? "hidden-folder" : ""}`} {...drop.handlers}>
+    <div className={`folder-row ${marks}`} data-folder-id={folder.id} onPointerDown={reorder.onPointerDown} {...drop.handlers}>
       <button
         className="folder-item"
-        onClick={closed ? () => setMode("unlock") : onSelect}
+        onClick={() => {
+          if (!reorder.clicked()) return;
+          if (closed) setMode("unlock");
+          else onSelect();
+        }}
         onDoubleClick={closed ? undefined : () => setMode("rename")}
+        onKeyDown={(e) => {
+          if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+          e.preventDefault();
+          reorder.onNudge(e.key === "ArrowUp" ? -1 : 1);
+        }}
         title={closed ? `${folder.name} (locked)` : folder.name}
       >
         <span className="folder-name">{folder.name}</span>

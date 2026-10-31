@@ -1,5 +1,8 @@
 import { useEffect, useState } from "react";
 import { studioMediaUrl } from "@shared/image.js";
+import { matchesShortcut } from "@shared/shortcuts.js";
+import { useShortcuts, useShortcutsRef } from "../../useShortcuts";
+import { FolderPicker } from "./FolderPicker";
 import { api } from "../api";
 import { formatBytes, formatDate, formatDuration, formatSeconds } from "../format";
 import type { GalleryFolder, GifOptions, ImageRecord } from "../types";
@@ -38,6 +41,10 @@ export function ImageDetail({ image, list, onNavigate, onClose, onReuse, onFavor
   const [saved, setSaved] = useState<string | null>(null);
   const [gifOpen, setGifOpen] = useState(false);
   const [exportsKeepSettings, setExportsKeepSettings] = useState<boolean | null>(null);
+  // The numbered folder list (the "Move to a folder" shortcut, Ctrl+M by default).
+  const [picking, setPicking] = useState(false);
+  const shortcuts = useShortcutsRef();
+  const pickKeys = useShortcuts().pickFolder;
   const index = list.findIndex((i) => i.id === image.id);
   const video = image.media === "video";
   const provenance = image.provenance ?? {};
@@ -57,11 +64,25 @@ export function ImageDetail({ image, list, onNavigate, onClose, onReuse, onFavor
     setCopied(false);
     setSaved(null);
     setGifOpen(false);
+    setPicking(false);
   }, [image.id]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement) return;
+      if (matchesShortcut(e, shortcuts.current.pickFolder)) {
+        e.preventDefault();
+        setPicking((open) => !open);
+        return;
+      }
+      // Left and right always mean the previous and next item, even with the folder list in
+      // focus, where they would otherwise change its choice and file the item somewhere else.
+      const arrow = e.key === "ArrowLeft" || e.key === "ArrowRight";
+      if (arrow && e.target instanceof HTMLSelectElement) {
+        e.preventDefault();
+        e.target.blur();
+      } else if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement) {
+        return;
+      }
       if (e.key === "Escape") onClose();
       if (e.key === "ArrowLeft" && prev) onNavigate(prev);
       if (e.key === "ArrowRight" && next) onNavigate(next);
@@ -96,12 +117,19 @@ export function ImageDetail({ image, list, onNavigate, onClose, onReuse, onFavor
             <button className="icon-button" onClick={onClose} aria-label="Close">✕</button>
           </div>
           <p className="detail-prompt">{image.prompt}</p>
+          <div className="detail-folder-wrap">
           <label className="detail-folder">
-            <span className="field-label">Folder</span>
+            <span className="field-label">
+              Folder <span className="folder-shortcut" title="Then 1 to 9 for a folder, 0 for none">{pickKeys.replaceAll("+", " + ")}</span>
+            </span>
             <select
               className="input"
               value={image.folder_id ?? ""}
-              onChange={(e) => onMove(image, e.target.value || null)}
+              onChange={(e) => {
+                onMove(image, e.target.value || null);
+                // Let go of the list, so the arrow keys go back to moving between items.
+                e.currentTarget.blur();
+              }}
             >
               <option value="">No folder</option>
               {folders.map((f) => (
@@ -110,6 +138,19 @@ export function ImageDetail({ image, list, onNavigate, onClose, onReuse, onFavor
               ))}
             </select>
           </label>
+          {picking && (
+            <FolderPicker
+              folders={folders}
+              current={image.folder_id ?? null}
+              subject={video ? "this video" : "this image"}
+              onPick={(folderId) => {
+                setPicking(false);
+                if (folderId !== (image.folder_id ?? null)) onMove(image, folderId);
+              }}
+              onClose={() => setPicking(false)}
+            />
+          )}
+          </div>
           <dl className="meta">
             <dt>Size</dt><dd>{image.width} × {image.height}</dd>
             {video && (<><dt>Length</dt><dd>{formatSeconds(image.frames ?? 0, image.fps ?? 0)} · {image.frames} frames at {image.fps} fps</dd></>)}

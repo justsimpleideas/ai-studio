@@ -338,6 +338,120 @@ button.model-chip {
   margin-top: 10px;
 }
 
+.mm-kv + .mm-kv {
+  border-top: none;
+  margin-top: -12px;
+}
+
+.mm-kv .mm-sub {
+  margin-top: 8px;
+  justify-content: flex-start;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.mm-kv .mm-sub select {
+  width: auto;
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+.mm-fields {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.mm-fields label {
+  display: grid;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.mm-fields input {
+  width: 100%;
+  padding: 3px 6px;
+  font-size: 12px;
+}
+
+.model-menu {
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+}
+
+/* Above a reply: how long the model thought and how fast it wrote. The thought
+   itself stays folded until its arrow is pressed. */
+.turn .reply-meta {
+  margin-bottom: 6px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.turn .reply-meta-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: var(--label-spacing);
+  text-transform: uppercase;
+  user-select: none;
+}
+
+.turn .reply-meta-time,
+.turn .reply-meta-rate {
+  font-variant-numeric: tabular-nums;
+  text-transform: none;
+  font-weight: 500;
+}
+
+.turn .reply-meta-rate::before {
+  content: '·';
+  margin-right: 6px;
+}
+
+.turn .reply-meta-line > .reply-meta-rate:first-child::before {
+  content: none;
+}
+
+.turn .thinking-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.turn .thinking-toggle:hover {
+  background: var(--line);
+  color: var(--text);
+}
+
+.turn .thinking-toggle svg {
+  transition: transform 120ms ease;
+}
+
+.turn .thinking-toggle.open svg {
+  transform: rotate(90deg);
+}
+
+.turn .thinking-body {
+  margin-top: 4px;
+  border-left: 2px solid var(--line-strong);
+  padding-left: 10px;
+  max-height: 40vh;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+
 .mm-actions {
   display: flex;
   justify-content: flex-end;
@@ -1892,6 +2006,43 @@ button.small {
   opacity: 0.45;
 }
 
+/* Where the studio's folders are: each one's path, then the buttons that move it. */
+.data-folder {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.data-folder-path {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  corner-shape: bevel;
+  overflow-wrap: anywhere;
+}
+
+.data-folder-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.data-folder-restart {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  corner-shape: bevel;
+  background: color-mix(in srgb, var(--accent) 7%, var(--panel));
+}
+
 /* Keyboard shortcuts: what each does, then its keys and the buttons to change them. */
 .shortcut-row {
   display: flex;
@@ -2035,8 +2186,13 @@ button.small {
   margin-top: 10px;
 }
 
-.key-row input[type='password'] {
+.key-row input[type='password'],
+.key-row input[type='url'] {
   width: 200px;
+}
+
+.key-row select {
+  width: auto;
 }
 
 .internet h4 {
@@ -2124,6 +2280,123 @@ button.small {
 .ws-net {
   margin-top: 3px;
   color: var(--ok);
+}
+
+.ws-strict {
+  margin-top: 3px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.chat-head .ws-strict {
+  margin: 0 0 0 10px;
+  font-size: 12px;
+}
+
+.strict-section .toggle-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  cursor: pointer;
+}
+
+.strict-section .toggle-row input {
+  margin-top: 3px;
+}
+
+/* Model check tab */
+
+/* The file report is the image side's (ModelInspectPanel's Report), whose
+   utility classes are scoped to .image-studio; the same rules here, scoped to
+   this tab, so its lines break and its details read as details. */
+.model-check .muted { color: var(--muted); }
+.model-check .small { font-size: 12px; }
+.model-check .strong { font-weight: 600; }
+.model-check .block { display: block; }
+.model-check .pre { white-space: pre-wrap; }
+.model-check .mono { font-family: var(--mono); }
+.model-check .tabular { font-variant-numeric: tabular-nums; }
+.model-check .path { overflow-wrap: anywhere; color: var(--muted); font-size: 12px; }
+.model-check .row-gap { display: flex; gap: 8px; align-items: center; }
+.model-check .grow { flex: 1; }
+.model-check .field { display: flex; flex-direction: column; gap: 7px; }
+.model-check .field-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: var(--label-spacing); color: var(--muted); }
+.model-check .hint { font-size: 12px; color: var(--muted); }
+.model-check .inspect-report { display: flex; flex-direction: column; gap: 12px; }
+.model-check .inspect-report .sha { overflow-wrap: anywhere; font-size: 12px; }
+.model-check .info-tip { display: inline-block; cursor: help; color: var(--accent); }
+.model-check .inspect-findings { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.model-check .finding { display: flex; gap: 10px; align-items: flex-start; }
+.model-check .finding-mark { flex: none; width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; border: 1px solid currentColor; }
+.model-check .finding.ok .finding-mark { color: var(--ok); }
+.model-check .finding.info .finding-mark { color: var(--muted); }
+.model-check .finding.warn .finding-mark { color: var(--warn); }
+.model-check .finding.danger .finding-mark { color: var(--danger); }
+.model-check .finding.danger > span > .strong { color: var(--danger); }
+.model-check .metadata-table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+.model-check .metadata-table td { padding: 4px 8px 4px 0; vertical-align: top; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+
+.model-check .guarantees {
+  margin: 8px 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 8px;
+}
+
+.model-check .guarantee-status {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 14px;
+  margin: 10px 0;
+  font-size: 13px;
+}
+
+.model-check .guarantee-status dt {
+  color: var(--muted);
+}
+
+.model-check .guarantee-status dd {
+  margin: 0;
+}
+
+.template-view {
+  margin: 8px 0;
+}
+
+.template-view summary {
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.template-view pre,
+.template-source {
+  max-height: 40vh;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+}
+
+.gguf-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px 14px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.gguf-facts dt {
+  color: var(--muted);
+}
+
+.gguf-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .ws-net-search,

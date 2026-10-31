@@ -83,6 +83,7 @@ export function PermissionsPanel({
   onClearSessionGrants,
   onSetProtected,
   onSetInternet,
+  onSetStrict,
   changes,
   onRevert
 }: {
@@ -98,6 +99,7 @@ export function PermissionsPanel({
   onClearSessionGrants: () => void
   onSetProtected: (list: ProtectedPath[]) => void
   onSetInternet: (level: InternetLevel) => void
+  onSetStrict: (strict: boolean) => void
   changes: ChangeGroup[]
   onRevert: (group: ChangeGroup) => void
 }): React.JSX.Element {
@@ -107,6 +109,23 @@ export function PermissionsPanel({
 
   return (
     <div className="panel">
+      {workspace ? (
+        <section className="strict-section">
+          <h3>Strict mode</h3>
+          <label className="toggle-row">
+            <input type="checkbox" checked={workspace.strict} onChange={(e) => onSetStrict(e.target.checked)} />
+            <span>
+              <strong>Conversation only: the model gets no tools at all</strong>
+              <span className="help block">
+                No reading, listing or changing files, no internet, whatever the settings below say. The model is not told
+                any tool exists, its output has no way to call one, and a call that arrives anyway is refused. For talking
+                with a model you do not yet trust, or when you want nothing touched.
+              </span>
+            </span>
+          </label>
+        </section>
+      ) : null}
+
       <section>
         <h3>Shared folders{workspace ? ` · ${workspace.name}` : ''}</h3>
         <p className="help">

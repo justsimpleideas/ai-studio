@@ -2,7 +2,15 @@ import dns from 'node:dns/promises'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { ApprovalRequest, ApprovalResponse, ToolOutcome } from '@shared/broker-types.js'
-import { SEARCH_HOST, webToolAllowed, type InternetLevel, type NetworkLogEntry } from '@shared/network.js'
+import { webToolAllowed, type InternetLevel, type NetworkLogEntry } from '@shared/network.js'
+import {
+  buildSearchRequest,
+  parseSearchResponse,
+  searchEndpoint,
+  searchProvider,
+  type SearchPreferences,
+  type SearchResult
+} from '@shared/search.js'
 import type { WebToolCall } from '@shared/tools.js'
 import { checkQuery, checkUrl, htmlToText, isPrivateAddress, isRunnableName, LIMITS, type LeakDetector } from './guard.js'
 import type { NetworkLog } from './log.js'
@@ -13,8 +21,10 @@ import type { NetworkLog } from './log.js'
  * The model process has no network code; a web tool call arrives here as a
  * request, like a file tool call reaches the broker. Every request is checked
  * (level, length, address, local network, leaked workspace text), shown to the
- * user unless they chose otherwise, and logged whatever happens to it. Only
- * GET requests are ever made, with no body and no headers chosen by the model.
+ * user unless they chose otherwise, and logged whatever happens to it. Pages
+ * and files are fetched with GET and no body; a search carries the query and a
+ * result count in the chosen service's shape (search.ts) and nothing else. No
+ * header is ever chosen by the model.
  */
 
 const USER_AGENT = 'LocalAIStudio/0.1'
@@ -34,6 +44,9 @@ export interface GateDeps {
   level: () => InternetLevel
   /** True when internet requests are set to be asked about (the default). */
   askFirst: () => boolean
+  /** Which search service, read fresh on every search. */
+  search: () => SearchPreferences
+  /** The key for the current search service, or null. */
   searchKey: () => string | null
   prompt: (request: ApprovalRequest) => Promise<ApprovalResponse>
   log: NetworkLog
@@ -103,11 +116,15 @@ export class WebGate {
     let target: URL | null = null
     let saveTo: string | null = null
     let askForWrite = false
+    let searchLabel = ''
     if (call.name === 'web_search') {
       const problem = checkQuery(call.args.query)
       if (problem) return refuse(problem)
+      const endpoint = searchEndpoint(this.deps.search())
+      if (!endpoint.ok) return refuse(endpoint.error)
       entry.sent = call.args.query.trim()
-      entry.host = SEARCH_HOST
+      entry.host = endpoint.host
+      searchLabel = endpoint.label
     } else {
       const checked = checkUrl(call.args.url.trim())
       if (!checked.ok) return refuse(checked.error)
@@ -144,14 +161,14 @@ export class WebGate {
         resolved: entry.sent,
         because:
           call.name === 'web_search'
-            ? `This search query will be sent to the search API at ${SEARCH_HOST}.`
+            ? `This search query will be sent to ${searchLabel}.`
             : call.name === 'fetch_page'
               ? `This page will be requested from ${entry.host}. Nothing from your files is sent.`
               : `This file will be requested from ${entry.host} and saved as a new file. Nothing from your files is sent.`,
         preview: {
           kind: 'network',
           sends: entry.sent,
-          to: call.name === 'web_search' ? `Search API (${SEARCH_HOST})` : (entry.host as string),
+          to: call.name === 'web_search' ? searchLabel : (entry.host as string),
           saveTo
         }
       })
@@ -230,23 +247,25 @@ export class WebGate {
     return null
   }
 
-  private async search(query: string): Promise<Array<{ title: string; url: string; snippet: string }>> {
+  private async search(query: string): Promise<SearchResult[]> {
+    const prefs = this.deps.search()
     const key = this.deps.searchKey()
-    if (!key) throw new Error('No search key is set. Add one under Permissions → Internet.')
-    const url = new URL(`https://${SEARCH_HOST}/res/v1/web/search`)
-    url.searchParams.set('q', query)
-    url.searchParams.set('count', '8')
-    const res = await this.fetchImpl(url, {
-      headers: { Accept: 'application/json', 'X-Subscription-Token': key, 'User-Agent': USER_AGENT },
+    if (searchProvider(prefs.provider).needsKey && !key) {
+      throw new Error('No search key is set. Add one under Permissions → Internet.')
+    }
+    const request = buildSearchRequest(prefs, query, key, USER_AGENT)
+    const res = await this.fetchImpl(request.url, {
+      method: request.method,
+      headers: request.headers,
+      ...(request.body === undefined ? {} : { body: request.body }),
       redirect: 'error',
       signal: AbortSignal.timeout(LIMITS.timeoutMs)
     })
     if (!res.ok) throw new Error(`The search service answered ${res.status}.`)
-    const data = (await res.json()) as { web?: { results?: Array<{ title?: string; url?: string; description?: string }> } }
-    return (data.web?.results ?? []).slice(0, 8).map((r) => ({
-      title: htmlToText(r.title ?? '').text,
-      url: r.url ?? '',
-      snippet: htmlToText(r.description ?? '').text
+    return parseSearchResponse(prefs.provider, await res.json()).map((r) => ({
+      title: htmlToText(r.title).text,
+      url: r.url,
+      snippet: htmlToText(r.snippet).text
     }))
   }
 

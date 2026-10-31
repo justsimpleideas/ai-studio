@@ -54,6 +54,7 @@ MAX_BODY = 64 * 1024
 # A start picture for image-to-video: a photo straight off a phone fits comfortably.
 MAX_INPUT_BYTES = 40 * 1024 * 1024
 MAX_INPUT_PIXELS = 64_000_000
+MAX_BULK = 2000  # items one multi-select action can name
 INPUT_TYPES = {"image/png": "PNG", "image/jpeg": "JPEG", "image/webp": "WEBP"}
 VIDEO_TYPES = ("video/mp4", "image/webp")
 FILE_CHUNK = 256 * 1024
@@ -238,10 +239,10 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         app.jobs.unload_model(model_kind(h))
         return {"state": app.jobs.model_state}
 
-    @route("POST", r"/api/jobs")
-    def post_job(h, m):
+    def checked_job(body: object) -> GenerationRequest | VideoRequest:
+        """A request the engine can run as it is now, as the configured model will run it."""
         try:
-            request = parse_job(h.json_body(), app.video_profile())
+            request = parse_job(body, app.video_profile())
         except RequestError as exc:
             raise HttpError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
         if request.kind not in app.jobs.backends:
@@ -254,7 +255,26 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         profile = app.image_profile() if isinstance(request, GenerationRequest) else None
         if getattr(request, "loras", ()) and profile is not None and not profile.loras:
             raise HttpError(HTTPStatus.BAD_REQUEST, "this image model does not take LoRAs; they work with the 6B model")
-        return app.jobs.submit(app.fit_to_model(request)).to_dict()
+        return app.fit_to_model(request)
+
+    @route("POST", r"/api/jobs")
+    def post_job(h, m):
+        return app.jobs.submit(checked_job(h.json_body())).to_dict()
+
+    @route("PUT", r"/api/jobs/(?P<id>[0-9a-f]{16})")
+    def put_job(h, m):
+        # Change a queued job, or restart the running one with changes (JobQueue.replace).
+        job = app.jobs.get(m["id"])
+        if job is None:
+            raise HttpError(HTTPStatus.NOT_FOUND, "no such job")
+        request = checked_job(h.json_body())
+        try:
+            changed = app.jobs.replace(job.id, request)
+        except ValueError as exc:
+            raise HttpError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        if changed is None or changed.request is not request:
+            raise HttpError(HTTPStatus.CONFLICT, "this job has already finished or is being cancelled")
+        return changed.to_dict()
 
     # ---------------------------------------------------------------- LoRA library
 
@@ -640,6 +660,21 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         except FolderError as exc:
             raise HttpError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
 
+    @route("POST", r"/api/folders/(?P<id>[0-9a-f]{16})/order")
+    def order_folder(h, m):
+        """{"before": "<folder id>"} puts this folder just before that one; null puts it last.
+
+        Only the order of the list changes: no item changes folder and nothing moves
+        on disk. Answers with the folder list, as GET /api/folders does.
+        """
+        body = h.json_body()
+        before = body.get("before") if isinstance(body, dict) else None
+        try:
+            app.gallery.move_folder(m["id"], before)
+        except FolderError as exc:
+            raise folder_http_error(exc) from exc
+        return {"items": app.gallery.list_folders(), "show_hidden": app.gallery.show_hidden}
+
     @route("PATCH", r"/api/folders/(?P<id>[0-9a-f]{16})")
     def patch_folder(h, m):
         """{"name": ...} renames; {"hidden": true|false} hides or shows."""
@@ -670,6 +705,24 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         if record is None:
             raise HttpError(HTTPStatus.NOT_FOUND, "no such image")
         return record
+
+    @route("POST", r"/api/gallery/folder")
+    def move_many(h, m):
+        """File several items in a folder at once (or, folder null, in none): the gallery's multi-select."""
+        body = h.json_body()
+        usage = "expected {\"ids\": [<image id>, ...], \"folder\": <folder id>|null}"
+        if not isinstance(body, dict) or set(body) != {"ids", "folder"}:
+            raise HttpError(HTTPStatus.BAD_REQUEST, usage)
+        ids, folder = body["ids"], body["folder"]
+        if (not isinstance(ids, list) or not 1 <= len(ids) <= MAX_BULK
+                or not all(isinstance(i, str) and valid_id(i) for i in ids)):
+            raise HttpError(HTTPStatus.BAD_REQUEST, usage)
+        if folder is not None and not (isinstance(folder, str) and valid_id(folder)):
+            raise HttpError(HTTPStatus.BAD_REQUEST, usage)
+        try:
+            return {"items": app.gallery.set_folder_many(ids, folder)}
+        except FolderError as exc:
+            raise HttpError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
 
     @route("PATCH", r"/api/gallery/(?P<id>[0-9a-f]{16})")
     def patch_image(h, m):

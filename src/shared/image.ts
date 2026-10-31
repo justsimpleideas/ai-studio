@@ -10,6 +10,7 @@
 
 import type { ImportOptions, ImportTarget, ModelImportState } from './importing.js'
 import type { ModelInspectState } from './inspect.js'
+import type { HardwareInfo } from './hardware.js'
 import type { EngineSetupState, ModelDownloadState, ModelId } from './setup.js'
 
 export const IMAGE_ENGINE_PORT = 5198
@@ -207,9 +208,25 @@ export interface ImageJob {
   error: string | null
   started: number | null
   finished: number | null
+  /** A running job told to stop, which it does at its next step. Missing from older engines. */
+  cancelling?: boolean
   /** Tasks only: live details (training reports its last loss) and what the task returned. */
   detail?: { loss?: number }
   result?: Record<string, unknown> | null
+}
+
+/** How the gallery's multi-select saves copies outside the studio. */
+export interface SaveManyOptions {
+  /** Keep the prompt and settings inside PNG files (videos never carry them). */
+  includeSettings: boolean
+  /** Also write each item's prompt and settings to a .txt file beside it. */
+  promptFiles: boolean
+}
+
+export interface SaveManyResult {
+  folder: string
+  saved: number
+  failed: number
 }
 
 export interface ImageRecord {
@@ -437,6 +454,11 @@ export interface ImageApi {
   /** A gallery image, or a video's last frame, as a start picture. */
   startImageFrom(id: string, frame: 'image' | 'last'): Promise<StartImage>
   cancel(jobId: string): Promise<ImageJob>
+  /**
+   * Change a job before it is done. A queued job keeps its id and place in line; the running one
+   * is cancelled and its changed copy (a new job, returned) goes first in line.
+   */
+  updateJob(jobId: string, request: GenerationRequest | VideoRequest): Promise<ImageJob>
   jobs(): Promise<ImageJob[]>
   gallery(query: GalleryQuery): Promise<GalleryPage>
   setFavorite(id: string, favorite: boolean): Promise<ImageRecord>
@@ -448,6 +470,13 @@ export interface ImageApi {
   deleteFolder(id: string): Promise<{ moved: number }>
   /** Put an image or video in a folder, or (null) in none. */
   moveToFolder(id: string, folderId: string | null): Promise<ImageRecord>
+  /** The same for several at once; answers with the ones moved (gone or out-of-view ones are skipped). */
+  moveManyToFolder(ids: string[], folderId: string | null): Promise<ImageRecord[]>
+  /**
+   * Put a folder just before `before` in the list, or last with null. Answers with
+   * the whole list in its new order. Only the order changes; nothing is moved.
+   */
+  reorderFolder(id: string, before: string | null): Promise<GalleryFolder[]>
   setFolderHidden(id: string, hidden: boolean): Promise<GalleryFolder>
   /** Set, change or (pin null) remove a folder's PIN; a folder that has one needs it as `current`. */
   setFolderPin(id: string, pin: string | null, current: string | null): Promise<GalleryFolder>
@@ -471,6 +500,8 @@ export interface ImageApi {
    * includeSettingsInExports is on.
    */
   saveImageAs(id: string): Promise<string | null>
+  /** Opens a folder picker and saves copies of these items in it; null if cancelled. Never overwrites. */
+  saveManyTo(ids: string[], options: SaveManyOptions): Promise<SaveManyResult | null>
   /** Opens a save dialog, then has the engine turn the video into a GIF; the saved path, or null if cancelled. */
   saveAsGif(id: string, options: GifOptions): Promise<string | null>
   includeSettingsInExports(): Promise<boolean>
@@ -483,6 +514,11 @@ export interface ImageApi {
   pickPython(): Promise<string | null>
   onEvent(handler: (event: ImageEngineEvent) => void): () => void
   onEngineState(handler: (state: ImageEngineState) => void): () => void
+  /**
+   * The gallery folder was changed in Settings, so everything this window
+   * still shows of the old one is stale (locations.ts).
+   */
+  onGalleryMoved(handler: () => void): () => void
 
   /** Installing the engine's Python environment (shared/setup.ts). */
   setupState(): Promise<EngineSetupState>
@@ -493,6 +529,8 @@ export interface ImageApi {
 
   /** Downloading a supported model into the models folder. */
   downloadState(): Promise<ModelDownloadState>
+  /** The GPU and RAM, to say which downloads suit this computer (shared/hardware.ts). */
+  hardware(): Promise<HardwareInfo>
   /** Where downloads go: the chosen folder, or the default one. */
   modelsFolder(): Promise<string>
   /** Opens a folder picker for where downloads go; null if cancelled. */

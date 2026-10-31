@@ -2,6 +2,7 @@ import type { GlobalRule } from './config.js'
 import type { PolicyRule, ProtectedPath, WorkspaceRoot } from './permissions.js'
 import type { ToolOutcome } from './broker-types.js'
 import type { InternetLevel } from './network.js'
+import type { ReplyStats } from './reply-stats.js'
 
 /**
  * A workspace is a folder the user opened, and everything the agent keeps for it.
@@ -33,6 +34,12 @@ export interface Workspace {
   protectedPaths: ProtectedPath[]
   /** How much internet the agent may use here. 'offline' unless the user changes it. */
   internet: InternetLevel
+  /**
+   * Strict mode: conversation only. The model is given no tools at all — no
+   * files, no internet — and a call that arrives anyway is refused before any
+   * broker sees it. Off unless the user turns it on.
+   */
+  strict: boolean
 }
 
 export interface WorkspaceSummary {
@@ -57,6 +64,10 @@ export interface ChatTurn {
   id: string
   role: 'user' | 'assistant' | 'system'
   text: string
+  /** The chain of thought the model wrote before this reply, when it wrote one. */
+  thinking?: string
+  /** How long it thought and how fast it wrote, for replies made since this was recorded. */
+  stats?: ReplyStats
 }
 
 /**

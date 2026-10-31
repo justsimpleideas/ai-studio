@@ -84,6 +84,116 @@ export function startView(start: GalleryStart, last: () => GalleryViewKind = loa
   return { kind: "all" };
 }
 
+/**
+ * How big the gallery's thumbnails are, as a file manager's view sizes: "large" is
+ * the size the gallery has always had and stays the default, with two smaller ones
+ * for seeing more at once. Only the window's own setting; nothing is re-rendered or
+ * re-saved, so switching is instant and costs nothing.
+ */
+export type TileSize = "large" | "medium" | "small";
+
+export const DEFAULT_TILE_SIZE: TileSize = "large";
+
+/** The sizes in the order the buttons show them, biggest first. */
+export const TILE_SIZES: readonly TileSize[] = ["large", "medium", "small"];
+
+const TILE_KEY = "lis.gallery.tileSize.v1";
+
+export function isTileSize(value: unknown): value is TileSize {
+  return value === "large" || value === "medium" || value === "small";
+}
+
+export function loadTileSize(storage: Pick<Storage, "getItem"> = localStorage): TileSize {
+  try {
+    const stored = storage.getItem(TILE_KEY);
+    return isTileSize(stored) ? stored : DEFAULT_TILE_SIZE;
+  } catch {
+    return DEFAULT_TILE_SIZE;
+  }
+}
+
+/**
+ * Covering the gallery's thumbnails with a mosaic: off, or two strengths.
+ *
+ * This is a cover for the eyes in the room, not protection: it hides what the
+ * grid shows at a glance, while opening an item still shows it, and the files on
+ * disk are untouched. For keeping things out of view altogether there are hidden
+ * and locked folders (gallery.py).
+ */
+export type MosaicLevel = "off" | "weak" | "strong";
+
+export const DEFAULT_MOSAIC: MosaicLevel = "off";
+
+/** The choices in the order the buttons show them. */
+export const MOSAIC_LEVELS: readonly MosaicLevel[] = ["off", "weak", "strong"];
+
+const MOSAIC_KEY = "lis.gallery.mosaic.v1";
+
+export function isMosaicLevel(value: unknown): value is MosaicLevel {
+  return value === "off" || value === "weak" || value === "strong";
+}
+
+export function loadMosaic(storage: Pick<Storage, "getItem"> = localStorage): MosaicLevel {
+  try {
+    const stored = storage.getItem(MOSAIC_KEY);
+    return isMosaicLevel(stored) ? stored : DEFAULT_MOSAIC;
+  } catch {
+    return DEFAULT_MOSAIC;
+  }
+}
+
+export function saveMosaic(level: MosaicLevel, storage: Pick<Storage, "setItem"> = localStorage): void {
+  try {
+    storage.setItem(MOSAIC_KEY, level);
+  } catch {
+    // storage full or disabled: the choice lasts until the window closes
+  }
+}
+
+/**
+ * The order of the folder list after moving `id` in front of `before` (to the end
+ * when that is null). The folder is taken out first, so `before` names a folder in
+ * the list as it will be without it — the same rule the engine follows (gallery.py
+ * move_folder), which keeps what the drag shows and what is saved in step.
+ */
+export function reorderedIds(ids: readonly string[], id: string, before: string | null): string[] {
+  // A folder that is not in the list (deleted, hidden while the drag was on) is not
+  // put into it: the list the drag started from is what comes back.
+  if (!ids.includes(id)) return [...ids];
+  const rest = ids.filter((i) => i !== id);
+  const at = before === null ? rest.length : rest.indexOf(before);
+  if (at < 0) return [...ids];
+  return [...rest.slice(0, at), id, ...rest.slice(at)];
+}
+
+/**
+ * Moving a folder one place up or down: the folder to put it before, or null for
+ * the end of the list. Null as the whole answer means it cannot go that way.
+ *
+ * Down is the awkward one: dropping a folder in front of its neighbour's neighbour
+ * is what puts it after its neighbour, because the folder is taken out of the list
+ * before being put back.
+ */
+export function nudgeTarget(
+  ids: readonly string[],
+  id: string,
+  direction: -1 | 1,
+): { before: string | null } | null {
+  const at = ids.indexOf(id);
+  if (at < 0) return null;
+  if (direction === -1) return at === 0 ? null : { before: ids[at - 1] ?? null };
+  if (at === ids.length - 1) return null;
+  return { before: ids[at + 2] ?? null };
+}
+
+export function saveTileSize(size: TileSize, storage: Pick<Storage, "setItem"> = localStorage): void {
+  try {
+    storage.setItem(TILE_KEY, size);
+  } catch {
+    // storage full or disabled: the choice lasts until the window closes
+  }
+}
+
 export function saveGalleryView(view: GalleryViewKind, storage: Pick<Storage, "setItem"> = localStorage): void {
   try {
     storage.setItem(VIEW_KEY, JSON.stringify(view));

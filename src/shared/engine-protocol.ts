@@ -1,4 +1,6 @@
-import type { GpuBackend, KvCacheType, SystemSection } from './config.js'
+import type { ChatEngine, GpuBackend, KvCacheType, ServerPreferences, SystemSection } from './config.js'
+import type { GenerationPreferences, ModelTraits, SamplingValues } from './generation.js'
+import type { ReplyStats } from './reply-stats.js'
 import type { RawToolCall, ToolName } from './tools.js'
 import type { UsageSnapshot } from './usage.js'
 
@@ -27,9 +29,36 @@ export interface ModelInfo {
   gpuLayers: number
   /** Name of the compute backend llama.cpp selected, e.g. "cuda" or "cpu". */
   backend: string
+  /** The GPUs the backend uses, by name; empty on the CPU. */
+  devices: string[]
   fileSizeBytes: number
   /** How the context memory was actually stored for this load. */
   kvCache: KvCacheType
+  /** What is running the model. */
+  engine: ChatEngine
+  /** With a mixture-of-experts model whose experts were kept in system memory: for how many layers ('all' for every layer). */
+  expertsOnCpu?: number | 'all'
+  /** With a mixture-of-experts model and the built-in engine: why its experts could not be kept in system memory, when they were asked to be. */
+  expertsOnCpuUnavailable?: string
+  /** The CPU thread count the model was loaded with; null is the engine's default. */
+  threads?: number | null
+  /** What the file's header says about the model (generation.ts). */
+  traits: ModelTraits
+  /** The sampling the "recommended" choice resolves to for this model, so the window can show it. */
+  recommendedSampling: SamplingValues
+  /** How conversations are formatted for this model, shown so the user can see what the model reads. */
+  template: ModelTemplate
+}
+
+export interface ModelTemplate {
+  /** The library's name for the formatting it chose, e.g. "Qwen" or "JinjaTemplate". */
+  wrapper: string
+  /** True when the file's own chat template is the one being run; false when a built-in one for the family is used instead. */
+  usesFileTemplate: boolean
+  /** The chat template carried by the file, as text; null when it has none. */
+  source: string | null
+  /** A short sample conversation rendered the way the model receives it. */
+  rendered: string
 }
 
 /**
@@ -51,6 +80,9 @@ export interface LoadRequest {
   gpuLayers: number | null
   contextSize: number | null
   kvCache: KvCacheType
+  /** Which engine process this is for; the server host also gets how to run the server. */
+  engine: ChatEngine
+  server: ServerPreferences
 }
 
 /**
@@ -70,7 +102,14 @@ export type MainToEngine =
   | { type: 'load'; request: LoadRequest }
   | { type: 'unload' }
   /** `tools` are the only tools the model is told about for this prompt: the workspace's internet level decides. */
-  | ({ type: 'prompt'; id: string; text: string; system: SystemSection[]; tools: ToolName[] } & ChatTarget)
+  | ({
+      type: 'prompt'
+      id: string
+      text: string
+      system: SystemSection[]
+      tools: ToolName[]
+      generation: GenerationPreferences
+    } & ChatTarget)
   | { type: 'abort'; id: string }
   | { type: 'toolResult'; callId: string; ok: boolean; payload: unknown }
   /**
@@ -81,11 +120,27 @@ export type MainToEngine =
 
 export type EngineToMain =
   | { type: 'ready' }
+  /**
+   * The engine needs to start again with these environment variables before it
+   * can load (gpu-devices.ts: the integrated GPU left out). The load in flight is
+   * sent again to the new process; nothing is loaded by this one.
+   */
+  | { type: 'restartEngine'; env: Record<string, string>; reason: string }
+  /**
+   * The server host started (or stopped: null) a llama-server process. The
+   * application keeps the id so the server is ended with the studio even when
+   * the engine process is killed outright and cannot clean up.
+   */
+  | { type: 'sidecar'; pid: number | null }
   | { type: 'loadProgress'; fraction: number }
   | { type: 'loaded'; info: ModelInfo }
   | { type: 'unloaded' }
   | { type: 'chunk'; id: string; text: string }
+  /** A piece of the model's chain of thought, streamed apart from the reply so the window can fold it. */
+  | { type: 'thought'; id: string; text: string }
   | { type: 'toolCall'; callId: string; promptId: string; call: RawToolCall }
+  /** How long the reply thought and how fast it wrote; sent just before `complete` or `aborted`. */
+  | { type: 'stats'; id: string; stats: ReplyStats }
   | { type: 'complete'; id: string; text: string }
   | { type: 'aborted'; id: string }
   | { type: 'error'; id: string | null; message: string; fatal: boolean }

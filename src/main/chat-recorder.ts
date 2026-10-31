@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { ToolOutcome } from '@shared/broker-types.js'
+import type { ReplyStats } from '@shared/reply-stats.js'
 import type { Chat, ChatView } from '@shared/workspace.js'
 import { chatTitle } from '@shared/workspace.js'
 
@@ -14,6 +15,10 @@ import { chatTitle } from '@shared/workspace.js'
 export class ChatRecorder {
   /** Reply text streamed so far, per prompt still running. */
   private readonly partial = new Map<string, string>()
+  /** Chain of thought streamed so far, per prompt that has written one. */
+  private readonly thoughts = new Map<string, string>()
+  /** Timing the engine reported, per prompt, ahead of its end. */
+  private readonly stats = new Map<string, ReplyStats>()
 
   constructor(
     readonly chat: Chat,
@@ -64,6 +69,15 @@ export class ChatRecorder {
     if (sofar !== undefined) this.partial.set(promptId, sofar + text)
   }
 
+  thought(promptId: string, text: string): void {
+    if (!this.partial.has(promptId)) return
+    this.thoughts.set(promptId, (this.thoughts.get(promptId) ?? '') + text)
+  }
+
+  replyStats(promptId: string, stats: ReplyStats): void {
+    if (this.partial.has(promptId)) this.stats.set(promptId, stats)
+  }
+
   /**
    * The streamed text is what the window showed, so it is what is kept. The
    * engine's final text is only a fallback for a reply that streamed nothing.
@@ -101,7 +115,17 @@ export class ChatRecorder {
   private finish(promptId: string, text: string): void {
     if (!this.partial.has(promptId)) return
     this.partial.delete(promptId)
-    this.chat.turns.push({ id: promptId, role: 'assistant', text })
+    const thinking = this.thoughts.get(promptId)?.trim()
+    const stats = this.stats.get(promptId)
+    this.thoughts.delete(promptId)
+    this.stats.delete(promptId)
+    this.chat.turns.push({
+      id: promptId,
+      role: 'assistant',
+      text,
+      ...(thinking ? { thinking } : {}),
+      ...(stats ? { stats } : {})
+    })
     this.touch()
   }
 }

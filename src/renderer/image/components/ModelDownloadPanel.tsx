@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { describeHardware, isRecommendedHere, modelFit, type Fit, type HardwareInfo } from '@shared/hardware.js'
 import type { EngineModelKind } from '@shared/image.js'
 import { IDLE_DOWNLOAD, MODEL_CATALOG, type CatalogModel, type ModelDownloadState, type ModelId } from '@shared/setup.js'
 import { api } from '../api.js'
@@ -6,7 +7,8 @@ import { downloadSummary } from '../download.js'
 
 /**
  * The supported models of one kind, each downloadable from its own repository
- * after the user has seen where it comes from and under which license.
+ * after the user has seen where it comes from and under which license, and each
+ * marked for how it would run on this computer's GPU and RAM.
  */
 
 export function useDownloadState(): ModelDownloadState {
@@ -27,8 +29,20 @@ interface Props {
   onSelected: () => void
 }
 
+/** This computer's GPU and RAM; null until known, or if they could not be read. */
+function useHardware(): HardwareInfo | null {
+  const [hardware, setHardware] = useState<HardwareInfo | null>(null)
+  useEffect(() => {
+    void api.hardware().then(setHardware, () => setHardware(null))
+  }, [])
+  return hardware
+}
+
+const FIT_TAGS: Record<Fit, string | null> = { good: null, slow: 'Slow here', no: 'Too big here' }
+
 export function ModelDownloadPanel({ kind, enabled, onSelected }: Props): React.JSX.Element {
   const state = useDownloadState()
+  const hardware = useHardware()
   const [open, setOpen] = useState<ModelId | null>(null)
   const [error, setError] = useState<string | null>(null)
   // Parts other models need are downloaded by Import a model file…, not chosen here.
@@ -53,20 +67,25 @@ export function ModelDownloadPanel({ kind, enabled, onSelected }: Props): React.
   return (
     <div className="field">
       <span className="field-label">Download a model</span>
+      {hardware && <span className="hint hardware">This PC: {describeHardware(hardware)}. The marks below are for it.</span>}
       <div className="download-list">
         {models.map((model) => {
           const mine = state.id === model.id && state.phase !== 'idle'
+          const fit = hardware ? modelFit(model, hardware) : null
+          const fitTag = fit ? FIT_TAGS[fit.fit] : null
           return (
             <div key={model.id} className="download-row">
               <div className="model-row">
                 <div>
                   <div className="strong">
                     {model.label}
-                    {model.recommended && <span className="tag">Recommended</span>}
+                    {isRecommendedHere(model, fit) && <span className="tag">Recommended</span>}
+                    {fit && fitTag && <span className={`tag fit-${fit.fit}`}>{fitTag}</span>}
                   </div>
                   <div className="muted small">
                     {(model.bytes / 1e9).toFixed(1)} GB · {model.detail}
                   </div>
+                  {fit && <div className={`small fit-note fit-${fit.fit}`}>{fit.note}</div>}
                 </div>
                 {!(mine && busy) && open !== model.id && (
                   <button disabled={!enabled || busy} onClick={() => setOpen(model.id)}>

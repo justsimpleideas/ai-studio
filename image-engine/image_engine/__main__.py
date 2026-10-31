@@ -53,6 +53,22 @@ MIN_TOKEN_LENGTH = 32
 PIPE_POLL_SECONDS = 0.5
 
 
+def gallery_root(data_dir: Path, outputs_dir: Path | None) -> Path:
+    """Where the gallery lives: beside the settings, or wherever the user moved it.
+
+    The studio lets the gallery folder be chosen (its locations.ts), and passes
+    it here. Moving it only changes where new images and videos are written: the
+    folder left behind keeps its own database and media, and pointing back at it
+    brings them all into view again.
+    """
+    if outputs_dir is None:
+        return data_dir / "outputs"
+    root = outputs_dir.expanduser()
+    if not root.is_absolute():
+        raise ValueError("--outputs-dir must be an absolute path")
+    return root
+
+
 def watch_stdin(on_eof) -> None:
     """Exit when the parent goes away.
 
@@ -108,6 +124,8 @@ def main(argv: list[str] | None = None, backend_factory: Callable | None = None,
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--host", default="127.0.0.1", help="loopback address to bind (default 127.0.0.1)")
     ap.add_argument("--data-dir", type=Path, default=None, help="settings and the gallery")
+    ap.add_argument("--outputs-dir", type=Path, default=None,
+                    help="the gallery folder, when it is kept outside the data folder (the studio sets this)")
     ap.add_argument("--watch-stdin", action="store_true", help="exit when stdin closes (set by the studio)")
     ap.add_argument("--no-token", action="store_true", help="run without a token (local experiments only)")
     args = ap.parse_args(argv)
@@ -122,6 +140,10 @@ def main(argv: list[str] | None = None, backend_factory: Callable | None = None,
 
     data_dir = (args.data_dir or default_data_dir()).resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        outputs = gallery_root(data_dir, args.outputs_dir)
+    except ValueError as exc:
+        ap.error(str(exc))
     settings = SettingsStore(data_dir)
 
     if backend_factory is None:
@@ -132,7 +154,7 @@ def main(argv: list[str] | None = None, backend_factory: Callable | None = None,
         caption_backend_factory = CaptionBackend
 
     events = EventHub()
-    gallery = Gallery(data_dir / "outputs")
+    gallery = Gallery(outputs)
     backend = backend_factory(settings.get)
     backends = {"image": backend}
     if video_backend_factory is not None:

@@ -1,13 +1,16 @@
 import path from 'node:path'
 import { IDLE_INSPECT, feedInspect, parseInspectEvent, type ModelInspectState } from '@shared/inspect.js'
+import { inspectGgufFile, isGgufFile } from '../gguf.js'
 import { runProcess, type Runner } from './setup.js'
 
 /**
  * Inspecting a model file the user picked (shared/inspect.ts).
  *
- * image-engine/scripts/inspect_model.py does the work, with the engine's Python, on
- * this machine only; this starts it, reads its JSON lines, and keeps the latest state
- * for the window. The path always comes from a native dialog the main process showed.
+ * A GGUF file is read here, by the studio's own strict reader, with no Python
+ * involved. Any other file goes to image-engine/scripts/inspect_model.py, run with
+ * the engine's Python, on this machine only; this starts it, reads its JSON lines,
+ * and keeps the latest state for the window. The path always comes from a native
+ * dialog the main process showed, or is the chat model's own.
  */
 
 export interface ModelInspectorOptions {
@@ -45,6 +48,21 @@ export class ModelInspector {
     let state: ModelInspectState = { ...IDLE_INSPECT, phase: 'header', file: path.basename(file) }
     this.set(state)
     try {
+      if (await isGgufFile(file)) {
+        try {
+          const report = await inspectGgufFile(file, {
+            signal: controller.signal,
+            onProgress: (stage, done, size) => {
+              state = feedInspect(state, { event: 'progress', stage, done, size })
+              this.set(state)
+            }
+          })
+          this.set(feedInspect(state, { event: 'report', report }))
+        } catch (err) {
+          this.set({ ...state, phase: controller.signal.aborted ? 'cancelled' : 'failed', message: controller.signal.aborted ? 'Stopped.' : (err as Error).message })
+        }
+        return
+      }
       let buffered = ''
       let stderrTail = ''
       const result = await this.run(this.options.python(), ['-I', '-u', this.options.script, '--file', file, '--json'], {

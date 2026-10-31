@@ -1,10 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_DISPLAY,
+  DEFAULT_MOSAIC,
+  DEFAULT_TILE_SIZE,
   loadDisplay,
   loadGalleryView,
+  loadMosaic,
+  loadTileSize,
+  nudgeTarget,
+  reorderedIds,
   saveDisplay,
   saveGalleryView,
+  saveMosaic,
+  saveTileSize,
   startView,
   type DisplaySettings,
 } from "../../src/renderer/image/display.js";
@@ -69,5 +77,80 @@ describe("what the Create and Video tabs show once something is made", () => {
     expect(loadDisplay(store(7))).toEqual(DEFAULT_DISPLAY);
     expect(loadDisplay({ getItem: () => { throw new Error("disabled"); } })).toEqual(DEFAULT_DISPLAY);
     expect(() => saveDisplay(DEFAULT_DISPLAY, { setItem: () => { throw new Error("full"); } })).not.toThrow();
+  });
+});
+
+describe("how big the gallery's thumbnails are", () => {
+  it("is the size it has always been until something else is chosen", () => {
+    expect(DEFAULT_TILE_SIZE).toBe("large");
+    expect(loadTileSize({ getItem: () => null })).toBe("large");
+    expect(loadTileSize({ getItem: () => "tiny" })).toBe("large");
+    expect(loadTileSize({ getItem: () => { throw new Error("no storage") } })).toBe("large");
+  });
+
+  it("keeps a smaller size for next time", () => {
+    let raw: string | null = null;
+    const memory = { setItem: (_key: string, value: string) => (raw = value), getItem: () => raw };
+    saveTileSize("small", memory);
+    expect(loadTileSize(memory)).toBe("small");
+    saveTileSize("medium", memory);
+    expect(loadTileSize(memory)).toBe("medium");
+  });
+});
+
+describe("putting the folders in an order", () => {
+  const ids = ["a", "b", "c", "d"];
+
+  it("moves a folder in front of another, counted without the folder itself", () => {
+    expect(reorderedIds(ids, "d", "b")).toEqual(["a", "d", "b", "c"]);
+    expect(reorderedIds(ids, "a", "c")).toEqual(["b", "a", "c", "d"]);
+    expect(reorderedIds(ids, "a", null)).toEqual(["b", "c", "d", "a"]);
+  });
+
+  it("leaves the list alone when the move means nothing", () => {
+    // In front of the one it already sits in front of, and to the end from the end.
+    expect(reorderedIds(ids, "a", "b")).toEqual(ids);
+    expect(reorderedIds(ids, "d", null)).toEqual(ids);
+    expect(reorderedIds(ids, "x", "b")).toEqual(ids);
+    expect(reorderedIds(ids, "a", "gone")).toEqual(ids);
+  });
+
+  it("nudges one place with the arrow keys, down included", () => {
+    expect(nudgeTarget(ids, "c", -1)).toEqual({ before: "b" });
+    expect(reorderedIds(ids, "c", "b")).toEqual(["a", "c", "b", "d"]);
+    // Down by one: in front of the folder two along, which is what puts it after the next.
+    expect(nudgeTarget(ids, "b", 1)).toEqual({ before: "d" });
+    expect(reorderedIds(ids, "b", "d")).toEqual(["a", "c", "b", "d"]);
+    // The last one moves down to the end, which is where it already is: refused.
+    expect(nudgeTarget(ids, "c", 1)).toEqual({ before: null });
+    expect(reorderedIds(ids, "c", null)).toEqual(["a", "b", "d", "c"]);
+  });
+
+  it("will not take the ends any further, or move a folder that is gone", () => {
+    expect(nudgeTarget(ids, "a", -1)).toBeNull();
+    expect(nudgeTarget(ids, "d", 1)).toBeNull();
+    expect(nudgeTarget(ids, "x", -1)).toBeNull();
+    expect(nudgeTarget(["only"], "only", 1)).toBeNull();
+    expect(nudgeTarget(["only"], "only", -1)).toBeNull();
+  });
+});
+
+describe("a mosaic over the thumbnails", () => {
+  it("is off until it is asked for", () => {
+    expect(DEFAULT_MOSAIC).toBe("off");
+    expect(loadMosaic({ getItem: () => null })).toBe("off");
+    expect(loadMosaic({ getItem: () => "blur" })).toBe("off");
+    expect(loadMosaic({ getItem: () => { throw new Error("no storage") } })).toBe("off");
+  });
+
+  it("keeps either strength, and being turned off again", () => {
+    let raw: string | null = null;
+    const memory = { setItem: (_key: string, value: string) => (raw = value), getItem: () => raw };
+    saveMosaic("weak", memory);
+    expect(loadMosaic(memory)).toBe("weak");
+    saveMosaic("strong", memory);
+    expect(loadMosaic(memory)).toBe("strong");
+    saveMosaic("off", memory);
+    expect(loadMosaic(memory)).toBe("off");
   });
 });

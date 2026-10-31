@@ -1,4 +1,6 @@
+import { DEFAULT_GENERATION, type GenerationPreferences } from './generation.js'
 import { DEFAULT_PERMISSION_SETTINGS, type PermissionSettings } from './permissions.js'
+import { DEFAULT_SEARCH, type SearchPreferences } from './search.js'
 import { DEFAULT_SHORTCUTS, type ShortcutMap } from './shortcuts.js'
 
 /**
@@ -41,14 +43,78 @@ export function isKvCacheType(value: unknown): value is KvCacheType {
   return value === 'f16' || value === 'q8_0'
 }
 
+/**
+ * What runs the chat model.
+ *
+ * 'builtin' is the library inside the studio (node-llama-cpp). 'server' is a
+ * llama-server program the user installed, started by the studio on this
+ * machine and spoken to over the loopback interface only. It was added for one
+ * reason: a mixture-of-experts model bigger than the GPU runs far better when
+ * only its experts are kept in system memory, which the stock library cannot
+ * ask for. The studio's build of the library's addon now can (on CUDA,
+ * scripts/native/), so the server is an alternative rather than a requirement.
+ */
+export type ChatEngine = 'builtin' | 'server'
+
+export function isChatEngine(value: unknown): value is ChatEngine {
+  return value === 'builtin' || value === 'server'
+}
+
+/**
+ * How the model is spread over the GPU and the CPU, and the llama-server
+ * program. The placement settings apply to both engines; only `path` is the
+ * server's alone.
+ */
+export interface ServerPreferences {
+  /** Path of the llama-server program; null until one is chosen. */
+  path: string | null
+  /**
+   * For a mixture-of-experts model: how many layers keep their experts on the
+   * CPU, counted from the first. Null means all of them, which is the safe
+   * start; a smaller number puts more on the GPU, when it has room; zero is
+   * none, the model split by layer as for any other.
+   */
+  expertsOnCpu: number | null
+  /** Threads for the parts that run on the CPU; null leaves it to the engine. */
+  threads: number | null
+}
+
+/** Every layer's experts on the CPU, and 8 threads: on a CPU with efficiency cores, fewer than all of them is faster. */
+export const DEFAULT_SERVER: ServerPreferences = { path: null, expertsOnCpu: null, threads: 8 }
+
+/** The choices offered for experts on the CPU; null is "all". */
+export const EXPERTS_ON_CPU_CHOICES: readonly (number | null)[] = [null, 32, 24, 16, 8, 0]
+/** The thread counts offered; null is the server's own default. */
+export const THREAD_CHOICES: readonly (number | null)[] = [null, 4, 6, 8, 12, 16]
+
+export function parseServer(value: unknown): ServerPreferences {
+  const raw = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>
+  const count = (v: unknown, max: number): number | null =>
+    typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= max ? v : null
+  return {
+    path: typeof raw.path === 'string' && raw.path.trim() ? raw.path : null,
+    expertsOnCpu: count(raw.expertsOnCpu, 1024),
+    // Never saved means the default; saved as null (or anything unusable) means the engine's own.
+    threads: !('threads' in raw)
+      ? DEFAULT_SERVER.threads
+      : typeof raw.threads === 'number' && Number.isInteger(raw.threads) && raw.threads >= 1 && raw.threads <= 256
+        ? raw.threads
+        : null
+  }
+}
+
 export interface ModelPreferences {
   lastModelPath: string | null
+  engine: ChatEngine
+  server: ServerPreferences
   backend: GpuBackend
   /** Null means let the library decide how much to put on the GPU. */
   gpuLayers: number | null
-  /** Null means use the model's trained context size. */
+  /** Null means the model's trained context size, capped (generation.ts, DEFAULT_CONTEXT_CAP). */
   contextSize: number | null
   kvCache: KvCacheType
+  /** Sampling and thinking; applied to the next prompt, no reload needed. */
+  generation: GenerationPreferences
 }
 
 /**
@@ -147,6 +213,28 @@ export function parseFolderPrivacy(value: unknown): FolderPrivacyPreferences {
   }
 }
 
+/**
+ * Notices from the tray icon while the studio runs in the background (the window
+ * hidden), when something the user is waiting on is done. Both on by default.
+ */
+export interface NotificationPreferences {
+  /** A chat reply has finished. */
+  chatReply: boolean
+  /** An image or a video (a whole batch) has finished. */
+  mediaDone: boolean
+}
+
+export const DEFAULT_NOTIFICATIONS: NotificationPreferences = { chatReply: true, mediaDone: true }
+
+/** Read notification preferences defensively: anything but a boolean means the default. */
+export function parseNotifications(value: unknown): NotificationPreferences {
+  const raw = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>
+  return {
+    chatReply: typeof raw['chatReply'] === 'boolean' ? raw['chatReply'] : DEFAULT_NOTIFICATIONS.chatReply,
+    mediaDone: typeof raw['mediaDone'] === 'boolean' ? raw['mediaDone'] : DEFAULT_NOTIFICATIONS.mediaDone
+  }
+}
+
 /** The window's colours: dark (the default) or light. */
 export type Theme = 'dark' | 'light'
 
@@ -165,10 +253,14 @@ export interface AppConfig {
   rules: GlobalRule[]
   model: ModelPreferences
   image: ImagePreferences
+  /** Which search service web_search uses (search.ts). The key itself lives in the secret store. */
+  search: SearchPreferences
   /** What closing the window does, and which models stay loaded in the background. */
   background: BackgroundPreferences
   /** When open gallery folders lock again without the studio quitting. */
   folderPrivacy: FolderPrivacyPreferences
+  /** Tray notices in the background when a reply or an image or video is done. */
+  notifications: NotificationPreferences
   /** Keyboard shortcuts that can be changed (shared/shortcuts.ts). */
   shortcuts: ShortcutMap
   /** Dark (the default) or light. */
@@ -193,10 +285,23 @@ export const DEFAULT_CONFIG: AppConfig = {
       enabled: true
     }
   ],
-  model: { lastModelPath: null, backend: 'auto', gpuLayers: null, contextSize: null, kvCache: 'f16' },
+  model: {
+    lastModelPath: null,
+    // llama-server first: measured several times faster than the built-in engine
+    // for a mixture-of-experts model bigger than the GPU (docs/decisions.md, S15, S16).
+    engine: 'server',
+    server: DEFAULT_SERVER,
+    backend: 'auto',
+    gpuLayers: null,
+    contextSize: 32_768,
+    kvCache: 'q8_0',
+    generation: DEFAULT_GENERATION
+  },
   image: { pythonPath: null, modelsFolder: null, partFolders: [], includeSettingsInExports: false },
+  search: DEFAULT_SEARCH,
   background: DEFAULT_BACKGROUND,
   folderPrivacy: DEFAULT_FOLDER_PRIVACY,
+  notifications: DEFAULT_NOTIFICATIONS,
   shortcuts: DEFAULT_SHORTCUTS,
   theme: 'dark',
   lastWorkspaceId: null
@@ -210,6 +315,10 @@ export interface SystemSection {
 
 const PREAMBLE =
   'You are a careful assistant running on the user’s own computer. You can look at and change files in the folders they have shared with you. Every action you take is shown to them, and some will need their approval before they run.'
+
+/** In strict mode the model is told plainly what it does not have, so it does not pretend otherwise. */
+const STRICT_PREAMBLE =
+  'You are a careful assistant running on the user’s own computer, in conversation only. You have no tools: you cannot read, list or change files, and you cannot use the internet. If asked to do any of that, say that this folder is in strict mode and you can only talk.'
 
 /** Where the agent is working, for the system prompt. */
 export interface WorkingContext {
@@ -226,6 +335,8 @@ export interface WorkingContext {
   readOnly?: string[]
   /** The workspace's internet level; the web tools are described only when it allows them. */
   internet?: 'offline' | 'search' | 'download'
+  /** Strict mode: no tools of any kind. The folder, internet and protected paths are not described, since none can be reached. */
+  strict?: boolean
 }
 
 function activeRules(rules: GlobalRule[]): GlobalRule[] {
@@ -244,8 +355,9 @@ function activeRules(rules: GlobalRule[]): GlobalRule[] {
  * of the same thing to reconcile.
  */
 export function composeSystemSections(rules: GlobalRule[], context?: WorkingContext): SystemSection[] {
-  const sections: SystemSection[] = [{ label: 'Base instructions', text: PREAMBLE }]
-  if (context) {
+  const strict = context?.strict === true
+  const sections: SystemSection[] = [{ label: 'Base instructions', text: strict ? STRICT_PREAMBLE : PREAMBLE }]
+  if (context && !strict) {
     const extra = context.extraFolders.length
       ? ` You may also use these folders: ${context.extraFolders.join(', ')}.`
       : ''

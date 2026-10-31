@@ -95,6 +95,9 @@ PIN_MAX_WAIT = 15 * 60.0
 FOLDER_ADDED_COLUMNS = {
     "hidden": "INTEGER NOT NULL DEFAULT 0",
     "pin": "TEXT NOT NULL DEFAULT ''",  # '' = no PIN; else scrypt$n$r$p$salt$hash
+    # The order the user dragged the folders into. 0 everywhere means no order of
+    # their own, which is how every gallery starts: then the list is alphabetical.
+    "position": "INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -296,6 +299,23 @@ class Gallery:
             self._db.commit()
         return self.get(image_id)
 
+    def set_folder_many(self, image_ids: list[str], folder_id: str | None) -> list[dict[str, Any]]:
+        """set_folder for several items in one go (one check, one commit). Items that are gone, or
+        out of view this session, are skipped; returns the records of the ones moved."""
+        with self._lock:
+            if folder_id is not None and self._folder_row(folder_id) is None:
+                raise FolderError("No such folder.")
+            blocked = self._blocked()
+            moved = []
+            for image_id in dict.fromkeys(image_ids):
+                row = self._db.execute("SELECT folder_id FROM images WHERE id = ?", (image_id,)).fetchone()
+                if row is None or (row["folder_id"] and row["folder_id"] in blocked):
+                    continue
+                self._db.execute("UPDATE images SET folder_id = ? WHERE id = ?", (folder_id or "", image_id))
+                moved.append(image_id)
+            self._db.commit()
+        return [r for r in (self.get(i) for i in moved) if r is not None]
+
     # ------------------------------------------------------------ folders
 
     @staticmethod
@@ -329,7 +349,8 @@ class Gallery:
         with self._lock:
             rows = self._db.execute(
                 "SELECT f.id, f.name, f.created, f.hidden, f.pin, COUNT(i.id) AS count FROM folders f "
-                "LEFT JOIN images i ON i.folder_id = f.id GROUP BY f.id ORDER BY lower(f.name)").fetchall()
+                "LEFT JOIN images i ON i.folder_id = f.id GROUP BY f.id "
+                "ORDER BY f.position, lower(f.name)").fetchall()
             out = []
             for r in rows:
                 if r["hidden"] and not (self._show_hidden or everything):
@@ -456,14 +477,55 @@ class Gallery:
     def _listed(self, folder_id: str) -> dict[str, Any] | None:
         return next((f for f in self.list_folders(everything=True) if f["id"] == folder_id), None)
 
+    def _next_position(self) -> int:
+        """Where a new folder goes: nowhere in particular (0) until the user has
+        put the folders in an order, then after the last of them."""
+        row = self._db.execute("SELECT MAX(position) AS top FROM folders").fetchone()
+        top = row["top"] if row and row["top"] is not None else 0
+        return top + 1 if top else 0
+
+    def _ordered_folder_ids(self) -> list[str]:
+        """Every folder, hidden ones included, in the order the list shows them."""
+        rows = self._db.execute("SELECT id FROM folders ORDER BY position, lower(name)").fetchall()
+        return [r["id"] for r in rows]
+
+    def move_folder(self, folder_id: str, before: object) -> list[str]:
+        """Put `folder_id` just before the folder `before`, or last when that is None.
+
+        The whole order is rewritten, hidden folders included, so it stays total:
+        a folder this session cannot see keeps its place among the ones it can.
+        Returns the new order (every folder). Nothing is moved on disk and no item
+        changes folder: this is only the order the list is shown in.
+        """
+        with self._lock:
+            if self._folder_row(folder_id) is None:
+                raise FolderError("That folder is no longer there.")
+            target = None
+            if before is not None:
+                if not isinstance(before, str) or self._folder_row(before) is None:
+                    raise FolderError("That folder is no longer there.")
+                if before == folder_id:
+                    raise FolderError("A folder cannot be moved before itself.")
+                target = before
+            order = [i for i in self._ordered_folder_ids() if i != folder_id]
+            at = order.index(target) if target is not None else len(order)
+            order.insert(at, folder_id)
+            # Positions start at 1: 0 is reserved for "no order of their own".
+            self._db.executemany("UPDATE folders SET position = ? WHERE id = ?",
+                                 [(n, i) for n, i in enumerate(order, start=1)])
+            self._db.commit()
+        return order
+
     def create_folder(self, name: object) -> dict[str, Any]:
         cleaned = self._clean_name(name)
         folder = {"id": secrets.token_hex(8), "name": cleaned, "created": time.time(), "count": 0}
         with self._lock:
             if self._name_taken(cleaned):
                 raise FolderError(f"There is already a folder called “{cleaned}”.")
-            self._db.execute("INSERT INTO folders (id, name, created) VALUES (?, ?, ?)",
-                             (folder["id"], folder["name"], folder["created"]))
+            # Alphabetical while the gallery has no order of its own; once it has
+            # one, a new folder joins the end rather than jumping into the middle.
+            self._db.execute("INSERT INTO folders (id, name, created, position) VALUES (?, ?, ?, ?)",
+                             (folder["id"], folder["name"], folder["created"], self._next_position()))
             self._db.commit()
         return folder
 

@@ -4,7 +4,7 @@
  * The Mac's Command key counts as Ctrl, as it does everywhere else in the studio.
  */
 
-export type ShortcutId = 'toggleSidebar' | 'lockFolders' | 'generate'
+export type ShortcutId = 'toggleSidebar' | 'lockFolders' | 'generate' | 'pickFolder'
 export type ShortcutMap = Record<ShortcutId, string>
 
 export const SHORTCUTS: readonly { id: ShortcutId; label: string; detail: string }[] = [
@@ -18,13 +18,19 @@ export const SHORTCUTS: readonly { id: ShortcutId; label: string; detail: string
     label: 'Lock every open folder',
     detail: 'From anywhere in the studio. A gallery view of one of them goes to Favorites.'
   },
-  { id: 'generate', label: 'Generate', detail: 'From the prompt of the Create and Video tabs.' }
+  { id: 'generate', label: 'Generate', detail: 'From the prompt of the Create and Video tabs.' },
+  {
+    id: 'pickFolder',
+    label: 'Move to a folder',
+    detail: 'In the details of an image or video, or with gallery items selected: the folders are numbered, so press 1 to 9 to move there, or 0 for no folder.'
+  }
 ]
 
 export const DEFAULT_SHORTCUTS: ShortcutMap = {
   toggleSidebar: 'Ctrl+B',
   lockFolders: 'Ctrl+Shift+L',
-  generate: 'Ctrl+Enter'
+  generate: 'Ctrl+Enter',
+  pickFolder: 'Ctrl+M'
 }
 
 /** Keys that do one thing wherever they are pressed, listed so Settings shows every shortcut. */
@@ -33,7 +39,9 @@ export const FIXED_SHORTCUTS: readonly { keys: string; label: string }[] = [
   { keys: 'Shift+F10, or the Menu key', label: 'Open the menu of the gallery item in focus' },
   { keys: 'Right-click', label: 'Open the menu of a gallery item' },
   { keys: 'Double-click', label: 'Rename a gallery folder' },
-  { keys: 'Esc', label: 'Close a menu, or clear the settings search' }
+  { keys: 'Ctrl+click, Shift+click', label: 'Select several gallery items (Ctrl+A selects every one shown)' },
+  { keys: '← →', label: 'The previous or next item, in the details of an image or video' },
+  { keys: 'Esc', label: 'Close a menu, clear the gallery selection, or clear the settings search' }
 ]
 
 const MODIFIERS = ['Ctrl', 'Alt', 'Shift'] as const

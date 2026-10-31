@@ -8,12 +8,15 @@ interface Props {
   images: ImageRecord[];
   onOpen: (image: ImageRecord, list: ImageRecord[]) => void;
   onCancel: (job: Job) => void;
+  /** Opens the queue window; `waiting` is how many jobs are in line behind this one. */
+  onQueue: () => void;
+  waiting: number;
   modelMessage: string;
   starting: boolean;
   display: ResultDisplay;
 }
 
-export function Preview({ job, images, onOpen, onCancel, modelMessage, starting, display }: Props) {
+export function Preview({ job, images, onOpen, onCancel, onQueue, waiting, modelMessage, starting, display }: Props) {
   const latest = images[0] ?? null;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // With results off, the stage shows only what is picked from the strip.
@@ -32,7 +35,7 @@ export function Preview({ job, images, onOpen, onCancel, modelMessage, starting,
         ) : (
           <EmptyStage busy={!!job} starting={starting} done={!!latest} />
         )}
-        {job && <Progress job={job} modelMessage={modelMessage} onCancel={() => onCancel(job)} />}
+        {job && <Progress job={job} modelMessage={modelMessage} onCancel={() => onCancel(job)} onQueue={onQueue} waiting={waiting} />}
       </div>
       {display.showStrip && images.length > 0 && (
         <div className="filmstrip" aria-label="This session">
@@ -80,7 +83,13 @@ function EmptyStage({ busy, starting, done }: { busy: boolean; starting: boolean
 /** Shown when time left would be at least this long; shorter jobs are over before it helps. */
 const SHOW_REMAINING_MS = 20_000;
 
-export function Progress({ job, modelMessage, onCancel }: { job: Job; modelMessage: string; onCancel: () => void }) {
+export function Progress({ job, modelMessage, onCancel, onQueue, waiting }: {
+  job: Job;
+  modelMessage: string;
+  onCancel: () => void;
+  onQueue: () => void;
+  waiting: number;
+}) {
   const [now, setNow] = useState(() => Date.now() / 1000);
   useEffect(() => {
     const t = window.setInterval(() => setNow(Date.now() / 1000), 250);
@@ -124,7 +133,15 @@ export function Progress({ job, modelMessage, onCancel }: { job: Job; modelMessa
       </div>
       <div className="progress-foot">
         <span className="muted small truncate">{"prompt" in job.request ? job.request.prompt : ""}</span>
-        <button className="ghost small" onClick={onCancel}>Cancel</button>
+        {/* Names what it cancels: this card's job, never the last one queued. The rest are in the queue window. */}
+        <span className="progress-actions">
+          <button className="ghost small queue-button" onClick={onQueue}>
+            {waiting > 0 ? `Queue · ${waiting} waiting` : "Queue"}
+          </button>
+          <button className="ghost small" onClick={onCancel} disabled={job.cancelling}>
+            {job.cancelling ? "Stopping…" : job.status === "queued" ? "Remove this one" : "Cancel this one"}
+          </button>
+        </span>
       </div>
     </div>
   );

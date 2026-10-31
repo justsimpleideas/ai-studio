@@ -9,6 +9,8 @@ out/
 dist/
 release/
 *.tsbuildinfo
+# The studio's build of the llama.cpp addon (scripts/native/addon.mjs build)
+build/
 
 # Model weights, whatever their format, and model folders. Each user downloads
 # their own from the studio (or with image-engine/scripts/fetch_model.py).

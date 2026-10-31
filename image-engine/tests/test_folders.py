@@ -99,6 +99,118 @@ class FolderGalleryTests(unittest.TestCase):
         self.assertEqual(self.gallery.list_folders(), [])
 
 
+class MoveManyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.gallery = Gallery(Path(self.tmp.name))
+
+    def tearDown(self):
+        self.gallery.close()
+        self.tmp.cleanup()
+
+    def save(self):
+        return self.gallery.save(Image.new("RGB", (8, 8)), job_id="j" * 16, model="m", request=REQUEST,
+                                 seed=1, duration_ms=1)
+
+    def test_moves_several_at_once_and_skips_what_is_gone_or_out_of_view(self):
+        trips = self.gallery.create_folder("Trips")
+        locked = self.gallery.create_folder("Private")
+        a, b, c, hidden = self.save(), self.save(), self.save(), self.save()
+        self.gallery.set_folder(hidden["id"], locked["id"])
+        self.gallery.set_pin(locked["id"], "123456")
+        self.gallery.lock_again(locked["id"])
+        moved = self.gallery.set_folder_many([a["id"], b["id"], a["id"], "0" * 16, hidden["id"]], trips["id"])
+        self.assertEqual([r["id"] for r in moved], [a["id"], b["id"]])
+        self.assertEqual(self.gallery.get(c["id"])["folder_id"], None)
+        self.assertEqual(self.gallery.list(folder=trips["id"])["total"], 2)
+        out = self.gallery.set_folder_many([a["id"]], None)
+        self.assertIsNone(out[0]["folder_id"])
+        with self.assertRaises(FolderError):
+            self.gallery.set_folder_many([a["id"]], "0" * 16)
+
+
+class FolderOrderTests(unittest.TestCase):
+    """The order the user drags the folders into (Gallery.move_folder)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.gallery = Gallery(self.root)
+
+    def tearDown(self):
+        self.gallery.close()
+        self.tmp.cleanup()
+
+    def names(self):
+        return [f["name"] for f in self.gallery.list_folders()]
+
+    def make(self, *names):
+        return {name: self.gallery.create_folder(name)["id"] for name in names}
+
+    def test_folders_start_alphabetical(self):
+        self.make("Zoo", "animals", "Beach")
+        self.assertEqual(self.names(), ["animals", "Beach", "Zoo"])
+
+    def test_a_folder_can_be_moved_in_front_of_another(self):
+        ids = self.make("animals", "Beach", "Zoo")
+        self.gallery.move_folder(ids["Zoo"], ids["Beach"])
+        self.assertEqual(self.names(), ["animals", "Zoo", "Beach"])
+
+    def test_a_folder_can_be_moved_to_the_end(self):
+        ids = self.make("animals", "Beach", "Zoo")
+        self.gallery.move_folder(ids["animals"], None)
+        self.assertEqual(self.names(), ["Beach", "Zoo", "animals"])
+
+    def test_the_order_outlives_the_gallery_being_closed(self):
+        ids = self.make("animals", "Beach", "Zoo")
+        self.gallery.move_folder(ids["Zoo"], ids["animals"])
+        self.gallery.close()
+        self.gallery = Gallery(self.root)
+        self.assertEqual(self.names(), ["Zoo", "animals", "Beach"])
+
+    def test_a_new_folder_is_alphabetical_until_there_is_an_order_then_last(self):
+        ids = self.make("Beach", "Zoo")
+        self.gallery.create_folder("animals")
+        self.assertEqual(self.names(), ["animals", "Beach", "Zoo"])
+        self.gallery.move_folder(ids["Zoo"], ids["Beach"])
+        self.gallery.create_folder("Alps")
+        self.assertEqual(self.names(), ["animals", "Zoo", "Beach", "Alps"])
+
+    def test_a_hidden_folder_keeps_its_place_among_the_ones_in_view(self):
+        ids = self.make("animals", "Beach", "Zoo")
+        self.gallery.set_hidden(ids["Beach"], True)
+        self.assertEqual(self.names(), ["animals", "Zoo"])
+        # Moved by name the session can see; the hidden one is still between them.
+        self.gallery.move_folder(ids["Zoo"], ids["animals"])
+        self.gallery.set_show_hidden(True)
+        self.assertEqual(self.names(), ["Zoo", "animals", "Beach"])
+
+    def test_nothing_moves_anywhere_on_disk_and_no_item_changes_folder(self):
+        ids = self.make("animals", "Beach")
+        item = self.gallery.save(Image.new("RGB", (8, 8)), job_id="j" * 16, model="m", request=REQUEST,
+                                 seed=1, duration_ms=1)
+        self.gallery.set_folder(item["id"], ids["Beach"])
+        before = self.gallery.get(item["id"])["file_name"]
+        files = sorted(p.name for p in self.root.rglob("*.png"))
+        self.gallery.move_folder(ids["Beach"], ids["animals"])
+        after = self.gallery.get(item["id"])
+        self.assertEqual(after["folder_id"], ids["Beach"])
+        self.assertEqual(after["file_name"], before)
+        self.assertEqual(sorted(p.name for p in self.root.rglob("*.png")), files)
+
+    def test_an_impossible_move_is_refused(self):
+        ids = self.make("animals", "Beach")
+        with self.assertRaises(FolderError):
+            self.gallery.move_folder(ids["animals"], ids["animals"])
+        with self.assertRaises(FolderError):
+            self.gallery.move_folder("0" * 16, None)
+        with self.assertRaises(FolderError):
+            self.gallery.move_folder(ids["animals"], "0" * 16)
+        with self.assertRaises(FolderError):
+            self.gallery.move_folder(ids["animals"], 5)
+        self.assertEqual(self.names(), ["animals", "Beach"])
+
+
 class FolderServerTests(unittest.TestCase):
     request = server_tests.ServerTests.request
 
@@ -147,6 +259,18 @@ class FolderServerTests(unittest.TestCase):
         self.assertIsNone(self.gallery.get(item["id"])["folder_id"])
         self.assertEqual(self.request("DELETE", f"/api/folders/{folder['id']}")[0], 404)
 
+    def test_move_many_over_http(self):
+        _, folder, _ = self.request("POST", "/api/folders", {"name": "Bulk"})
+        a, b = self.item(), self.item()
+        status, body, _ = self.request("POST", "/api/gallery/folder", {"ids": [a["id"], b["id"]], "folder": folder["id"]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual({i["folder_id"] for i in body["items"]}, {folder["id"]})
+        for bad in ({"ids": [], "folder": None}, {"ids": ["../x"], "folder": None}, {"ids": [a["id"]]},
+                    {"ids": [a["id"]], "folder": 5}, {"ids": [a["id"]] * 2001, "folder": None}):
+            with self.subTest(bad=str(bad)[:60]):
+                self.assertEqual(self.request("POST", "/api/gallery/folder", bad)[0], 400)
+        self.assertEqual(self.request("POST", "/api/gallery/folder", {"ids": [a["id"]], "folder": "0" * 16})[0], 400)
+
     def test_bad_folder_requests_are_refused(self):
         item = self.item()
         for body in ({"folder": "../x"}, {"folder": 5}, {"folder": "0" * 16}, {"colour": "red"}, {}):
@@ -156,6 +280,25 @@ class FolderServerTests(unittest.TestCase):
         self.assertEqual(self.request("GET", "/api/gallery?folder=../../x")[0], 400)
         self.assertEqual(self.request("POST", "/api/folders", {"name": ""})[0], 400)
         self.assertEqual(self.request("PATCH", f"/api/folders/{'0' * 16}", {"name": "x"})[0], 404)
+
+    def test_the_order_can_be_changed_over_http(self):
+        made = [self.request("POST", "/api/folders", {"name": name})[1] for name in ("Ants", "Bees", "Cats")]
+        ids = {f["name"]: f["id"] for f in made}
+        def mine(listing):
+            """Only this test's folders: the class shares its gallery with the others."""
+            return [f["name"] for f in listing["items"] if f["name"] in ids]
+
+        status, listing, _ = self.request("POST", f"/api/folders/{ids['Cats']}/order", {"before": ids["Bees"]})
+        self.assertEqual(status, 200, listing)
+        self.assertEqual(mine(listing), ["Ants", "Cats", "Bees"])
+        _, listing, _ = self.request("GET", "/api/folders")
+        self.assertEqual(mine(listing), ["Ants", "Cats", "Bees"])
+        _, listing, _ = self.request("POST", f"/api/folders/{ids['Ants']}/order", {"before": None})
+        self.assertEqual(mine(listing), ["Cats", "Bees", "Ants"])
+        self.assertEqual(self.request("POST", f"/api/folders/{'0' * 16}/order", {"before": None})[0], 400)
+        self.assertEqual(self.request("POST", f"/api/folders/{ids['Ants']}/order", {"before": "../x"})[0], 400)
+        for name in ("Ants", "Bees", "Cats"):
+            self.request("DELETE", f"/api/folders/{ids[name]}")
 
     def test_favourite_and_folder_together(self):
         _, folder, _ = self.request("POST", "/api/folders", {"name": "Both"})
